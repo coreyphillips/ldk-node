@@ -39,10 +39,15 @@ reconnect on an already working channel. See the installed
 [`portable/runtime.ts` watchdog](https://github.com/coreyphillips/beignet-portable-engine/blob/67bc9cf0ba3e55fa1e1d7ad73e360bb04321a62c/portable/runtime.ts#L644).
 The integration report is tracked in
 [Beignet issue 1872](https://github.com/coreyphillips/beignet/issues/1872).
-For further qualification, let that initial watchdog expire while the restored
-channel is stable and usable before beginning offline setup. This is a test
-scheduling workaround; it does not fix the installed wallet. That failing run
-does not establish Iroh offline-receive, public-relay, or native iOS success.
+The complete fixture subsequently passed all eleven baseline and offline checks
+by waiting nine seconds with a stable usable home before offline setup. After
+the final bridge failure-handling fix, the same eleven checks passed again:
+ordinary payments with an active reservation, settlement while the phone was
+stopped, primary restarts, and exactly one recovered 5,000-sat credit through two
+phone reopens. The evidence is retained in
+[`final-iroh.json`](../../docs/qualification/final-iroh.json). The wait is a test
+scheduling workaround; it does not fix the installed wallet. Public relays,
+fallback and native iOS Iroh remain unqualified.
 
 The endpoint identity is a separate random 32-byte file, created exclusively with
 mode `0600` and synced before use. Existing files must have the same size, owner,

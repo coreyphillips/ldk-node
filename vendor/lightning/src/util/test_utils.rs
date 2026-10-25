@@ -892,6 +892,24 @@ pub struct TestStore {
 	read_only: bool,
 }
 
+#[test]
+fn test_store_async_completion_overwrites_same_namespace_key() {
+	use core::task::{Context, Poll};
+	let store = TestStore::new(false);
+	let waker = crate::util::async_poll::dummy_waker();
+	let mut context = Context::from_waker(&waker);
+	for secondary in ["", "updates"] {
+		KVStoreSync::write(&store, "monitors", secondary, "channel", vec![1]).unwrap();
+		let mut write = KVStore::write(&store, "monitors", secondary, "channel", vec![2]);
+		assert!(matches!(write.as_mut().poll(&mut context), Poll::Pending));
+		assert_eq!(KVStoreSync::read(&store, "monitors", secondary, "channel").unwrap(), vec![1]);
+		store.complete_all_async_writes();
+		assert!(matches!(write.as_mut().poll(&mut context), Poll::Ready(Ok(()))));
+		assert_eq!(KVStoreSync::read(&store, "monitors", secondary, "channel").unwrap(), vec![2]);
+		assert_eq!(KVStoreSync::list(&store, "monitors", secondary).unwrap(), vec!["channel".to_owned()]);
+	}
+}
+
 impl TestStore {
 	pub fn new(read_only: bool) -> Self {
 		let pending_async_writes = Mutex::new(new_hash_map());
@@ -916,12 +934,12 @@ impl TestStore {
 		&self, primary_namespace: &str, secondary_namespace: &str, key: &str, write_id: usize,
 	) {
 		let prefix = format!("{primary_namespace}/{secondary_namespace}");
-		let key = format!("{primary_namespace}/{secondary_namespace}/{key}");
+		let pending_key = format!("{primary_namespace}/{secondary_namespace}/{key}");
 
 		let mut persisted_lock = self.persisted_bytes.lock().unwrap();
 		let mut writes_lock = self.pending_async_writes.lock().unwrap();
 
-		let pending_writes = writes_lock.get_mut(&key).expect("No pending writes for given key");
+		let pending_writes = writes_lock.get_mut(&pending_key).expect("No pending writes for given key");
 		pending_writes.retain(|(id, res, data)| {
 			if *id <= write_id {
 				let namespace = persisted_lock.entry(prefix.clone()).or_insert(new_hash_map());

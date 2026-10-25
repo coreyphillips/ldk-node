@@ -1,0 +1,31 @@
+[package]
+name = "chicory-primary-local"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.85"
+publish = false
+
+[workspace]
+resolver = "2"
+
+[[bin]]
+name = "chicory-primary-local"
+path = "../../examples/chicory-primary.rs"
+
+[features]
+uniffi = ["ldk-node/uniffi"]
+
+[dependencies]
+ldk-node = { path = "../..", features = ["chicory"] }
+serde_json = { version = "1.0.128", default-features = false, features = ["std"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+
+[patch.crates-io]
+lightning = { path = "../../vendor/lightning" }
+lightning-liquidity = { path = "../../vendor/lightning-liquidity" }
+
+[profile.dev]
+panic = "abort"
+
+[profile.release]
+panic = "abort"

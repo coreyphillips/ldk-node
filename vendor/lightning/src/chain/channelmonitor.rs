@@ -114,6 +114,20 @@ pub struct ChannelMonitorUpdate {
 }
 
 impl ChannelMonitorUpdate {
+	/// Whether persistence of this update must include the complete updated monitor.
+	///
+	/// Some updates depend on chain-authenticated state which is absent from the update itself.
+	/// Persisting only such an update could make restart replay fail against an older monitor.
+	/// Custom incremental persisters must persist the full monitor before reporting completion
+	/// whenever this returns true, retaining this update's ID for the completion callback.
+	pub fn requires_full_monitor_persistence(&self) -> bool {
+		self.updates.iter().any(|update| match update {
+			ChannelMonitorUpdateStep::FforJournal { journal } =>
+				journal.epoch.slots.iter().any(|slot| slot.chain_removal.is_some()),
+			_ => false,
+		})
+	}
+
 	pub(crate) fn internal_renegotiated_funding_data(
 		&self,
 	) -> impl Iterator<Item = (OutPoint, ScriptBuf)> + '_ {
@@ -7775,10 +7789,15 @@ mod tests {
 
 	fn do_test_ffor_native_chain_resolution(fulfilled: bool) {
 		use crate::chain::channelmonitor::{ChannelMonitorUpdate, MonitorEvent};
+		use crate::chain::chainmonitor::Persist;
 		use crate::ln::channelmanager::{FforPolicy, SentHTLCId};
 		use crate::ln::channelmanager::ffor_manager::tests::activate_native_book;
 		use crate::ln::ffor;
 		use crate::chain::package::HolderHTLCOutput;
+		use crate::util::native_async::FutureQueue;
+		use crate::util::persist::{MonitorUpdatingPersister, MonitorUpdatingPersisterAsync};
+		use crate::util::test_utils::{TestKeysInterface, TestStore};
+		use crate::util::wakers::Notifier;
 		let chanmon_cfgs = create_chanmon_cfgs(2);
 		let node_cfgs = create_node_cfgs(2, &chanmon_cfgs);
 		let mut config = test_default_anchors_channel_config();
@@ -7832,6 +7851,20 @@ mod tests {
 			nodes[0].tx_broadcaster, nodes[0].fee_estimator, &nodes[0].logger);
 		assert!(!monitor.get_and_clear_pending_monitor_events().iter().any(|event| matches!(event, MonitorEvent::FforVoucherResolved { .. })));
 		assert!(monitor.inner.lock().unwrap().ffor_chain_resolutions.is_none());
+		// Chain synchronization may retain this pre-threshold snapshot after its final
+		// pending claim matures. An isolated later journal cannot replay its chain proof.
+		let store = Arc::new(TestStore::new(false));
+		let persister = MonitorUpdatingPersister::new(&*store, nodes[0].logger, 1000,
+			&nodes[0].keys_manager.backing, &nodes[0].keys_manager.backing,
+			nodes[0].tx_broadcaster, nodes[0].fee_estimator);
+		let monitor_name = monitor.persistence_key();
+		assert_eq!(persister.persist_new_channel(monitor_name, &monitor), crate::chain::ChannelMonitorUpdateStatus::Completed);
+		let futures = Arc::new(FutureQueue::new());
+		let async_keys = Arc::new(TestKeysInterface::new(&[0; 32], Network::Testnet));
+		let async_persister = MonitorUpdatingPersisterAsync::new(Arc::clone(&store), Arc::clone(&futures),
+			Arc::new(TestLogger::new()), 1000, Arc::clone(&async_keys), Arc::clone(&async_keys),
+			Arc::new(TestBroadcaster::new(Network::Testnet)), Arc::new(TestFeeEstimator::new(253)));
+		let notifier = Arc::new(Notifier::new());
 		// Restart while resolution is still below the native confirmation threshold.
 		let (_, restored) = <(BlockHash, ChannelMonitor<_>)>::read(&mut io::Cursor::new(monitor.encode()),
 			(&nodes[0].keys_manager.backing, &nodes[0].keys_manager.backing)).unwrap();
@@ -7857,18 +7890,44 @@ mod tests {
 			let source = SentHTLCId::FforVoucher { channel_id: channel, epoch_id, slot };
 			let release = ChannelMonitorUpdate { update_id: recovered.get_latest_update_id() + 1, channel_id: Some(channel),
 				updates: vec![ChannelMonitorUpdateStep::ReleasePaymentComplete { htlc: source }] };
-			assert!(recovered.update_monitor(&release, &nodes[0].tx_broadcaster, &nodes[0].fee_estimator, &nodes[0].logger).is_err());
+			let (_, invalid_release) = <(BlockHash, ChannelMonitor<_>)>::read(&mut io::Cursor::new(recovered.encode()),
+				(&nodes[0].keys_manager.backing, &nodes[0].keys_manager.backing)).unwrap();
+			assert!(invalid_release.update_monitor(&release, &nodes[0].tx_broadcaster, &nodes[0].fee_estimator, &nodes[0].logger).is_err());
 			let previous = recovered.get_ffor_journal().unwrap();
 			let next = ffor::prepare_chain_resolution(&previous, slot, proof).unwrap();
 			let update = ChannelMonitorUpdate { update_id: recovered.get_latest_update_id() + 1, channel_id: Some(channel),
 				updates: vec![ChannelMonitorUpdateStep::FforJournal { journal: next.journal.clone() }] };
+			assert!(update.requires_full_monitor_persistence());
+			let (_, stale) = persister.read_channel_monitor_with_updates(&monitor_name.to_string()).unwrap();
+			let persisted_update_id = stale.get_latest_update_id();
+			if stale.inner.lock().unwrap().ffor_chain_resolutions.is_none() {
+				assert!(stale.update_monitor(&update, &nodes[0].tx_broadcaster, &nodes[0].fee_estimator, &nodes[0].logger).is_err(),
+					"A journal must never authenticate its own chain-removal claim on replay");
+			}
 			recovered.update_monitor(&update, &nodes[0].tx_broadcaster, &nodes[0].fee_estimator, &nodes[0].logger).unwrap();
+			let (_, async_monitor) = <(BlockHash, ChannelMonitor<_>)>::read(&mut io::Cursor::new(recovered.encode()),
+				(&*async_keys, &*async_keys)).unwrap();
+			async_persister.spawn_async_update_channel(monitor_name, Some(&update), &async_monitor, Arc::clone(&notifier));
+			futures.poll_futures();
+			assert!(async_persister.get_and_clear_completed_updates().is_empty(),
+				"The native completion ID must wait for the full monitor write");
+			assert_eq!(store.list_pending_async_writes("monitors", "", &monitor_name.to_string()).len(), 1);
+			assert!(store.list_pending_async_writes("monitor_updates", &monitor_name.to_string(), &update.update_id.to_string()).is_empty());
+			assert_eq!(persister.read_channel_monitor_with_updates(&monitor_name.to_string()).unwrap().1.get_latest_update_id(), persisted_update_id);
+			store.complete_all_async_writes();
+			futures.poll_futures();
+			assert_eq!(async_persister.get_and_clear_completed_updates(), vec![(channel, update.update_id)]);
+			let (_, durable) = persister.read_channel_monitor_with_updates(&monitor_name.to_string()).unwrap();
+			assert_eq!(durable.get_ffor_journal(), recovered.get_ffor_journal());
+			assert_eq!(durable.inner.lock().unwrap().ffor_chain_resolutions, recovered.inner.lock().unwrap().ffor_chain_resolutions);
 			assert!(recovered.get_and_clear_pending_monitor_events().iter().any(|event|
 				matches!(event, MonitorEvent::FforVoucherResolved { slot: id, .. } if *id == slot)),
 				"Persisted journal alone does not acknowledge native payment completion");
 			let release = ChannelMonitorUpdate { update_id: recovered.get_latest_update_id() + 1, channel_id: Some(channel),
 				updates: vec![ChannelMonitorUpdateStep::ReleasePaymentComplete { htlc: source }] };
 			recovered.update_monitor(&release, &nodes[0].tx_broadcaster, &nodes[0].fee_estimator, &nodes[0].logger).unwrap();
+			assert!(!release.requires_full_monitor_persistence());
+			assert_eq!(persister.update_persisted_channel(monitor_name, Some(&release), &recovered), crate::chain::ChannelMonitorUpdateStatus::Completed);
 		}
 		assert!(!recovered.get_and_clear_pending_monitor_events().iter().any(|event| matches!(event, MonitorEvent::FforVoucherResolved { .. })));
 		assert_eq!(recovered.check_and_update_full_resolution_status(&*nodes[0].logger), (false, false));
@@ -7876,6 +7935,9 @@ mod tests {
 			(&nodes[0].keys_manager.backing, &nodes[0].keys_manager.backing)).unwrap();
 		assert_eq!(final_restore.get_ffor_journal(), recovered.get_ffor_journal());
 		assert!(!final_restore.get_and_clear_pending_monitor_events().iter().any(|event| matches!(event, MonitorEvent::FforVoucherResolved { .. })));
+		let (_, persisted_restore) = persister.read_channel_monitor_with_updates(&monitor_name.to_string()).unwrap();
+		assert_eq!(persisted_restore.get_ffor_journal(), recovered.get_ffor_journal());
+		assert!(!persisted_restore.get_and_clear_pending_monitor_events().iter().any(|event| matches!(event, MonitorEvent::FforVoucherResolved { .. })));
 	}
 
 	#[test]

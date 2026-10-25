@@ -1,0 +1,33 @@
+{
+  "binarySha256": "3ed1fc62faa3e72a17dc4eb179425e93d5995a458622151b74260ab92b151711",
+  "manifestSha256": "68c26ec302536b259d82b91030aa29dd562d73db70a7253bfc2224b50c0008c8",
+  "lockSha256": "4165a28734bf4630f3417acdcb2450a223856c29cef2907ad9a345c254dde3f8",
+  "driverSha256": "985d8f982e797f32d0a0c134dec3e6123c8dfea5ce547e8f94b41513cd70e38f",
+  "lightningFeatures": [
+    "default",
+    "grind_signatures",
+    "std"
+  ],
+  "sourceSharedWithExample": true,
+  "testUtilsEnabled": false,
+  "scope": "standalone-normal-dependency-build",
+  "manifest": "tools/chicory-primary/Cargo.toml",
+  "passed": true,
+  "dependencyAudit": {
+    "addedPackages": [
+      {
+        "name": "chicory-primary-local",
+        "version": "0.1.0"
+      }
+    ],
+    "changedChecksums": [],
+    "testUtilsNodes": [],
+    "lightningFeatures": [
+      [
+        "default",
+        "grind_signatures",
+        "std"
+      ]
+    ]
+  }
+}

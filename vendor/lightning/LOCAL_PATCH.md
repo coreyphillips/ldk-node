@@ -121,6 +121,17 @@ the threshold, withhold monitor persistence, replay the proof, and restart after
 journal completion. These are native tests, separate from installed-phone
 interoperability qualification.
 
+An FFOR journal containing a chain removal requires a complete monitor snapshot.
+The incremental persister preserves the original update ID and reports completion
+only after that snapshot is durable. The journal does not authenticate its own
+chain evidence: replay still requires the monitor's independently derived proof.
+This matters when the final claim matures between periodic chain snapshots.
+Custom incremental persisters must honor
+`ChannelMonitorUpdate::requires_full_monitor_persistence`. Native timeout and
+fulfillment regressions deliberately retain a pre-threshold base, delay the async
+snapshot write, and reload through the actual incremental persister after both
+the proof journal and its payment-completion update.
+
 Ordinary voucher redemption also waits for native commitment finalization.
 Receiving `update_fulfill_htlc` alone cannot mark a voucher redeemed. Bounded
 current-epoch proof survives the final revocation and the crash window before

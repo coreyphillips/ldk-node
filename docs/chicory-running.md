@@ -9,11 +9,19 @@ remaining limitations before using persistent wallets.
 
 ## Build and preserve the native dependency patches
 
-From this checkout:
+For the regtest console driver, use the standalone normal-dependency package:
 
 ```sh
-cargo build --locked --features chicory --example chicory-primary
+cargo build --locked --manifest-path tools/chicory-primary/Cargo.toml
 ```
+
+Its executable is `tools/chicory-primary/target/debug/chicory-primary-local`.
+See [its invocation and stdin commands](../tools/chicory-primary/README.md).
+This package shares the example's source but does not enable LDK's `_test_utils`
+feature through this repository's dev dependencies. Start it with fresh provider
+state. The example build enables test-only persisted failure-event fields, so a
+database created by that build must not be assumed interchangeable with a normal
+consumer build. The standalone driver still deliberately accepts only regtest.
 
 For an application outside this workspace, Cargo does not inherit a dependency's
 `[patch]` table. Its top-level `Cargo.toml` must select both local native forks:
@@ -36,6 +44,11 @@ The patches are required for channel behavior and persisted safety state, not
 only custom message parsing. Do not replace them with unmodified registry crates
 when opening this branch's database. Keep the application lockfile and the local
 source revision together.
+The built-in incremental persister saves a full monitor for chain-derived offline
+custody updates. A host supplying its own native `Persist` implementation must
+honor `ChannelMonitorUpdate::requires_full_monitor_persistence` and keep the
+original update ID for completion. Persisting just that journal delta omits
+independent chain evidence needed at restart.
 
 ## Configure a node through the public builder
 

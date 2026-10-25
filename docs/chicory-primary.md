@@ -647,6 +647,16 @@ provider database across these feature sets based on the successful protocol
 fixtures alone. Private-channel qualification also does not cover public gossip
 propagation.
 
+A separate unfunded normal-host check reached a public Iroh relay and completed
+native BOLT8 authentication, but the transport switched from relay to direct IP
+during the exchange. The strict relay-only qualification therefore failed. The
+pinned addon cannot disable IP transport through its public API, and its path
+watcher aborted during diagnostics. The bridge does not use that watcher. See
+[the transport assessment](../tools/chicory-iroh/README.md) for the distinction
+between observed mixed-path connectivity and still-unqualified relay-only
+wallet operation. This check used the supplied `mint.local:60401` Electrum
+server read-only; the funded wallet scenarios used the separate Docker regtest.
+
 | Normal host run after the persistence fix | Measured result | Evidence |
 | --- | --- | --- |
 | Explicit unpaid lifecycle, 06:56:14 to 06:57:04 UTC | All 11 checks passed. Actual voucher timeout, both post-timeout restarts, a fresh 9,890-sat JIT home and no unpaid credit. | [JSON](qualification/normal-offline-unpaid.json). |

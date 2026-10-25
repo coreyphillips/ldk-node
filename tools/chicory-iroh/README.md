@@ -49,6 +49,18 @@ phone reopens. The evidence is retained in
 scheduling workaround; it does not fix the installed wallet. Public relays,
 fallback and native iOS Iroh remain unqualified.
 
+A later bounded check reached the public relay with discovery disabled and no
+supplied direct addresses, using a fresh unfunded normal-feature native host.
+Path snapshots showed relay traffic followed by direct IP traffic during BOLT8.
+Native authentication completed, but this was mixed-path connectivity and the
+strict relay-only check failed. The pinned addon does not expose the Rust
+`clear_ip_transports()` option, so a relay-only address cannot force that mode.
+Its `watchPaths` diagnostic API also aborted when called without a Tokio runtime;
+the bridge does not use that API. Snapshots are not treated as continuous proof.
+This test used read-only Electrum access at `mint.local:60401`, moved no funds,
+and closed both endpoints and the native host afterward. Relay-only wallet
+payments, fallback and native iOS Iroh remain unqualified.
+
 The endpoint identity is a separate random 32-byte file, created exclusively with
 mode `0600` and synced before use. Existing files must have the same size, owner,
 and mode. Symlinks and malformed files are refused. Back up this file to preserve
@@ -83,7 +95,7 @@ IROH_BINDING_PATH=/absolute/path/to/node_modules/@number0/iroh npm test
 ```
 
 The optional BOLT8 test additionally takes `LDK_TEST_BINARY` pointing to
-`target/debug/examples/chicory-primary`, `LDK_TEST_CHAIN_SOURCE` for the local
+`tools/chicory-primary/target/debug/chicory-primary-local`, `LDK_TEST_CHAIN_SOURCE` for the local
 regtest source, and optionally `BEIGNET_SOURCE_DIR`. It starts a disposable native
 LDK wallet, imports only Beignet's pure BOLT8 codec for the test client, and checks
 the authenticated native `init`. It does not claim wallet features, mine, fund,

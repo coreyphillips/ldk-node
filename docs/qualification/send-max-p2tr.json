@@ -1,0 +1,54 @@
+{
+  "scope": "installed-chicory-portable",
+  "checks": [
+    {
+      "name": "installed Chicory engine and wallet-core pair with native primary"
+    },
+    {
+      "name": "external payer has a confirmed channel to native primary"
+    },
+    {
+      "name": "installed wallet reviews and creates a skim-fee unified JIT request"
+    },
+    {
+      "name": "installed wallet Activity and balances reflect the native JIT payment",
+      "paymentHash": "f32a371577ab4d6aac3e7ebac0085fe455df054fffebaf88205739d7fca0ba49",
+      "status": "completed",
+      "activityAmountSats": 20000,
+      "activityFeeSats": 0,
+      "totalSats": 19880,
+      "availableSats": 18880
+    },
+    {
+      "name": "installed wallet restart restores the paid request, balance and channel"
+    },
+    {
+      "name": "installed wallet pays a native primary invoice and records completed Activity"
+    },
+    {
+      "name": "installed send-max pays the exact reviewed bech32m destination",
+      "amountSats": 15301,
+      "keptSats": 1000,
+      "txid": "a9d1e8b250afaa798f5cc9f7b70ec4df1cb01bc39c987d0410208fc6759db431"
+    },
+    {
+      "name": "installed send-max retains one completed Activity row and its home after both restarts"
+    }
+  ],
+  "packages": {
+    "chicoryVersion": "0.7.4",
+    "engineUpstreamVersion": "0.32.1",
+    "engineSha256": "05cdb752e1007532edc1366ea14cbf98a96825885a62d47d6001f74c1bed229d",
+    "walletCoreSha256": "4a79550c91ac05303d85d28fe0b5daf4c2a05da97e713a83db54012f7e9a655e",
+    "payerVersion": "0.32.2"
+  },
+  "chain": "regtest",
+  "startedAt": "2026-10-25T04:23:32.058Z",
+  "providerNodeId": "024087f51a741c0fa0b9dc6e0f4c47c68167cda28ab744a6bd651f4a08c8e59a6f",
+  "processes": [
+    90474,
+    91031
+  ],
+  "completedAt": "2026-10-25T04:24:04.273Z",
+  "passed": true
+}

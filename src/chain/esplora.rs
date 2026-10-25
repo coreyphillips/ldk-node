@@ -36,6 +36,8 @@ use crate::types::{ChainMonitor, ChannelManager, DynStore, Sweeper, Wallet};
 use crate::{Error, NodeMetrics};
 
 pub(super) struct EsploraChainSource {
+	#[cfg(feature = "chicory")]
+	pub(super) chain_apply_gate: Arc<tokio::sync::Mutex<bool>>,
 	pub(super) sync_config: EsploraSyncConfig,
 	esplora_client: EsploraAsyncClient,
 	onchain_wallet_sync_status: Mutex<WalletSyncStatus>,
@@ -95,6 +97,8 @@ impl EsploraChainSource {
 		let onchain_wallet_sync_status = Mutex::new(WalletSyncStatus::Completed);
 		let lightning_wallet_sync_status = Mutex::new(WalletSyncStatus::Completed);
 		Self {
+			#[cfg(feature = "chicory")]
+			chain_apply_gate: Arc::new(tokio::sync::Mutex::new(false)),
 			sync_config,
 			esplora_client,
 			onchain_wallet_sync_status,
@@ -374,6 +378,12 @@ impl EsploraChainSource {
 		&self, channel_manager: Arc<ChannelManager>, chain_monitor: Arc<ChainMonitor>,
 		output_sweeper: Arc<Sweeper>,
 	) -> Result<(), Error> {
+		#[cfg(feature = "chicory")]
+		let mut chain_apply = self.chain_apply_gate.lock().await;
+		#[cfg(feature = "chicory")]
+		{
+			*chain_apply = false;
+		}
 		let sync_cman = Arc::clone(&channel_manager);
 		let sync_cmon = Arc::clone(&chain_monitor);
 		let sync_sweeper = Arc::clone(&output_sweeper);
@@ -388,7 +398,13 @@ impl EsploraChainSource {
 			self.tx_sync.sync(confirmables),
 		);
 		let now = Instant::now();
-		match timeout_fut.await {
+		let result = timeout_fut.await;
+		#[cfg(feature = "chicory")]
+		{
+			*chain_apply = matches!(&result, Ok(Ok(())));
+			drop(chain_apply);
+		}
+		match result {
 			Ok(res) => match res {
 				Ok(()) => {
 					log_info!(
@@ -531,6 +547,50 @@ impl EsploraChainSource {
 			return Err(esplora_client::Error::InvalidResponse);
 		}
 		Ok(())
+	}
+
+	#[cfg(feature = "chicory")]
+	pub(super) async fn confirmed_transaction(
+		&self, txid: Txid, tip: lightning::chain::BestBlock,
+	) -> Result<super::chicory::ConfirmedTransaction, Error> {
+		let client = &self.esplora_client;
+		if client.get_block_hash(tip.height).await.map_err(|_| Error::TxSyncFailed)?
+			!= tip.block_hash
+		{
+			return Err(Error::TxSyncFailed);
+		}
+		let status = client.get_tx_status(&txid).await.map_err(|_| Error::TxSyncFailed)?;
+		let height = status.block_height.ok_or(Error::TxSyncFailed)?;
+		let block_hash = status.block_hash.ok_or(Error::TxSyncFailed)?;
+		if !status.confirmed || !super::chicory::sufficiently_confirmed(height, tip) {
+			return Err(Error::TxSyncFailed);
+		}
+		let transaction = client
+			.get_tx(&txid)
+			.await
+			.map_err(|_| Error::TxSyncFailed)?
+			.ok_or(Error::TxSyncFailed)?;
+		if transaction.compute_txid() != txid {
+			return Err(Error::TxSyncFailed);
+		}
+		let proof = client
+			.get_merkle_block(&txid)
+			.await
+			.map_err(|_| Error::TxSyncFailed)?
+			.ok_or(Error::TxSyncFailed)?;
+		let mut matches = Vec::new();
+		let mut indexes = Vec::new();
+		proof.extract_matches(&mut matches, &mut indexes).map_err(|_| Error::TxSyncFailed)?;
+		if proof.header.block_hash() != block_hash
+			|| !matches.contains(&txid)
+			|| client.get_block_hash(height).await.map_err(|_| Error::TxSyncFailed)? != block_hash
+			|| client.get_block_hash(tip.height).await.map_err(|_| Error::TxSyncFailed)?
+				!= tip.block_hash
+			|| client.get_block_hash(height).await.map_err(|_| Error::TxSyncFailed)? != block_hash
+		{
+			return Err(Error::TxSyncFailed);
+		}
+		Ok(super::chicory::ConfirmedTransaction { transaction, block_hash, height, tip })
 	}
 
 	pub(crate) async fn broadcast_transaction_with_result(

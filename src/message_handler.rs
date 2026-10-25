@@ -10,20 +10,99 @@ use std::sync::Arc;
 
 use bitcoin::secp256k1::PublicKey;
 use lightning::ln::peer_handler::CustomMessageHandler;
-use lightning::ln::wire::CustomMessageReader;
+use lightning::ln::wire::{CustomMessageReader, Type};
 use lightning::util::logger::Logger;
-use lightning::util::ser::LengthLimitedRead;
+use lightning::util::ser::{LengthLimitedRead, Writeable, Writer};
 use lightning_liquidity::lsps0::ser::RawLSPSMessage;
 use lightning_types::features::{InitFeatures, NodeFeatures};
 
+#[cfg(feature = "chicory")]
+use crate::chicory::{wire, ChicoryService};
 use crate::liquidity::LiquiditySource;
 
-pub(crate) enum NodeCustomMessageHandler<L: Deref>
+/// Multiplex independent application protocols without replacing LSPS support.
+#[derive(Debug)]
+pub(crate) enum NodeCustomMessage {
+	Liquidity(RawLSPSMessage),
+	#[cfg(feature = "chicory")]
+	Beignet(wire::Envelope),
+	#[cfg(feature = "chicory")]
+	Ffor(FforFrame),
+}
+
+/// Transport framing only. The native engine validates signatures, channel
+/// identity and durable state before any protocol transition.
+#[cfg(feature = "chicory")]
+pub(crate) struct FforFrame {
+	message_type: u16,
+	payload: Vec<u8>,
+}
+
+#[cfg(feature = "chicory")]
+impl std::fmt::Debug for FforFrame {
+	fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+		formatter
+			.debug_struct("FforFrame")
+			.field("message_type", &self.message_type)
+			.field("payload_len", &self.payload.len())
+			.finish()
+	}
+}
+
+#[cfg(feature = "chicory")]
+fn is_ffor_message_type(message_type: u16) -> bool {
+	matches!(message_type, 55001 | 55003 | 55045 | 55047 | 55049 | 55051 | 55053 | 55075 | 55077)
+}
+
+impl Writeable for NodeCustomMessage {
+	fn write<W: Writer>(&self, writer: &mut W) -> Result<(), lightning::io::Error> {
+		match self {
+			Self::Liquidity(message) => message.write(writer),
+			#[cfg(feature = "chicory")]
+			Self::Beignet(message) => {
+				let bytes = message.encode().map_err(|_| {
+					lightning::io::Error::new(
+						lightning::io::ErrorKind::InvalidInput,
+						"invalid Beignet envelope",
+					)
+				})?;
+				writer.write_all(&bytes)
+			},
+			#[cfg(feature = "chicory")]
+			Self::Ffor(message) => {
+				if !is_ffor_message_type(message.message_type)
+					|| !(128..=65_533).contains(&message.payload.len())
+				{
+					return Err(lightning::io::Error::new(
+						lightning::io::ErrorKind::InvalidInput,
+						"invalid FFOR frame",
+					));
+				}
+				writer.write_all(&message.payload)
+			},
+		}
+	}
+}
+
+impl Type for NodeCustomMessage {
+	fn type_id(&self) -> u16 {
+		match self {
+			Self::Liquidity(message) => message.type_id(),
+			#[cfg(feature = "chicory")]
+			Self::Beignet(_) => wire::CUSTOM_MESSAGE_TYPE,
+			#[cfg(feature = "chicory")]
+			Self::Ffor(message) => message.message_type,
+		}
+	}
+}
+
+pub(crate) struct NodeCustomMessageHandler<L: Deref>
 where
 	L::Target: Logger,
 {
-	Ignoring,
-	Liquidity { liquidity_source: Arc<LiquiditySource<L>> },
+	liquidity_source: Option<Arc<LiquiditySource<L>>>,
+	#[cfg(feature = "chicory")]
+	chicory_service: Option<Arc<ChicoryService>>,
 }
 
 impl<L: Deref> NodeCustomMessageHandler<L>
@@ -31,11 +110,25 @@ where
 	L::Target: Logger,
 {
 	pub(crate) fn new_liquidity(liquidity_source: Arc<LiquiditySource<L>>) -> Self {
-		Self::Liquidity { liquidity_source }
+		Self {
+			liquidity_source: Some(liquidity_source),
+			#[cfg(feature = "chicory")]
+			chicory_service: None,
+		}
 	}
 
 	pub(crate) fn new_ignoring() -> Self {
-		Self::Ignoring
+		Self {
+			liquidity_source: None,
+			#[cfg(feature = "chicory")]
+			chicory_service: None,
+		}
+	}
+
+	#[cfg(feature = "chicory")]
+	pub(crate) fn with_chicory(mut self, service: Option<Arc<ChicoryService>>) -> Self {
+		self.chicory_service = service;
+		self
 	}
 }
 
@@ -43,16 +136,41 @@ impl<L: Deref> CustomMessageReader for NodeCustomMessageHandler<L>
 where
 	L::Target: Logger,
 {
-	type CustomMessage = RawLSPSMessage;
+	type CustomMessage = NodeCustomMessage;
 
 	fn read<RD: LengthLimitedRead>(
 		&self, message_type: u16, buffer: &mut RD,
 	) -> Result<Option<Self::CustomMessage>, lightning::ln::msgs::DecodeError> {
-		match self {
-			Self::Ignoring => Ok(None),
-			Self::Liquidity { liquidity_source, .. } => {
-				liquidity_source.liquidity_manager().read(message_type, buffer)
-			},
+		#[cfg(feature = "chicory")]
+		if is_ffor_message_type(message_type) && self.chicory_service.is_some() {
+			let length = buffer.remaining_bytes();
+			if !(128..=65_533).contains(&length) {
+				return Ok(None);
+			}
+			let mut payload = vec![0; length as usize];
+			buffer.read_exact(&mut payload)?;
+			return Ok(Some(NodeCustomMessage::Ffor(FforFrame { message_type, payload })));
+		}
+		#[cfg(feature = "chicory")]
+		if message_type == wire::CUSTOM_MESSAGE_TYPE && self.chicory_service.is_some() {
+			// BOLT 8 already limits frames. Keep the bound here as well for callers
+			// that invoke the reader directly, before allocating from untrusted input.
+			let length = buffer.remaining_bytes();
+			if !(4..=65_533).contains(&length) {
+				return Ok(None);
+			}
+			let mut bytes = vec![0; length as usize];
+			buffer.read_exact(&mut bytes)?;
+			// Beignet drops malformed application messages without disconnecting
+			// the Lightning peer. Unknown versions are ignored by the service.
+			return Ok(wire::Envelope::decode(&bytes).ok().map(NodeCustomMessage::Beignet));
+		}
+		match &self.liquidity_source {
+			Some(source) => source
+				.liquidity_manager()
+				.read(message_type, buffer)
+				.map(|message| message.map(NodeCustomMessage::Liquidity)),
+			None => Ok(None),
 		}
 	}
 }
@@ -62,60 +180,192 @@ where
 	L::Target: Logger,
 {
 	fn handle_custom_message(
-		&self, msg: Self::CustomMessage, sender_node_id: PublicKey,
+		&self, message: Self::CustomMessage, sender_node_id: PublicKey,
 	) -> Result<(), lightning::ln::msgs::LightningError> {
-		match self {
-			Self::Ignoring => Ok(()), // Should be unreachable!() as the reader will return `None`
-			Self::Liquidity { liquidity_source, .. } => {
-				liquidity_source.liquidity_manager().handle_custom_message(msg, sender_node_id)
+		match message {
+			NodeCustomMessage::Liquidity(message) => {
+				if let Some(source) = &self.liquidity_source {
+					source.liquidity_manager().handle_custom_message(message, sender_node_id)?;
+				}
+			},
+			#[cfg(feature = "chicory")]
+			NodeCustomMessage::Beignet(message) => {
+				if let Some(service) = &self.chicory_service {
+					service.handle_message(sender_node_id, message);
+				}
+			},
+			#[cfg(feature = "chicory")]
+			NodeCustomMessage::Ffor(message) => {
+				if let Some(service) = &self.chicory_service {
+					service.handle_ffor_message(
+						sender_node_id,
+						message.message_type,
+						&message.payload,
+					);
+				}
 			},
 		}
+		Ok(())
 	}
 
 	fn get_and_clear_pending_msg(&self) -> Vec<(PublicKey, Self::CustomMessage)> {
-		match self {
-			Self::Ignoring => Vec::new(),
-			Self::Liquidity { liquidity_source, .. } => {
-				liquidity_source.liquidity_manager().get_and_clear_pending_msg()
-			},
-		}
+		let messages = self
+			.liquidity_source
+			.as_ref()
+			.map(|source| {
+				source
+					.liquidity_manager()
+					.get_and_clear_pending_msg()
+					.into_iter()
+					.map(|(peer, message)| (peer, NodeCustomMessage::Liquidity(message)))
+					.collect::<Vec<_>>()
+			})
+			.unwrap_or_default();
+		#[cfg(feature = "chicory")]
+		let messages = {
+			let mut messages = messages;
+			if let Some(service) = &self.chicory_service {
+				messages.extend(
+					service
+						.get_and_clear_pending_msg()
+						.into_iter()
+						.map(|(peer, message)| (peer, NodeCustomMessage::Beignet(message))),
+				);
+				// Native dequeue advances completion-gated actions. Preserve its
+				// order: accept/activation frames precede the native channel updates
+				// that the next peer-manager event loop may collect.
+				messages.extend(service.get_and_clear_pending_ffor_messages().into_iter().map(
+					|message| {
+						(
+							message.peer,
+							NodeCustomMessage::Ffor(FforFrame {
+								message_type: message.message_type,
+								payload: message.payload,
+							}),
+						)
+					},
+				));
+			}
+			messages
+		};
+		messages
 	}
 
 	fn provided_node_features(&self) -> NodeFeatures {
-		match self {
-			Self::Ignoring => NodeFeatures::empty(),
-			Self::Liquidity { liquidity_source, .. } => {
-				liquidity_source.liquidity_manager().provided_node_features()
-			},
-		}
+		self.liquidity_source
+			.as_ref()
+			.map(|source| source.liquidity_manager().provided_node_features())
+			.unwrap_or_else(NodeFeatures::empty)
 	}
 
-	fn provided_init_features(&self, their_node_id: PublicKey) -> InitFeatures {
-		match self {
-			Self::Ignoring => InitFeatures::empty(),
-			Self::Liquidity { liquidity_source, .. } => {
-				liquidity_source.liquidity_manager().provided_init_features(their_node_id)
-			},
-		}
+	fn provided_init_features(&self, peer: PublicKey) -> InitFeatures {
+		// Native ChannelManager owns channel feature negotiation, including FFOR.
+		// This application handler contributes only independent LSPS features.
+		self.liquidity_source
+			.as_ref()
+			.map(|source| source.liquidity_manager().provided_init_features(peer))
+			.unwrap_or_else(InitFeatures::empty)
 	}
 
 	fn peer_connected(
-		&self, their_node_id: PublicKey, msg: &lightning::ln::msgs::Init, inbound: bool,
+		&self, peer: PublicKey, message: &lightning::ln::msgs::Init, inbound: bool,
 	) -> Result<(), ()> {
-		match self {
-			Self::Ignoring => Ok(()),
-			Self::Liquidity { liquidity_source, .. } => {
-				liquidity_source.liquidity_manager().peer_connected(their_node_id, msg, inbound)
-			},
+		if let Some(source) = &self.liquidity_source {
+			source.liquidity_manager().peer_connected(peer, message, inbound)?;
+		}
+		#[cfg(feature = "chicory")]
+		if let Some(service) = &self.chicory_service {
+			service.peer_connected(peer, message);
+		}
+		Ok(())
+	}
+
+	fn peer_disconnected(&self, peer: PublicKey) {
+		if let Some(source) = &self.liquidity_source {
+			source.liquidity_manager().peer_disconnected(peer);
+		}
+		#[cfg(feature = "chicory")]
+		if let Some(service) = &self.chicory_service {
+			service.peer_disconnected(peer);
+		}
+	}
+}
+
+#[cfg(all(test, feature = "chicory"))]
+mod ffor_frame_tests {
+	use super::*;
+
+	#[test]
+	fn ffor_frames_preserve_body_without_a_second_message_prefix() {
+		for message_type in [55001, 55003, 55045, 55047, 55049, 55051, 55053, 55075, 55077] {
+			for length in [128, 65_533] {
+				let message =
+					NodeCustomMessage::Ffor(FforFrame { message_type, payload: vec![7; length] });
+				assert_eq!(message.type_id(), message_type);
+				assert_eq!(message.encode(), vec![7; length]);
+			}
+		}
+		for (message_type, length) in [(55001, 127), (55001, 65_534), (55005, 128)] {
+			let message =
+				NodeCustomMessage::Ffor(FforFrame { message_type, payload: vec![7; length] });
+			assert!(message.write(&mut Vec::new()).is_err());
 		}
 	}
 
-	fn peer_disconnected(&self, their_node_id: PublicKey) {
-		match self {
-			Self::Ignoring => {},
-			Self::Liquidity { liquidity_source, .. } => {
-				liquidity_source.liquidity_manager().peer_disconnected(their_node_id)
-			},
+	#[test]
+	fn custom_message_diagnostics_do_not_reveal_ffor_receipts() {
+		let first =
+			NodeCustomMessage::Ffor(FforFrame { message_type: 55077, payload: vec![17; 160] });
+		let second =
+			NodeCustomMessage::Ffor(FforFrame { message_type: 55077, payload: vec![241; 160] });
+		assert_eq!(format!("{first:?}"), format!("{second:?}"));
+	}
+}
+
+#[cfg(all(test, not(feature = "chicory")))]
+mod compatibility_review_tests {
+	use super::*;
+	use bitcoin::secp256k1::{Secp256k1, SecretKey};
+	use lightning::util::logger::Record;
+	use lightning_liquidity::lsps0::ser::LSPS_MESSAGE_TYPE_ID;
+
+	struct SilentLogger;
+	impl Logger for SilentLogger {
+		fn log(&self, _: Record<'_>) {}
+	}
+
+	#[test]
+	fn disabled_reader_preserves_ignoring_behavior() {
+		let handler = NodeCustomMessageHandler::<Arc<SilentLogger>>::new_ignoring();
+		for message_type in [44069, LSPS_MESSAGE_TYPE_ID, 55001, 55077, 65535] {
+			for length in [0usize, 3, 4, 68, 65533, 65534, 65535] {
+				let bytes = vec![0xff; length];
+				let mut input = bytes.as_slice();
+				assert!(handler.read(message_type, &mut input).unwrap().is_none());
+				assert_eq!(input, bytes.as_slice());
+			}
 		}
+		assert!(handler.get_and_clear_pending_msg().is_empty());
+		assert_eq!(handler.provided_node_features(), NodeFeatures::empty());
+		let key = PublicKey::from_secret_key(
+			&Secp256k1::new(),
+			&SecretKey::from_slice(&[1; 32]).unwrap(),
+		);
+		assert_eq!(handler.provided_init_features(key), InitFeatures::empty());
+		handler.peer_disconnected(key);
+		handler
+			.handle_custom_message(
+				NodeCustomMessage::Liquidity(RawLSPSMessage { payload: "{}".to_owned() }),
+				key,
+			)
+			.unwrap();
+	}
+
+	#[test]
+	fn lsps_wrapper_preserves_type_and_unprefixed_wire_bytes() {
+		let payload = r#"{"jsonrpc":"2.0","id":"a","method":"lsps0.list_protocols","params":{}}"#;
+		let message = NodeCustomMessage::Liquidity(RawLSPSMessage { payload: payload.to_owned() });
+		assert_eq!(message.type_id(), LSPS_MESSAGE_TYPE_ID);
+		assert_eq!(message.encode(), payload.as_bytes());
 	}
 }

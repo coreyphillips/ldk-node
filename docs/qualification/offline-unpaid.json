@@ -1,0 +1,84 @@
+{
+  "scope": "installed-chicory-portable",
+  "checks": [
+    {
+      "name": "installed Chicory engine and wallet-core pair with native primary"
+    },
+    {
+      "name": "external payer has a confirmed channel to native primary"
+    },
+    {
+      "name": "installed wallet reviews and creates a skim-fee unified JIT request"
+    },
+    {
+      "name": "installed wallet Activity and balances reflect the native JIT payment",
+      "paymentHash": "d43c074b86c942a9373c17fd695dc04b8f66716627cc0fd8076939e76ed35827",
+      "status": "completed",
+      "activityAmountSats": 20000,
+      "activityFeeSats": 0,
+      "totalSats": 19880,
+      "availableSats": 18880
+    },
+    {
+      "name": "installed wallet restart restores the paid request, balance and channel"
+    },
+    {
+      "name": "installed wallet pays a native primary invoice and records completed Activity"
+    },
+    {
+      "name": "installed wallet prepares an active concurrent-v2 offline reservation",
+      "channelId": "f4a5c17255a5a42b3ebbbb32f55db7e214ca1a9160a31479c6d49ad05e160286",
+      "epochId": "4c3893533bdafeda6f52a3aabbd0f1511fa898d589f7dd984126b5959dbe2d47",
+      "amountSats": 5000,
+      "paymentHash": "76c1c20377be869a3a3c31962f2206ba7e4a9a7f4213a44c9a80991b3a80fb00"
+    },
+    {
+      "name": "explicit unpaid epoch close stops admission and retains the reserved voucher",
+      "channelId": "f4a5c17255a5a42b3ebbbb32f55db7e214ca1a9160a31479c6d49ad05e160286",
+      "epochId": "4c3893533bdafeda6f52a3aabbd0f1511fa898d589f7dd984126b5959dbe2d47",
+      "state": "DRAINING",
+      "reservedHtlcs": 1
+    },
+    {
+      "name": "both restarts preserve the unpaid reserved book without a false credit",
+      "epochId": "4c3893533bdafeda6f52a3aabbd0f1511fa898d589f7dd984126b5959dbe2d47",
+      "localBalanceSats": 16880,
+      "reservedHtlcs": 1
+    },
+    {
+      "name": "unpaid reserved voucher resolves through its actual six-confirmation timeout",
+      "commitmentTxid": "ee5acd3c49fb5ae6bb92b9c08e2ee7548a0195f9d7571c2fabb3fb18afa51529",
+      "voucherOutputIndex": 2,
+      "timeoutTxid": "e4cee8638b85ce148d0e713dbbed83af84918c599c023c67afce4022ede5918c",
+      "voucherExpiry": 2847,
+      "timeoutConfirmations": 6,
+      "completedReceiveRows": 0
+    },
+    {
+      "name": "durable unpaid timeout permits a fresh native JIT home with no old invoice credit",
+      "oldChannelId": "f4a5c17255a5a42b3ebbbb32f55db7e214ca1a9160a31479c6d49ad05e160286",
+      "channelId": "0c1da0647693262c8023ac4a0b439e96b4d259c1c599f6b3437b378ed17b28a6",
+      "localBalanceSats": 9890,
+      "freshReceiveRows": 1,
+      "unpaidReceiveRows": 0
+    }
+  ],
+  "primaryBinarySha256": "617a88077fe5e3a0acd0ab2c2b0beecf36a11756c6be75e5e305b7578f38f668",
+  "packages": {
+    "chicoryVersion": "0.7.4",
+    "engineUpstreamVersion": "0.32.1",
+    "engineSha256": "05cdb752e1007532edc1366ea14cbf98a96825885a62d47d6001f74c1bed229d",
+    "walletCoreSha256": "4a79550c91ac05303d85d28fe0b5daf4c2a05da97e713a83db54012f7e9a655e",
+    "payerVersion": "0.32.2"
+  },
+  "chain": "regtest",
+  "startedAt": "2026-10-25T05:58:07.320Z",
+  "providerNodeId": "03d60603af3d4561416047816a1a792c36ae05274e4e1457ddbe7df6b942012828",
+  "processes": [
+    73746,
+    74196,
+    74978
+  ],
+  "completedAt": "2026-10-25T05:59:05.455Z",
+  "passed": true
+}

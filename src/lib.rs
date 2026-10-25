@@ -80,6 +80,8 @@
 mod balance;
 mod builder;
 mod chain;
+#[cfg(feature = "chicory")]
+pub mod chicory;
 pub mod config;
 mod connection;
 mod data_store;
@@ -206,6 +208,8 @@ pub struct Node {
 	gossip_source: Arc<GossipSource>,
 	pathfinding_scores_sync_url: Option<String>,
 	liquidity_source: Option<Arc<LiquiditySource<Arc<Logger>>>>,
+	#[cfg(feature = "chicory")]
+	chicory_service: Option<Arc<chicory::ChicoryService>>,
 	kv_store: Arc<DynStore>,
 	logger: Arc<Logger>,
 	_router: Arc<Router>,
@@ -665,6 +669,8 @@ impl Node {
 			Arc::clone(&self.output_sweeper),
 			Arc::clone(&self.network_graph),
 			self.liquidity_source.clone(),
+			#[cfg(feature = "chicory")]
+			self.chicory_service.clone(),
 			Arc::clone(&self.payment_store),
 			Arc::clone(&self.peer_store),
 			static_invoice_store,
@@ -778,6 +784,41 @@ impl Node {
 			});
 		}
 
+		#[cfg(feature = "chicory")]
+		if let Some(service) = self.chicory_service.clone() {
+			{
+				service.start_conflicts();
+				for _ in 0..2 {
+					let service = Arc::clone(&service);
+					let chain_source = Arc::clone(&self.chain_source);
+					let peer_manager = Arc::clone(&self.peer_manager);
+					let mut stop = self.stop_sender.subscribe();
+					self.runtime.spawn_cancellable_background_task(async move {
+						loop {
+							tokio::select! {
+								_ = stop.changed() => return,
+								_ = service.handle_next_conflict(&chain_source) => peer_manager.process_events(),
+							}
+						}
+					});
+				}
+			}
+			let mut stop = self.stop_sender.subscribe();
+			let peer_manager = Arc::clone(&self.peer_manager);
+			self.runtime.spawn_cancellable_background_task(async move {
+				let mut interval = tokio::time::interval(Duration::from_secs(1));
+				loop {
+					tokio::select! {
+						_ = stop.changed() => return,
+						_ = interval.tick() => {
+							service.tick();
+							peer_manager.process_events();
+						}
+					}
+				}
+			});
+		}
+
 		log_info!(self.logger, "Startup complete.");
 		*self.is_running.write().unwrap() = true;
 		if self.background_processor_failed.load(Ordering::Acquire) {
@@ -830,6 +871,10 @@ impl Node {
 
 		// Prevent all task groups from accepting work that could outlive this shutdown generation.
 		self.runtime.close_task_admission();
+		#[cfg(feature = "chicory")]
+		if let Some(service) = &self.chicory_service {
+			service.stop_conflicts();
+		}
 
 		// Prevent blocking Electrum syncs from making any further callbacks before persistence
 		// tasks stop accepting work.

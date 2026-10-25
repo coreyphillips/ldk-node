@@ -2389,6 +2389,16 @@ impl NodeSigner for WalletKeysManager {
 	fn sign_message(&self, msg: &[u8]) -> Result<String, ()> {
 		self.inner.sign_message(msg)
 	}
+
+	fn supports_ffor_settler(&self) -> bool {
+		self.inner.supports_ffor_settler()
+	}
+
+	fn sign_ffor_message(&self, message_type: u16, unsigned: &[u8]) -> Result<Signature, ()> {
+		// The native signer checks the protocol domain and canonical outbound
+		// message before signing. No raw signing key crosses this boundary.
+		self.inner.sign_ffor_message(message_type, unsigned)
+	}
 }
 
 impl OutputSpender for WalletKeysManager {

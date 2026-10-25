@@ -1,0 +1,72 @@
+{
+  "scope": "installed-chicory-portable",
+  "checks": [
+    {
+      "name": "installed Chicory engine and wallet-core pair with native primary"
+    },
+    {
+      "name": "external payer has a confirmed channel to native primary"
+    },
+    {
+      "name": "installed wallet reviews and creates a skim-fee unified JIT request"
+    },
+    {
+      "name": "installed wallet Activity and balances reflect the native JIT payment",
+      "paymentHash": "d4c374362d130ce1ac64ccf1c674ba691a888d0f0d1a6a0f45b118f830621b4f",
+      "status": "completed",
+      "activityAmountSats": 20000,
+      "activityFeeSats": 0,
+      "totalSats": 19880,
+      "availableSats": 18880
+    },
+    {
+      "name": "installed wallet restart restores the paid request, balance and channel"
+    },
+    {
+      "name": "installed wallet pays a native primary invoice and records completed Activity"
+    },
+    {
+      "name": "disposable payer replaces only its nonshared direct-funding input",
+      "candidateTxid": "6ee0daea0168b045734e9bffe7038bac9f6f935aee7d0eea30b0a99b4bfbb113",
+      "conflictTxid": "1e3a7746c2410047e522eb91174b03da3512821d671de9cd5200d759161bc4d9",
+      "inputIndex": 1,
+      "oldFundingTxid": "2c47fe6bede2f2d76925947afc4fb63a2ff202c221f975305418b1523f90519c",
+      "replacementFeeSats": 10000
+    },
+    {
+      "name": "five-confirmation conflict does not roll back the candidate across primary restart",
+      "candidateTxid": "6ee0daea0168b045734e9bffe7038bac9f6f935aee7d0eea30b0a99b4bfbb113",
+      "conflictTxid": "1e3a7746c2410047e522eb91174b03da3512821d671de9cd5200d759161bc4d9",
+      "confirmations": 5
+    },
+    {
+      "name": "six-confirmation conflict restores matching usable prior funding on both peers",
+      "candidateTxid": "6ee0daea0168b045734e9bffe7038bac9f6f935aee7d0eea30b0a99b4bfbb113",
+      "conflictTxid": "1e3a7746c2410047e522eb91174b03da3512821d671de9cd5200d759161bc4d9",
+      "confirmations": 6,
+      "fundingTxid": "2c47fe6bede2f2d76925947afc4fb63a2ff202c221f975305418b1523f90519c",
+      "localBalanceSats": 16880
+    },
+    {
+      "name": "installed wallet spends from recovered prior funding after both restarts",
+      "amountSats": 1000
+    }
+  ],
+  "packages": {
+    "chicoryVersion": "0.7.4",
+    "engineUpstreamVersion": "0.32.1",
+    "engineSha256": "05cdb752e1007532edc1366ea14cbf98a96825885a62d47d6001f74c1bed229d",
+    "walletCoreSha256": "4a79550c91ac05303d85d28fe0b5daf4c2a05da97e713a83db54012f7e9a655e",
+    "payerVersion": "0.32.2"
+  },
+  "chain": "regtest",
+  "startedAt": "2026-10-25T05:45:22.254Z",
+  "providerNodeId": "036d518036134dae12532f3ff6cceea8281721fa8088e95936260af483dcbe928a",
+  "processes": [
+    61430,
+    62757,
+    62963
+  ],
+  "completedAt": "2026-10-25T05:46:49.512Z",
+  "passed": true
+}

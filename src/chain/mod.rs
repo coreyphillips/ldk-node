@@ -6,6 +6,10 @@
 // accordance with one or both of these licenses.
 
 mod bitcoind;
+#[cfg(feature = "chicory")]
+mod chicory;
+#[cfg(feature = "chicory")]
+pub(crate) use chicory::ConfirmedTransaction;
 mod electrum;
 mod esplora;
 

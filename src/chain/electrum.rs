@@ -190,6 +190,8 @@ fn derived_wallet_incremental_sync_timeout(
 }
 
 pub(super) struct ElectrumChainSource {
+	#[cfg(feature = "chicory")]
+	pub(super) chain_apply_gate: Arc<tokio::sync::Mutex<bool>>,
 	server_url: String,
 	pub(super) sync_config: ElectrumSyncConfig,
 	electrum_runtime_status: RwLock<ElectrumRuntimeStatus>,
@@ -214,6 +216,8 @@ impl ElectrumChainSource {
 		let onchain_wallet_sync_status = Mutex::new(WalletSyncStatus::Completed);
 		let lightning_wallet_sync_status = Mutex::new(WalletSyncStatus::Completed);
 		Self {
+			#[cfg(feature = "chicory")]
+			chain_apply_gate: Arc::new(tokio::sync::Mutex::new(false)),
 			server_url,
 			sync_config,
 			electrum_runtime_status,
@@ -533,7 +537,13 @@ impl ElectrumChainSource {
 			};
 
 		let confirmable = electrum_client.wrap_confirmables(&confirmables);
-		let res = electrum_client.sync_confirmables(vec![confirmable]).await;
+		let res = electrum_client
+			.sync_confirmables(
+				vec![confirmable],
+				#[cfg(feature = "chicory")]
+				Arc::clone(&self.chain_apply_gate),
+			)
+			.await;
 
 		if let Ok(_) = res {
 			let unix_time_secs_opt =
@@ -610,6 +620,33 @@ impl ElectrumChainSource {
 		}
 	}
 
+	#[cfg(feature = "chicory")]
+	pub(super) async fn confirmed_transaction(
+		&self, txid: Txid, tip: lightning::chain::BestBlock,
+	) -> Result<super::chicory::ConfirmedTransaction, Error> {
+		let runtime =
+			self.electrum_runtime_status.read().unwrap().client().ok_or(Error::NotRunning)?;
+		let permit = Arc::clone(&runtime.conflict_gate)
+			.try_acquire_owned()
+			.map_err(|_| Error::TxSyncFailed)?;
+		let connect = Arc::clone(&runtime.connect_conflict);
+		let deadline = Instant::now() + Duration::from_secs(15);
+		runtime
+			.runtime_handle
+			.spawn_blocking(move || {
+				// Cancellation of spawn_blocking does not stop a running socket call.
+				// Keep the permit until it exits, and never share the wallet client.
+				let _permit = permit;
+				if Instant::now() >= deadline {
+					return Err(Error::TxSyncFailed);
+				}
+				let client = connect().map_err(|_| Error::TxSyncFailed)?;
+				confirmed_electrum_transaction(&client, txid, tip, deadline)
+			})
+			.await
+			.map_err(|_| Error::TxSyncFailed)?
+	}
+
 	pub(crate) async fn broadcast_transaction_with_result(
 		&self, tx: &Transaction,
 	) -> Result<BroadcastResponse, Error> {
@@ -627,6 +664,73 @@ impl ElectrumChainSource {
 			};
 		electrum_client.get_address_balance(address).await
 	}
+}
+
+/// Read a proof on an isolated, finite-timeout client. The configured chain
+/// backend remains trusted for active-chain identity, as it is for native sync.
+#[cfg(feature = "chicory")]
+pub(super) fn confirmed_electrum_transaction(
+	client: &impl ElectrumApi, txid: Txid, tip: lightning::chain::BestBlock, deadline: Instant,
+) -> Result<super::chicory::ConfirmedTransaction, Error> {
+	let remaining = || if Instant::now() < deadline { Ok(()) } else { Err(Error::TxSyncFailed) };
+	let header_at = |height| {
+		remaining()?;
+		client.block_header(height as usize).map_err(|_| Error::TxSyncFailed)
+	};
+	let starting_header = header_at(tip.height)?;
+	if starting_header.block_hash() != tip.block_hash {
+		return Err(Error::TxSyncFailed);
+	}
+	remaining()?;
+	let transaction = client.transaction_get(&txid).map_err(|_| Error::TxSyncFailed)?;
+	if transaction.compute_txid() != txid {
+		return Err(Error::TxSyncFailed);
+	}
+	// The first output may be OP_RETURN and absent from an Electrum index. A
+	// confirmed non-coinbase spend has a spendable parent script to query instead.
+	let outpoint = transaction.input.first().ok_or(Error::TxSyncFailed)?.previous_output;
+	if outpoint.is_null() {
+		return Err(Error::TxSyncFailed);
+	}
+	remaining()?;
+	let parent = client.transaction_get(&outpoint.txid).map_err(|_| Error::TxSyncFailed)?;
+	if parent.compute_txid() != outpoint.txid {
+		return Err(Error::TxSyncFailed);
+	}
+	let script =
+		&parent.output.get(outpoint.vout as usize).ok_or(Error::TxSyncFailed)?.script_pubkey;
+	remaining()?;
+	let history = client.script_get_history(script).map_err(|_| Error::TxSyncFailed)?;
+	let mut heights = history
+		.iter()
+		.filter(|row| row.tx_hash == txid && row.height > 0)
+		.map(|row| row.height as u32);
+	let height = heights.next().ok_or(Error::TxSyncFailed)?;
+	if heights.any(|other| other != height) || !super::chicory::sufficiently_confirmed(height, tip)
+	{
+		return Err(Error::TxSyncFailed);
+	}
+	remaining()?;
+	let proof =
+		client.transaction_get_merkle(&txid, height as usize).map_err(|_| Error::TxSyncFailed)?;
+	let header = header_at(height)?;
+	// Bound branch depth and reject position bits that are outside the proof.
+	if proof.block_height != height as usize
+		|| proof.merkle.len() > 32
+		|| (proof.merkle.len() < usize::BITS as usize && proof.pos >> proof.merkle.len() != 0)
+		|| !electrum_client::utils::validate_merkle_proof(&txid, &header.merkle_root, &proof)
+		|| header_at(tip.height)?.block_hash() != tip.block_hash
+		|| header_at(height)?.block_hash() != header.block_hash()
+	{
+		return Err(Error::TxSyncFailed);
+	}
+	remaining()?;
+	Ok(super::chicory::ConfirmedTransaction {
+		transaction,
+		block_hash: header.block_hash(),
+		height,
+		tip,
+	})
 }
 
 impl Filter for ElectrumChainSource {
@@ -744,6 +848,10 @@ struct ElectrumRuntimeClient {
 	config: Arc<Config>,
 	logger: Arc<Logger>,
 	confirm_gate: Arc<ConfirmGate>,
+	#[cfg(feature = "chicory")]
+	conflict_gate: Arc<tokio::sync::Semaphore>,
+	#[cfg(feature = "chicory")]
+	connect_conflict: Arc<dyn Fn() -> Result<ElectrumClient, ElectrumError> + Send + Sync>,
 }
 
 impl ElectrumRuntimeClient {
@@ -783,9 +891,23 @@ impl ElectrumRuntimeClient {
 				},
 			)?,
 		);
+		#[cfg(feature = "chicory")]
+		let connect_conflict = {
+			let url = server_url.clone();
+			Arc::new(move || {
+				ElectrumClient::from_config(
+					&url,
+					ElectrumConfigBuilder::new().retry(0).timeout(Some(2)).build(),
+				)
+			})
+		};
 		let connect_main =
 			Arc::new(move || MainElectrumClient::connect(&server_url, &electrum_config));
 		Ok(Self {
+			#[cfg(feature = "chicory")]
+			conflict_gate: Arc::new(tokio::sync::Semaphore::new(2)),
+			#[cfg(feature = "chicory")]
+			connect_conflict,
 			main_client: Arc::new(RwLock::new(Arc::new(main_client))),
 			connect_main,
 			tx_sync,
@@ -875,11 +997,29 @@ impl ElectrumRuntimeClient {
 
 	async fn sync_confirmables(
 		&self, confirmables: Vec<Arc<dyn Confirm + Sync + Send>>,
+		#[cfg(feature = "chicory")] chain_apply_gate: Arc<tokio::sync::Mutex<bool>>,
 	) -> Result<(), Error> {
 		let now = Instant::now();
 
 		let tx_sync = Arc::clone(&self.tx_sync);
-		let spawn_fut = self.runtime_handle.spawn_blocking(move || tx_sync.sync(confirmables));
+		#[cfg(feature = "chicory")]
+		let confirm_gate = Arc::clone(&self.confirm_gate);
+		let spawn_fut = self.runtime_handle.spawn_blocking(move || {
+			// The blocking sync may outlive its async timeout. Keep its paired
+			// manager/monitor application gate inside the blocking task itself.
+			#[cfg(feature = "chicory")]
+			let mut chain_apply = chain_apply_gate.blocking_lock();
+			#[cfg(feature = "chicory")]
+			{
+				*chain_apply = false;
+			}
+			let result = tx_sync.sync(confirmables);
+			#[cfg(feature = "chicory")]
+			{
+				*chain_apply = result.is_ok() && confirm_gate.is_active();
+			}
+			result
+		});
 		let timeout_fut =
 			tokio::time::timeout(Duration::from_secs(LDK_WALLET_SYNC_TIMEOUT_SECS), spawn_fut);
 

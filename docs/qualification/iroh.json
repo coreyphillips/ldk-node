@@ -1,0 +1,80 @@
+{
+  "scope": "installed-chicory-portable-direct-iroh",
+  "checks": [
+    {
+      "name": "installed Chicory engine and wallet-core pair with native primary"
+    },
+    {
+      "name": "external payer has a confirmed channel to native primary"
+    },
+    {
+      "name": "installed wallet reviews and creates a skim-fee unified JIT request"
+    },
+    {
+      "name": "installed wallet Activity and balances reflect the native JIT payment",
+      "paymentHash": "f48b335dc763432ab97b56ab40613f2fb374b7ef049c9b2b2473190fcc62c024",
+      "status": "completed",
+      "activityAmountSats": 20000,
+      "activityFeeSats": 0,
+      "totalSats": 19880,
+      "availableSats": 18880
+    },
+    {
+      "name": "installed wallet restart restores the paid request, balance and channel"
+    },
+    {
+      "name": "installed wallet pays a native primary invoice and records completed Activity"
+    },
+    {
+      "name": "installed wallet prepares an active concurrent-v2 offline reservation",
+      "channelId": "db9b56f99ef79cb2e7c3a107bcb8a48adc92629cb5543b594aa0fcbe36db87a6",
+      "epochId": "8b41cb40cd87e5daba018451c12bfb00f29fa7bbfde35f75289edd05e7e6bc07",
+      "amountSats": 5000,
+      "paymentHash": "d1ac3ae7497f6c4d9178f7e3bcefffe7c491c1c7ebf6451347c9a51e9bee5a57"
+    },
+    {
+      "name": "native active offline reservation survives ordinary payments in both directions",
+      "channelId": "db9b56f99ef79cb2e7c3a107bcb8a48adc92629cb5543b594aa0fcbe36db87a6",
+      "epochId": "8b41cb40cd87e5daba018451c12bfb00f29fa7bbfde35f75289edd05e7e6bc07",
+      "sentSats": 1000,
+      "receivedSats": 1200,
+      "totalSats": 17080
+    },
+    {
+      "name": "restarted native primary settles the external payment while the phone is stopped",
+      "amountSats": 5000,
+      "paymentHash": "d1ac3ae7497f6c4d9178f7e3bcefffe7c491c1c7ebf6451347c9a51e9bee5a57"
+    },
+    {
+      "name": "installed phone recovers the durable offline receipt after primary restart",
+      "amountSats": 5000,
+      "totalSats": 22080,
+      "activityRows": 1
+    },
+    {
+      "name": "second phone reopen preserves one offline credit and one completed Activity row",
+      "totalSats": 22080,
+      "activityRows": 1
+    }
+  ],
+  "primaryBinarySha256": "31c5f546513e7a3d348e4c8dd52ddc98eb2783df514f4cd620e8245267188b7b",
+  "packages": {
+    "chicoryVersion": "0.7.4",
+    "engineUpstreamVersion": "0.32.1",
+    "engineSha256": "05cdb752e1007532edc1366ea14cbf98a96825885a62d47d6001f74c1bed229d",
+    "walletCoreSha256": "4a79550c91ac05303d85d28fe0b5daf4c2a05da97e713a83db54012f7e9a655e",
+    "payerVersion": "0.32.2"
+  },
+  "chain": "regtest",
+  "startedAt": "2026-10-25T05:54:24.643Z",
+  "irohEndpointId": "73f6cda684ee6bf0b16756fb9154a2c19f0ed269f8a26114ba61efad3247363f",
+  "providerNodeId": "029c1d84fd614eb5f32078de66662c51cf5a382b024dee601bdf0be72e1f287be5",
+  "processes": [
+    71045,
+    71452,
+    71499
+  ],
+  "irohOfflineSetupDelayMs": 9000,
+  "completedAt": "2026-10-25T05:55:00.967Z",
+  "passed": true
+}

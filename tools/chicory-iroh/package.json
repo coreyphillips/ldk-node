@@ -1,0 +1,9 @@
+{
+  "name": "chicory-ldk-iroh-bridge",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Optional Iroh byte transport for a local native LDK Node",
+  "engines": { "node": ">=20.3.0" },
+  "scripts": { "test": "node --test bridge.test.cjs", "start": "node bridge.cjs" },
+  "dependencies": { "@number0/iroh": "1.1.0" }
+}

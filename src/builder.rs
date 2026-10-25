@@ -48,6 +48,8 @@ use lightning_persister::fs_store::FilesystemStore;
 use vss_client::headers::{FixedHeaders, LnurlAuthToJwtProvider, VssHeaderProvider};
 
 use crate::chain::ChainSource;
+#[cfg(feature = "chicory")]
+use crate::chicory::{ChicoryService, JitConfigError, JitServiceConfig};
 use crate::config::{
 	default_user_config, may_announce_channel, AddressType, AddressTypeRuntimeConfig,
 	AnnounceError, AsyncPaymentsRole, BitcoindRestClientConfig, Config, ElectrumSyncConfig,
@@ -296,6 +298,8 @@ pub struct NodeBuilder {
 	chain_data_source_config: Option<ChainDataSourceConfig>,
 	gossip_source_config: Option<GossipSourceConfig>,
 	liquidity_source_config: Option<LiquiditySourceConfig>,
+	#[cfg(feature = "chicory")]
+	chicory_service_config: Option<JitServiceConfig>,
 	log_writer_config: Option<LogWriterConfig>,
 	async_payments_role: Option<AsyncPaymentsRole>,
 	runtime_handle: Option<tokio::runtime::Handle>,
@@ -326,12 +330,31 @@ impl NodeBuilder {
 			chain_data_source_config,
 			gossip_source_config,
 			liquidity_source_config,
+			#[cfg(feature = "chicory")]
+			chicory_service_config: None,
 			log_writer_config,
 			runtime_handle,
 			async_payments_role: None,
 			pathfinding_scores_sync_config,
 			channel_data_migration,
 		}
+	}
+
+	/// Enables the experimental native Beignet JIT service used by Chicory.
+	///
+	/// The policy bounds funds the node may allocate to authenticated peers. This
+	/// does not enable FFOR, zero-reserve channels, or a complete direct-funding flow.
+	/// Confirmed inbound v2 acceptance has a separate opt-in in the policy.
+	/// The service is disabled by default and is not a complete Chicory primary.
+	/// Invalid policies are rejected without replacing the current policy.
+	/// See `docs/chicory-primary.md`.
+	#[cfg(feature = "chicory")]
+	pub fn set_chicory_service(
+		&mut self, config: JitServiceConfig,
+	) -> Result<&mut Self, JitConfigError> {
+		config.validate()?;
+		self.chicory_service_config = Some(config);
+		Ok(self)
 	}
 
 	/// Configures the [`Node`] instance to (re-)use a specific `tokio` runtime.
@@ -840,6 +863,8 @@ impl NodeBuilder {
 			self.chain_data_source_config.as_ref(),
 			self.gossip_source_config.as_ref(),
 			self.liquidity_source_config.as_ref(),
+			#[cfg(feature = "chicory")]
+			self.chicory_service_config.as_ref(),
 			self.pathfinding_scores_sync_config.as_ref(),
 			self.async_payments_role,
 			seed_bytes,
@@ -875,6 +900,8 @@ impl NodeBuilder {
 			self.chain_data_source_config.as_ref(),
 			self.gossip_source_config.as_ref(),
 			self.liquidity_source_config.as_ref(),
+			#[cfg(feature = "chicory")]
+			self.chicory_service_config.as_ref(),
 			self.pathfinding_scores_sync_config.as_ref(),
 			self.async_payments_role,
 			seed_bytes,
@@ -901,6 +928,16 @@ pub struct ArcedNodeBuilder {
 
 #[cfg(feature = "uniffi")]
 impl ArcedNodeBuilder {
+	/// Enables the experimental native JIT service for Rust callers using this builder.
+	///
+	/// This method is not exposed through generated bindings. It has the same
+	/// policy validation and incomplete compatibility scope as
+	/// [`NodeBuilder::set_chicory_service`].
+	#[cfg(feature = "chicory")]
+	pub fn set_chicory_service(&self, config: JitServiceConfig) -> Result<(), JitConfigError> {
+		self.inner.write().unwrap().set_chicory_service(config).map(|_| ())
+	}
+
 	/// Creates a new builder instance with the default configuration.
 	pub fn new() -> Self {
 		let inner = RwLock::new(NodeBuilder::new());
@@ -1724,6 +1761,7 @@ fn build_with_store_internal(
 	config: Arc<Config>, chain_data_source_config: Option<&ChainDataSourceConfig>,
 	gossip_source_config: Option<&GossipSourceConfig>,
 	liquidity_source_config: Option<&LiquiditySourceConfig>,
+	#[cfg(feature = "chicory")] chicory_service_config: Option<&JitServiceConfig>,
 	pathfinding_scores_sync_config: Option<&PathfindingScoresSyncConfig>,
 	async_payments_role: Option<AsyncPaymentsRole>, seed_bytes: [u8; 64], runtime: Runtime,
 	logger: Arc<Logger>, kv_store: Arc<DynStore>,
@@ -2197,6 +2235,22 @@ fn build_with_store_internal(
 			100;
 	}
 
+	#[cfg(feature = "chicory")]
+	if let Some(policy) = chicory_service_config {
+		user_config.accept_inbound_channels_v2 = policy.allow_confirmed_v2;
+		user_config.intercept_liquidity_shortfalls = policy.enabled && policy.allow_splice_jit;
+		user_config.minimum_inbound_splice_depth = Some(policy.inbound_splice_minimum_depth);
+		user_config.channel_handshake_config.reuse_funding_key_on_splice =
+			policy.reuse_funding_key_on_splice;
+		if policy.enabled {
+			user_config.accept_intercept_htlcs = true;
+			user_config.accept_forwards_to_priv_channels = true;
+			user_config
+				.channel_handshake_config
+				.max_inbound_htlc_value_in_flight_percent_of_channel = 100;
+		}
+	}
+
 	if let Some(role) = async_payments_role {
 		match role {
 			AsyncPaymentsRole::Server => {
@@ -2346,6 +2400,21 @@ fn build_with_store_internal(
 		)),
 	};
 
+	#[cfg(feature = "chicory")]
+	let chicory_service = chicory_service_config
+		.map(|policy| {
+			ChicoryService::new(
+				policy.clone(),
+				Arc::clone(&channel_manager),
+				Arc::clone(&chain_monitor),
+				Arc::clone(&wallet),
+				Arc::clone(&kv_store),
+				Arc::clone(&config),
+			)
+			.map(Arc::new)
+		})
+		.transpose()?;
+
 	let (liquidity_source, custom_message_handler) =
 		if let Some(lsc) = liquidity_source_config.as_ref() {
 			let mut liquidity_source_builder = LiquiditySourceBuilder::new(
@@ -2391,15 +2460,27 @@ fn build_with_store_internal(
 			let liquidity_source = runtime
 				.block_on(async move { liquidity_source_builder.build().await.map(Arc::new) })?;
 			let custom_message_handler =
-				Arc::new(NodeCustomMessageHandler::new_liquidity(Arc::clone(&liquidity_source)));
+				NodeCustomMessageHandler::new_liquidity(Arc::clone(&liquidity_source));
 			(Some(liquidity_source), custom_message_handler)
 		} else {
-			(None, Arc::new(NodeCustomMessageHandler::new_ignoring()))
+			(None, NodeCustomMessageHandler::new_ignoring())
 		};
+
+	#[cfg(feature = "chicory")]
+	let custom_message_handler = custom_message_handler.with_chicory(chicory_service.clone());
+	let custom_message_handler = Arc::new(custom_message_handler);
+	#[cfg(feature = "chicory")]
+	let channel_message_handler = Arc::new(crate::chicory::PeerStorageChannelHandler::new(
+		Arc::clone(&channel_manager),
+		Arc::clone(&kv_store),
+		chicory_service.is_some(),
+	));
+	#[cfg(not(feature = "chicory"))]
+	let channel_message_handler = Arc::clone(&channel_manager);
 
 	let msg_handler = match gossip_source.as_gossip_sync() {
 		GossipSync::P2P(p2p_gossip_sync) => MessageHandler {
-			chan_handler: Arc::clone(&channel_manager),
+			chan_handler: Arc::clone(&channel_message_handler),
 			route_handler: Arc::clone(&p2p_gossip_sync)
 				as Arc<dyn RoutingMessageHandler + Sync + Send>,
 			onion_message_handler: Arc::clone(&onion_messenger),
@@ -2407,7 +2488,7 @@ fn build_with_store_internal(
 			send_only_message_handler: Arc::clone(&chain_monitor),
 		},
 		GossipSync::Rapid(_) => MessageHandler {
-			chan_handler: Arc::clone(&channel_manager),
+			chan_handler: Arc::clone(&channel_message_handler),
 			route_handler: Arc::new(IgnoringMessageHandler {})
 				as Arc<dyn RoutingMessageHandler + Sync + Send>,
 			onion_message_handler: Arc::clone(&onion_messenger),
@@ -2599,6 +2680,8 @@ fn build_with_store_internal(
 		gossip_source,
 		pathfinding_scores_sync_url,
 		liquidity_source,
+		#[cfg(feature = "chicory")]
+		chicory_service,
 		kv_store,
 		logger,
 		_router: router,

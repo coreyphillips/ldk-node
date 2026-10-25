@@ -1,5 +1,6 @@
 [workspace]
-members = [".", "crates/bdk-wallet-aggregate"]
+members = [".", "crates/bdk-wallet-aggregate", "vendor/lightning", "vendor/lightning-liquidity"]
+default-members = ["."]
 exclude = ["bindings/uniffi-bindgen"]
 
 [package]
@@ -31,6 +32,8 @@ panic = 'abort'     # Abort on panic
 
 [features]
 default = []
+# Experimental native Beignet protocol support. See docs/chicory-primary.md.
+chicory = []
 
 [dependencies]
 lightning = { version = "0.2.7", features = ["std"] }
@@ -125,7 +128,15 @@ check-cfg = [
 name = "payments"
 harness = false
 
-#[patch.crates-io]
+[[example]]
+name = "chicory-primary"
+required-features = ["chicory"]
+
+[patch.crates-io]
+# Pinned native compatibility changes, documented in docs/chicory-primary.md.
+lightning = { path = "vendor/lightning" }
+lightning-liquidity = { path = "vendor/lightning-liquidity" }
+
 #lightning = { path = "../rust-lightning/lightning" }
 #lightning-types = { path = "../rust-lightning/lightning-types" }
 #lightning-invoice = { path = "../rust-lightning/lightning-invoice" }

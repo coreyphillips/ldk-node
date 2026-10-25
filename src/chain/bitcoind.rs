@@ -55,6 +55,8 @@ enum ListenerSyncOutcome {
 }
 
 pub(super) struct BitcoindChainSource {
+	#[cfg(feature = "chicory")]
+	pub(super) chain_apply_gate: Arc<tokio::sync::Mutex<bool>>,
 	api_client: Arc<BitcoindClient>,
 	header_cache: tokio::sync::Mutex<BoundedHeaderCache>,
 	wallet_polling_status: Mutex<WalletSyncStatus>,
@@ -97,6 +99,8 @@ impl BitcoindChainSource {
 		let header_cache = tokio::sync::Mutex::new(BoundedHeaderCache::new());
 		let wallet_polling_status = Mutex::new(WalletSyncStatus::Completed);
 		Self {
+			#[cfg(feature = "chicory")]
+			chain_apply_gate: Arc::new(tokio::sync::Mutex::new(false)),
 			api_client,
 			header_cache,
 			wallet_polling_status,
@@ -128,6 +132,8 @@ impl BitcoindChainSource {
 		let wallet_polling_status = Mutex::new(WalletSyncStatus::Completed);
 
 		Self {
+			#[cfg(feature = "chicory")]
+			chain_apply_gate: Arc::new(tokio::sync::Mutex::new(false)),
 			api_client,
 			header_cache,
 			wallet_polling_status,
@@ -388,6 +394,12 @@ impl BitcoindChainSource {
 		&self, onchain_wallet: Arc<Wallet>, channel_manager: Arc<ChannelManager>,
 		chain_monitor: Arc<ChainMonitor>, output_sweeper: Arc<Sweeper>,
 	) -> Result<ListenerSyncOutcome, Error> {
+		#[cfg(feature = "chicory")]
+		let mut chain_apply = self.chain_apply_gate.lock().await;
+		#[cfg(feature = "chicory")]
+		{
+			*chain_apply = false;
+		}
 		onchain_wallet.finish_pending_sync(false)?;
 
 		let previous_lightning_tip = channel_manager.current_best_block();
@@ -436,6 +448,11 @@ impl BitcoindChainSource {
 			log_error!(self.logger, "Failed to synchronize chain listeners: {:?}", e);
 			Error::TxSyncFailed
 		})?;
+		#[cfg(feature = "chicory")]
+		{
+			*chain_apply = true;
+			drop(chain_apply);
+		}
 		drop(locked_header_cache);
 
 		for listener in &account_listeners {
@@ -659,6 +676,81 @@ impl BitcoindChainSource {
 		}
 
 		Ok(())
+	}
+
+	#[cfg(feature = "chicory")]
+	pub(super) async fn confirmed_transaction(
+		&self, txid: Txid, tip: BestBlock,
+	) -> Result<super::chicory::ConfirmedTransaction, Error> {
+		// Both configured Core modes already carry an authenticated RPC client.
+		// Arbitrary confirmed lookups require the node's transaction index.
+		let rpc = match &*self.api_client {
+			BitcoindClient::Rpc { rpc_client, .. } | BitcoindClient::Rest { rpc_client, .. } => {
+				rpc_client
+			},
+		};
+		let initial: BlockHash = rpc
+			.call_method("getblockhash", &[serde_json::json!(tip.height)])
+			.await
+			.map_err(|_| Error::TxSyncFailed)?;
+		if initial != tip.block_hash {
+			return Err(Error::TxSyncFailed);
+		}
+		let value: serde_json::Value = rpc
+			.call_method(
+				"getrawtransaction",
+				&[serde_json::json!(txid.to_string()), serde_json::json!(true)],
+			)
+			.await
+			.map_err(|_| Error::TxSyncFailed)?;
+		let block_hash: BlockHash = value
+			.get("blockhash")
+			.and_then(|v| v.as_str())
+			.ok_or(Error::TxSyncFailed)?
+			.parse()
+			.map_err(|_| Error::TxSyncFailed)?;
+		let header = rpc.get_header(&block_hash, None).await.map_err(|_| Error::TxSyncFailed)?;
+		if header.header.block_hash() != block_hash
+			|| !super::chicory::sufficiently_confirmed(header.height, tip)
+		{
+			return Err(Error::TxSyncFailed);
+		}
+		let active: BlockHash = rpc
+			.call_method("getblockhash", &[serde_json::json!(header.height)])
+			.await
+			.map_err(|_| Error::TxSyncFailed)?;
+		if active != block_hash {
+			return Err(Error::TxSyncFailed);
+		}
+		let block = match rpc.get_block(&block_hash).await.map_err(|_| Error::TxSyncFailed)? {
+			BlockData::FullBlock(block) => block,
+			_ => return Err(Error::TxSyncFailed),
+		};
+		if block.block_hash() != block_hash || !block.check_merkle_root() {
+			return Err(Error::TxSyncFailed);
+		}
+		let transaction = block
+			.txdata
+			.into_iter()
+			.find(|tx| tx.compute_txid() == txid)
+			.ok_or(Error::TxSyncFailed)?;
+		let observed: BlockHash = rpc
+			.call_method("getblockhash", &[serde_json::json!(tip.height)])
+			.await
+			.map_err(|_| Error::TxSyncFailed)?;
+		let active: BlockHash = rpc
+			.call_method("getblockhash", &[serde_json::json!(header.height)])
+			.await
+			.map_err(|_| Error::TxSyncFailed)?;
+		if observed != tip.block_hash || active != block_hash {
+			return Err(Error::TxSyncFailed);
+		}
+		Ok(super::chicory::ConfirmedTransaction {
+			transaction,
+			block_hash,
+			height: header.height,
+			tip,
+		})
 	}
 
 	pub(crate) async fn broadcast_transaction_with_result(

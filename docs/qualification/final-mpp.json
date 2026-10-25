@@ -1,0 +1,73 @@
+{
+  "scope": "native-jit-two-part",
+  "checks": [
+    {
+      "name": "native primary has a confirmed external payer channel and an unfunded receiver"
+    },
+    {
+      "name": "unchanged receiver authorizes one multipart invoice and provider restart preserves registration",
+      "amountSats": 20000
+    },
+    {
+      "name": "existing Beignet MPP sender dispatches two distinct HTLCs to the same intercept SCID",
+      "interceptScid": "0000010002370003",
+      "dispatched": [
+        {
+          "channelId": "b82b6aa71c03e1b725c7b59e48ad9e6eb4eb4b591c6a894b2cbbdcaa1fc9f141",
+          "htlcId": "0",
+          "amountMsat": 10000000
+        },
+        {
+          "channelId": "b82b6aa71c03e1b725c7b59e48ad9e6eb4eb4b591c6a894b2cbbdcaa1fc9f141",
+          "htlcId": "1",
+          "amountMsat": 10000000
+        }
+      ]
+    },
+    {
+      "name": "native primary forwards both parts through one home and charges its flat fee once",
+      "paymentHash": "9208e80ff83b5c5a6e96c037ef39b634b98605bf291f076c1fa1a43759c6e3e4",
+      "receivedSats": 19880,
+      "feeSats": 120,
+      "localBalanceSats": 19880,
+      "fundingTxid": "ed87a95bbcf5a0e533a722f5caf69e82d727d6318a48ddab0c8c831cd81ebb30",
+      "capacitySats": 40000,
+      "reportedPaymentSats": 20000,
+      "forwarded": [
+        {
+          "feeMsat": 120000,
+          "skimMsat": 120000,
+          "forwardedMsat": 9880000
+        },
+        {
+          "feeMsat": 0,
+          "skimMsat": 0,
+          "forwardedMsat": 10000000
+        }
+      ],
+      "receivedParts": [
+        {
+          "channelId": "30bb1ed81c838c0cabdd488a31d627d7829ef6caf522a733e5a0f5bc5ba987ec",
+          "htlcId": "0",
+          "amountMsat": 9880000
+        },
+        {
+          "channelId": "30bb1ed81c838c0cabdd488a31d627d7829ef6caf522a733e5a0f5bc5ba987ec",
+          "htlcId": "1",
+          "amountMsat": 10000000
+        }
+      ],
+      "receiverChannels": 1
+    }
+  ],
+  "startedAt": "2026-10-25T06:10:34.145Z",
+  "chain": "regtest",
+  "beignetVersion": "0.32.2",
+  "providerNodeId": "02c43c49513f60ca6e013c7eb3ecde16e2f6304a831c58a643e27004d05abe5629",
+  "processes": [
+    83418,
+    83570
+  ],
+  "completedAt": "2026-10-25T06:10:40.239Z",
+  "passed": true
+}

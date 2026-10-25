@@ -16,7 +16,8 @@ use bitcoin::secp256k1::PublicKey;
 use bitcoin::{Amount, OutPoint, TxIn, TxOut};
 use lightning::events::bump_transaction::BumpTransactionEvent;
 use lightning::events::{
-	ClosureReason, Event as LdkEvent, PaymentFailureReason, PaymentPurpose, ReplayEvent,
+	ClosureReason, Event as LdkEvent, InboundChannelFunds, PaymentFailureReason, PaymentPurpose,
+	ReplayEvent,
 };
 use lightning::ln::channelmanager::PaymentId;
 use lightning::ln::types::ChannelId;
@@ -1136,6 +1137,8 @@ where
 	output_sweeper: Arc<Sweeper>,
 	network_graph: Arc<Graph>,
 	liquidity_source: Option<Arc<LiquiditySource<Arc<Logger>>>>,
+	#[cfg(feature = "chicory")]
+	chicory_service: Option<Arc<crate::chicory::ChicoryService>>,
 	payment_store: Arc<PaymentStore>,
 	peer_store: Arc<PeerStore<L>>,
 	runtime: Arc<RuntimeControl>,
@@ -1156,6 +1159,7 @@ where
 		channel_manager: Arc<ChannelManager>, connection_manager: Arc<ConnectionManager<L>>,
 		output_sweeper: Arc<Sweeper>, network_graph: Arc<Graph>,
 		liquidity_source: Option<Arc<LiquiditySource<Arc<Logger>>>>,
+		#[cfg(feature = "chicory")] chicory_service: Option<Arc<crate::chicory::ChicoryService>>,
 		payment_store: Arc<PaymentStore>, peer_store: Arc<PeerStore<L>>,
 		static_invoice_store: Option<StaticInvoiceStore>, onion_messenger: Arc<OnionMessenger>,
 		om_mailbox: Option<Arc<OnionMessageMailbox>>, runtime: Arc<RuntimeControl>, logger: L,
@@ -1170,6 +1174,8 @@ where
 			output_sweeper,
 			network_graph,
 			liquidity_source,
+			#[cfg(feature = "chicory")]
+			chicory_service,
 			payment_store,
 			peer_store,
 			logger,
@@ -1877,7 +1883,7 @@ where
 				counterparty_node_id,
 				funding_satoshis,
 				channel_type,
-				channel_negotiation_type: _,
+				channel_negotiation_type,
 				is_announced,
 				params: _,
 			} => {
@@ -1960,7 +1966,12 @@ where
 				}
 
 				let user_channel_id: u128 = rng().random();
-				let allow_0conf = self.config.trusted_peers_0conf.contains(&counterparty_node_id);
+				// V2 funding may contain peer-contributed inputs. The separate inbound
+				// v2 opt-in always retains confirmation requirements, including for
+				// peers that are trusted for v1 zero-conf channels.
+				let allow_0conf =
+					matches!(channel_negotiation_type, InboundChannelFunds::PushMsat(_))
+						&& self.config.trusted_peers_0conf.contains(&counterparty_node_id);
 				let mut channel_override_config = None;
 				if let Some((lsp_node_id, _)) = self
 					.liquidity_source
@@ -2198,6 +2209,16 @@ where
 						.await;
 				}
 
+				#[cfg(feature = "chicory")]
+				if let Some(service) = &self.chicory_service {
+					service.channel_ready(
+						channel_id,
+						user_channel_id,
+						counterparty_node_id,
+						funding_txo,
+					);
+				}
+
 				let event = Event::ChannelReady {
 					channel_id,
 					user_channel_id: UserChannelId(user_channel_id),
@@ -2221,6 +2242,11 @@ where
 			} => {
 				log_info!(self.logger, "Channel {} closed due to: {}", channel_id, reason);
 
+				#[cfg(feature = "chicory")]
+				if let Some(service) = &self.chicory_service {
+					service.channel_closed(channel_id, user_channel_id, counterparty_node_id);
+				}
+
 				let event = Event::ChannelClosed {
 					channel_id,
 					user_channel_id: UserChannelId(user_channel_id),
@@ -2242,9 +2268,26 @@ where
 				intercept_id,
 				expected_outbound_amount_msat,
 				payment_hash,
+				inbound_amount_msat,
 				..
 			} => {
-				if let Some(liquidity_source) = self.liquidity_source.as_ref() {
+				#[cfg(not(feature = "chicory"))]
+				let _ = inbound_amount_msat;
+				#[cfg(feature = "chicory")]
+				if let Some(service) = &self.chicory_service {
+					if service.owns_scid(requested_next_hop_scid) {
+						service.handle_htlc_intercepted(
+							requested_next_hop_scid,
+							intercept_id,
+							payment_hash,
+							inbound_amount_msat,
+							expected_outbound_amount_msat,
+						);
+						return Ok(());
+					}
+				}
+
+				let handled = if let Some(liquidity_source) = self.liquidity_source.as_ref() {
 					liquidity_source
 						.handle_htlc_intercepted(
 							requested_next_hop_scid,
@@ -2252,7 +2295,12 @@ where
 							expected_outbound_amount_msat,
 							payment_hash,
 						)
-						.await;
+						.await
+				} else {
+					false
+				};
+				if !handled {
+					let _ = self.channel_manager.fail_intercepted_htlc(intercept_id);
 				}
 			},
 			LdkEvent::InvoiceReceived { .. } => {
@@ -2449,6 +2497,11 @@ where
 					new_funding_txo,
 				);
 
+				#[cfg(feature = "chicory")]
+				if let Some(service) = &self.chicory_service {
+					service.splice_pending(channel_id, counterparty_node_id, new_funding_txo);
+				}
+
 				let event = Event::SplicePending {
 					channel_id,
 					user_channel_id: UserChannelId(user_channel_id),
@@ -2500,6 +2553,11 @@ where
 					return Err(ReplayEvent());
 				}
 
+				#[cfg(feature = "chicory")]
+				if let Some(service) = &self.chicory_service {
+					service.splice_failed(channel_id, counterparty_node_id);
+				}
+
 				let event = Event::SpliceFailed {
 					channel_id,
 					user_channel_id: UserChannelId(user_channel_id),
@@ -2529,6 +2587,139 @@ mod tests {
 
 	use super::*;
 	use crate::io::test_utils::InMemoryStore;
+
+	#[cfg(feature = "chicory")]
+	fn inbound_policy_node(seed: u8, trusted_peers_0conf: Vec<PublicKey>) -> crate::Node {
+		let mut builder = crate::builder::NodeBuilder::from_config(Config {
+			network: bitcoin::Network::Regtest,
+			anchor_channels_config: None,
+			trusted_peers_0conf,
+			..Config::default()
+		});
+		builder.set_chain_source_esplora("http://127.0.0.1:1".into(), None);
+		builder.set_entropy_seed_bytes([seed; 64]);
+		builder.set_log_facade_logger();
+		builder
+			.set_chicory_service(crate::chicory::JitServiceConfig {
+				allow_confirmed_v2: true,
+				..Default::default()
+			})
+			.unwrap();
+		builder.build_with_store(Arc::new(InMemoryStore::new())).unwrap()
+	}
+
+	#[cfg(feature = "chicory")]
+	fn handler_for_node(node: &crate::Node) -> EventHandler<Arc<Logger>> {
+		let bump_handler = Arc::new(BumpTransactionEventHandler::new(
+			Arc::clone(&node.tx_broadcaster),
+			Arc::new(lightning::events::bump_transaction::Wallet::new(
+				Arc::clone(&node.wallet),
+				Arc::clone(&node.logger),
+			)),
+			Arc::clone(&node.keys_manager),
+			Arc::clone(&node.logger),
+		));
+		EventHandler::new(
+			Arc::clone(&node.event_queue),
+			Arc::clone(&node.wallet),
+			bump_handler,
+			Arc::clone(&node.channel_manager),
+			Arc::clone(&node.connection_manager),
+			Arc::clone(&node.output_sweeper),
+			Arc::clone(&node.network_graph),
+			node.liquidity_source.clone(),
+			node.chicory_service.clone(),
+			Arc::clone(&node.payment_store),
+			Arc::clone(&node.peer_store),
+			None,
+			Arc::clone(&node.onion_messenger),
+			node.om_mailbox.clone(),
+			node.runtime.control(),
+			Arc::clone(&node.logger),
+			Arc::clone(&node.config),
+		)
+	}
+
+	#[cfg(feature = "chicory")]
+	#[test]
+	fn trusted_peer_v1_keeps_zero_conf_but_v2_requires_confirmations() {
+		use bitcoin::secp256k1::{Secp256k1, SecretKey};
+		use lightning::ln::channel_keys::RevocationBasepoint;
+		use lightning::ln::msgs::{
+			BaseMessageHandler, ChannelMessageHandler, Init, MessageSendEvent, OpenChannelV2,
+		};
+
+		for v2 in [false, true] {
+			let opener = inbound_policy_node(21, Vec::new());
+			let receiver = inbound_policy_node(22, vec![opener.node_id()]);
+			let opener_init = Init {
+				features: opener.channel_manager.provided_init_features(receiver.node_id()),
+				networks: None,
+				remote_network_address: None,
+			};
+			let receiver_init = Init {
+				features: receiver.channel_manager.provided_init_features(opener.node_id()),
+				networks: None,
+				remote_network_address: None,
+			};
+			opener
+				.channel_manager
+				.peer_connected(receiver.node_id(), &receiver_init, false)
+				.unwrap();
+			receiver.channel_manager.peer_connected(opener.node_id(), &opener_init, true).unwrap();
+			opener
+				.channel_manager
+				.create_channel(receiver.node_id(), 100_000, 0, 1, None, None)
+				.unwrap();
+			let mut pending = opener.channel_manager.get_and_clear_pending_msg_events();
+			let MessageSendEvent::SendOpenChannel { mut msg, .. } = pending.remove(0) else {
+				panic!("expected native open_channel");
+			};
+			assert!(pending.is_empty());
+			if v2 {
+				msg.common_fields.temporary_channel_id =
+					ChannelId::temporary_v2_from_revocation_basepoint(&RevocationBasepoint(
+						msg.common_fields.revocation_basepoint,
+					));
+				let open = OpenChannelV2 {
+					funding_feerate_sat_per_1000_weight: msg
+						.common_fields
+						.commitment_feerate_sat_per_1000_weight,
+					common_fields: msg.common_fields,
+					locktime: 0,
+					second_per_commitment_point: PublicKey::from_secret_key(
+						&Secp256k1::new(),
+						&SecretKey::from_slice(&[23; 32]).unwrap(),
+					),
+					require_confirmed_inputs: None,
+				};
+				receiver.channel_manager.handle_open_channel_v2(opener.node_id(), &open);
+			} else {
+				receiver.channel_manager.handle_open_channel(opener.node_id(), &msg);
+			}
+			let handler = handler_for_node(&receiver);
+			let requests = std::cell::Cell::new(0);
+			receiver.runtime.block_on(receiver.channel_manager.process_pending_events_async(
+				|event| {
+					assert!(matches!(event, LdkEvent::OpenChannelRequest { .. }));
+					requests.set(requests.get() + 1);
+					handler.handle_event(event)
+				},
+			));
+			assert_eq!(requests.get(), 1);
+			let responses = receiver.channel_manager.get_and_clear_pending_msg_events();
+			match responses.as_slice() {
+				[MessageSendEvent::SendAcceptChannelV2 { msg, .. }] if v2 => {
+					assert!(msg.common_fields.minimum_depth > 0);
+					assert_eq!(msg.funding_satoshis, 0);
+				},
+				[MessageSendEvent::SendAcceptChannel { msg, .. }] if !v2 => {
+					assert_eq!(msg.common_fields.minimum_depth, 0);
+				},
+				other => panic!("unexpected acceptance response: {other:?}"),
+			}
+		}
+	}
 
 	#[tokio::test]
 	async fn event_queue_persistence() {

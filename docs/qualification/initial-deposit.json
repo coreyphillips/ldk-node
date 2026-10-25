@@ -1,0 +1,40 @@
+{
+  "scope": "installed-chicory-portable",
+  "checks": [
+    {
+      "name": "installed Chicory engine and wallet-core pair with native primary"
+    },
+    {
+      "name": "first phone deposit creates one confirmed-only native funding candidate",
+      "depositTxid": "20ab20777bd55470b0c919f8101e60fd50a2846ed589a92e7f51705472a4be80",
+      "fundingTxid": "b43cbab06dec52898c8beb087cd61ba90e9c706f9ca7887780e1e3bd0feae087",
+      "capacitySats": 29475
+    },
+    {
+      "name": "confirmed initial deposit home spends through native primary after primary restart",
+      "fundingTxid": "b43cbab06dec52898c8beb087cd61ba90e9c706f9ca7887780e1e3bd0feae087",
+      "capacitySats": 29475,
+      "spentSats": 1000,
+      "localBalanceSats": 28475
+    },
+    {
+      "name": "phone reopen preserves the initial deposit home and post-spend balance"
+    }
+  ],
+  "packages": {
+    "chicoryVersion": "0.7.4",
+    "engineUpstreamVersion": "0.32.1",
+    "engineSha256": "05cdb752e1007532edc1366ea14cbf98a96825885a62d47d6001f74c1bed229d",
+    "walletCoreSha256": "4a79550c91ac05303d85d28fe0b5daf4c2a05da97e713a83db54012f7e9a655e",
+    "payerVersion": "0.32.2"
+  },
+  "chain": "regtest",
+  "startedAt": "2026-10-25T04:40:15.780Z",
+  "providerNodeId": "028dd50cfcb4491fa3acba721ae0d3b7bed3088defb56eaeedeefa53a9b7ac464a",
+  "processes": [
+    3984,
+    4171
+  ],
+  "completedAt": "2026-10-25T04:40:23.968Z",
+  "passed": true
+}

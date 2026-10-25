@@ -1,0 +1,81 @@
+{
+  "scope": "native-jit-two-part",
+  "checks": [
+    {
+      "name": "native primary has a confirmed external payer channel and an unfunded receiver"
+    },
+    {
+      "name": "existing home has insufficient liquidity for either multipart contribution",
+      "fundingTxid": "e7f446e39ad2990e4eb7aea701a5cecd671c113460ff69ae5049da1677a7d199",
+      "capacitySats": 40000,
+      "remoteBalanceSats": 12120,
+      "partSats": 15000
+    },
+    {
+      "name": "unchanged receiver authorizes one multipart invoice and provider restart preserves registration",
+      "amountSats": 30000
+    },
+    {
+      "name": "existing Beignet MPP sender dispatches two distinct HTLCs to the same intercept SCID",
+      "interceptScid": "00000100094a0000",
+      "dispatched": [
+        {
+          "channelId": "157fb70aa03a87f06ac77e6565f9f262c400d547db060040ab80c417f575416d",
+          "htlcId": "1",
+          "amountMsat": 15001000
+        },
+        {
+          "channelId": "157fb70aa03a87f06ac77e6565f9f262c400d547db060040ab80c417f575416d",
+          "htlcId": "2",
+          "amountMsat": 15001000
+        }
+      ]
+    },
+    {
+      "name": "native primary forwards both parts through one home and charges its flat fee once",
+      "paymentHash": "f6f4cd5efa9d246ad5d6f0e2affabf86e6d8406f01f61848088c16a7cd911b74",
+      "receivedSats": 29870,
+      "feeSats": 130,
+      "localBalanceSats": 57750,
+      "fundingTxid": "60ab8ab51ed7dff4860d9f2c768a514299aed710016466b07d60a900aea0762b",
+      "oldFundingTxid": "e7f446e39ad2990e4eb7aea701a5cecd671c113460ff69ae5049da1677a7d199",
+      "capacitySats": 90000,
+      "reportedPaymentSats": 30000,
+      "forwarded": [
+        {
+          "feeMsat": 131000,
+          "skimMsat": 130000,
+          "forwardedMsat": 14870000
+        },
+        {
+          "feeMsat": 1000,
+          "skimMsat": 0,
+          "forwardedMsat": 15000000
+        }
+      ],
+      "receivedParts": [
+        {
+          "channelId": "99d1a77716da4950ae69ff6034111c67cdcea501a7aeb74e0e99d29ae346f4e7",
+          "htlcId": "2",
+          "amountMsat": 14870000
+        },
+        {
+          "channelId": "99d1a77716da4950ae69ff6034111c67cdcea501a7aeb74e0e99d29ae346f4e7",
+          "htlcId": "3",
+          "amountMsat": 15000000
+        }
+      ],
+      "receiverChannels": 1
+    }
+  ],
+  "startedAt": "2026-10-25T05:11:06.579Z",
+  "chain": "regtest",
+  "beignetVersion": "0.32.2",
+  "providerNodeId": "0372284dcd68d5ac42fd827c4e7ca5fa67c03b7c62fdf7c7460ed5c837afcf7303",
+  "processes": [
+    27649,
+    27855
+  ],
+  "completedAt": "2026-10-25T05:11:15.675Z",
+  "passed": true
+}

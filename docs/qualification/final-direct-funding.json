@@ -1,0 +1,94 @@
+{
+  "scope": "installed-chicory-portable",
+  "checks": [
+    {
+      "name": "installed Chicory engine and wallet-core pair with native primary"
+    },
+    {
+      "name": "external payer has a confirmed channel to native primary"
+    },
+    {
+      "name": "installed wallet reviews and creates a skim-fee unified JIT request"
+    },
+    {
+      "name": "installed wallet Activity and balances reflect the native JIT payment",
+      "paymentHash": "db266d1f1d4aace0f93d1a53b101952cd586a064fbf6a330b4f4bd8693992c0d",
+      "status": "completed",
+      "activityAmountSats": 20000,
+      "activityFeeSats": 0,
+      "totalSats": 19880,
+      "availableSats": 18880
+    },
+    {
+      "name": "installed wallet restart restores the paid request, balance and channel"
+    },
+    {
+      "name": "installed wallet pays a native primary invoice and records completed Activity"
+    },
+    {
+      "name": "installed direct funding existing-home pays the exact channel amount and verifies its receipt",
+      "requestId": "b71f5f9c855560b2c55ec908e72054eb",
+      "receiverNodeId": "02d03f061d14c17856c4a1c4d2d48c5b522b83b069b453c6d144015e5ca2e798c2",
+      "receiptHash": "4a91dbdbe4a30468f4f877251c1e821b1c5cc4c62d1078f12bc3ced3ea5f00b1",
+      "receiptVerified": true,
+      "fundingTxid": "736b6b8178125c2b90190e7bc86f4853ad357f0cef071c3a39e9207ef82aecbb",
+      "fundingOutputIndex": 0,
+      "fundingScript": "0020953102387c19997647605e11d7e88fbff3f57dd9d46b323b957badf5e764798e",
+      "spentTxid": "34a0910d311057f1eaeda92bad52c88dbdace731fcaa1e0d346f0d1796b3202b",
+      "spentVout": 0,
+      "amountSats": 5000,
+      "activityStatus": "completed",
+      "activityAmountSats": 5000,
+      "capacitySats": 45000,
+      "localBalanceSats": 21880,
+      "payerCoinSats": 20000,
+      "primaryUsable": true,
+      "confirmations": 17
+    },
+    {
+      "name": "installed wallet spends from the direct-funded existing-home channel",
+      "amountSats": 1000
+    },
+    {
+      "name": "installed direct funding initial-channel pays the exact channel amount and verifies its receipt",
+      "requestId": "be16450b4c7c4c7da374e7f65dedf216",
+      "receiverNodeId": "03efd557f8ef652045558a69e7594cd709cc15354354f64b6a23b6976bf0e64e1b",
+      "receiptHash": "b75578397a5070b519d79b9bd01dfacdfa1e5bd4374f66e33665d1f8159f0627",
+      "receiptVerified": true,
+      "fundingTxid": "93dddd9c01593c32328f17dbdb9057380f1fe538504c02629b6a14f19e2edaf0",
+      "fundingOutputIndex": 0,
+      "fundingScript": "0020bba08dc947bc29b5bb1cb538a0186fb542fba26e8a1568ebf2087961d2b5c6be",
+      "spentTxid": "082b0a4d298127b4dee975e65975240620dadb42e5ae0aedcd874b7fdc537db2",
+      "spentVout": 1,
+      "amountSats": 15000,
+      "activityStatus": "completed",
+      "activityAmountSats": 15000,
+      "capacitySats": 15000,
+      "localBalanceSats": 15000,
+      "payerCoinSats": 20000,
+      "primaryUsable": true,
+      "confirmations": 17
+    },
+    {
+      "name": "installed wallet spends from the direct-funded initial-channel channel",
+      "amountSats": 1000
+    }
+  ],
+  "primaryBinarySha256": "e557becd6e07d67c202e98437f7d4c0dede9d9f28281103d60895378379498b0",
+  "packages": {
+    "chicoryVersion": "0.7.4",
+    "engineUpstreamVersion": "0.32.1",
+    "engineSha256": "05cdb752e1007532edc1366ea14cbf98a96825885a62d47d6001f74c1bed229d",
+    "walletCoreSha256": "4a79550c91ac05303d85d28fe0b5daf4c2a05da97e713a83db54012f7e9a655e",
+    "payerVersion": "0.32.2"
+  },
+  "chain": "regtest",
+  "startedAt": "2026-10-25T06:03:41.385Z",
+  "providerNodeId": "0297cf08d751cb35c5b21e0bd68795af0b59534ed3ea039b88960754f0dd647315",
+  "processes": [
+    78206
+  ],
+  "directFundingScope": "existing-home-and-initial-channel",
+  "completedAt": "2026-10-25T06:05:59.444Z",
+  "passed": true
+}

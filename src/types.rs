@@ -99,7 +99,7 @@ pub(crate) type ChainMonitor = chainmonitor::ChainMonitor<
 
 pub(crate) type PeerManager = lightning::ln::peer_handler::PeerManager<
 	SocketDescriptor,
-	Arc<ChannelManager>,
+	Arc<PeerChannelHandler>,
 	Arc<dyn RoutingMessageHandler + Send + Sync>,
 	Arc<OnionMessenger>,
 	Arc<Logger>,
@@ -107,6 +107,11 @@ pub(crate) type PeerManager = lightning::ln::peer_handler::PeerManager<
 	Arc<KeysManager>,
 	Arc<ChainMonitor>,
 >;
+
+#[cfg(not(feature = "chicory"))]
+pub(crate) type PeerChannelHandler = ChannelManager;
+#[cfg(feature = "chicory")]
+pub(crate) type PeerChannelHandler = crate::chicory::PeerStorageChannelHandler;
 
 pub(crate) type LiquidityManager = lightning_liquidity::LiquidityManager<
 	Arc<KeysManager>,

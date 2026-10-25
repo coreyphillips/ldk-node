@@ -1,0 +1,61 @@
+{
+  "scope": "native-jit-subset",
+  "checks": [
+    {
+      "name": "both Beignet clients complete BOLT 8 with native primary"
+    },
+    {
+      "name": "native relay preserves opaque bytes and stamps authenticated sender"
+    },
+    {
+      "name": "unsupported offline receive returns a correlated explicit refusal"
+    },
+    {
+      "name": "isolated primary and payer funded on regtest"
+    },
+    {
+      "name": "confirmed payer channel established"
+    },
+    {
+      "name": "Beignet JIT quote agrees on a 120 sat skim fee",
+      "feeSats": 120
+    },
+    {
+      "name": "excessive JIT request refused before funding"
+    },
+    {
+      "name": "unchanged Beignet client creates a JIT invoice"
+    },
+    {
+      "name": "provider restart retains identity and idempotent authorization"
+    },
+    {
+      "name": "payer payment opens receiver channel and settles after restart",
+      "paymentHash": "9edc2c8549b84185dcf7c949f33a9bc2ee7d6eae2f299d71fb40e390934373a9",
+      "receivedSats": 19880,
+      "reportedPaymentSats": 20000,
+      "feeSats": 120,
+      "receiverChannels": 1
+    },
+    {
+      "name": "65531-byte padded peer backup roundtrips on reconnect",
+      "wireBytes": 65531
+    },
+    {
+      "name": "65531-byte padded peer backup and channel survive provider restart",
+      "wireBytes": 65531
+    }
+  ],
+  "chain": "regtest",
+  "primaryChainSource": "bitcoin-core-rpc",
+  "startedAt": "2026-10-25T03:30:16.034Z",
+  "beignetVersion": "0.32.2",
+  "providerNodeId": "0253ba63eac2e2bff1f5d5eb9ec911df436ac2995f74c1f7c251ac89d511a8302a",
+  "processes": [
+    44729,
+    44891,
+    44910
+  ],
+  "completedAt": "2026-10-25T03:30:22.427Z",
+  "passed": true
+}

@@ -1,0 +1,128 @@
+// This file is Copyright its original authors, visible in version control
+// history.
+//
+// This file is licensed under the Apache License, Version 2.0 <LICENSE-APACHE
+// or http://www.apache.org/licenses/LICENSE-2.0> or the MIT license
+// <LICENSE-MIT or http://opensource.org/licenses/MIT>, at your option.
+// You may not use this file except in accordance with one or both of these
+// licenses.
+
+//! Contains the main bLIP-50 / LSPS0 server-side object, [`LSPS0ServiceHandler`].
+//!
+//! Please refer to the [bLIP-50 / LSPS0
+//! specifcation](https://github.com/lightning/blips/blob/master/blip-0050.md) for more
+//! information.
+
+use alloc::vec::Vec;
+
+use crate::lsps0::msgs::{LSPS0ListProtocolsResponse, LSPS0Message, LSPS0Request, LSPS0Response};
+use crate::lsps0::ser::{LSPSProtocolMessageHandler, LSPSRequestId};
+use crate::message_queue::MessageQueue;
+use crate::sync::Arc;
+
+use lightning::ln::msgs::{ErrorAction, LightningError};
+use lightning::util::logger::Level;
+
+use bitcoin::secp256k1::PublicKey;
+
+/// The main server-side object allowing to send and receive bLIP-50 / LSPS0 messages.
+pub struct LSPS0ServiceHandler {
+	pending_messages: Arc<MessageQueue>,
+	protocols: Vec<u16>,
+}
+
+impl LSPS0ServiceHandler {
+	/// Returns a new instance of [`LSPS0ServiceHandler`].
+	pub(crate) fn new(protocols: Vec<u16>, pending_messages: Arc<MessageQueue>) -> Self {
+		Self { protocols, pending_messages }
+	}
+
+	fn handle_request(
+		&self, request_id: LSPSRequestId, request: LSPS0Request, counterparty_node_id: &PublicKey,
+	) -> Result<(), lightning::ln::msgs::LightningError> {
+		let mut message_queue_notifier = self.pending_messages.notifier();
+
+		match request {
+			LSPS0Request::ListProtocols(_) => {
+				let msg = LSPS0Message::Response(
+					request_id,
+					LSPS0Response::ListProtocols(LSPS0ListProtocolsResponse {
+						protocols: self.protocols.clone(),
+					}),
+				);
+				message_queue_notifier.enqueue(counterparty_node_id, msg.into());
+				Ok(())
+			},
+		}
+	}
+}
+
+impl LSPSProtocolMessageHandler for LSPS0ServiceHandler {
+	type ProtocolMessage = LSPS0Message;
+	const PROTOCOL_NUMBER: Option<u16> = None;
+
+	fn handle_message(
+		&self, message: Self::ProtocolMessage, counterparty_node_id: &PublicKey,
+	) -> Result<(), LightningError> {
+		match message {
+			LSPS0Message::Request(request_id, request) => {
+				self.handle_request(request_id, request, counterparty_node_id)
+			},
+			LSPS0Message::Response(..) => {
+				debug_assert!(
+					false,
+					"Service handler received LSPS0 response message. This should never happen."
+				);
+				Err(LightningError { err: format!("Service handler received LSPS0 response message from node {}. This should never happen.", counterparty_node_id), action: ErrorAction::IgnoreAndLog(Level::Info)})
+			},
+		}
+	}
+}
+
+#[cfg(test)]
+mod tests {
+
+	use crate::lsps0::msgs::LSPS0ListProtocolsRequest;
+	use crate::lsps0::ser::LSPSMessage;
+	use crate::tests::utils;
+	use alloc::string::ToString;
+	use alloc::sync::Arc;
+	use lightning::util::wakers::Notifier;
+
+	use super::*;
+
+	#[test]
+	fn test_handle_list_protocols_request() {
+		let protocols: Vec<u16> = vec![];
+		let notifier = Arc::new(Notifier::new());
+		let pending_messages = Arc::new(MessageQueue::new(notifier));
+
+		let lsps0_handler =
+			Arc::new(LSPS0ServiceHandler::new(protocols, Arc::clone(&pending_messages)));
+
+		let list_protocols_request = LSPS0Message::Request(
+			LSPSRequestId("xyz123".to_string()),
+			LSPS0Request::ListProtocols(LSPS0ListProtocolsRequest {}),
+		);
+		let counterparty_node_id = utils::parse_pubkey(
+			"027100442c3b79f606f80f322d98d499eefcb060599efc5d4ecb00209c2cb54190",
+		)
+		.unwrap();
+
+		lsps0_handler.handle_message(list_protocols_request, &counterparty_node_id).unwrap();
+		let pending_messages = pending_messages.get_and_clear_pending_msgs();
+
+		assert_eq!(pending_messages.len(), 1);
+
+		let (pubkey, message) = &pending_messages[0];
+
+		assert_eq!(*pubkey, counterparty_node_id);
+		assert_eq!(
+			*message,
+			LSPSMessage::LSPS0(LSPS0Message::Response(
+				LSPSRequestId("xyz123".to_string()),
+				LSPS0Response::ListProtocols(LSPS0ListProtocolsResponse { protocols: vec![] })
+			))
+		);
+	}
+}

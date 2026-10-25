@@ -1,0 +1,76 @@
+{
+  "scope": "installed-chicory-portable",
+  "checks": [
+    {
+      "name": "installed Chicory engine and wallet-core pair with native primary"
+    },
+    {
+      "name": "external payer has a confirmed channel to native primary"
+    },
+    {
+      "name": "installed wallet reviews and creates a skim-fee unified JIT request"
+    },
+    {
+      "name": "installed wallet Activity and balances reflect the native JIT payment",
+      "paymentHash": "bfc73915386f19c0c9a56626aa746352f278440e9b2ecdc7951b3d4fcf1308ef",
+      "status": "completed",
+      "activityAmountSats": 20000,
+      "activityFeeSats": 0,
+      "totalSats": 19880,
+      "availableSats": 18880
+    },
+    {
+      "name": "installed wallet restart restores the paid request, balance and channel"
+    },
+    {
+      "name": "installed wallet pays a native primary invoice and records completed Activity"
+    },
+    {
+      "name": "installed send-max pays the exact reviewed p2wsh destination",
+      "amountSats": 15301,
+      "keptSats": 1000,
+      "txid": "0f1c83931089d11b13a8095bc22db63038ea4b2e4bf52264227d3618b3dcb772"
+    },
+    {
+      "name": "installed send-max retains one completed Activity row and its home after both restarts"
+    },
+    {
+      "name": "installed drain broadcasts cooperative close and loose-coin sweep before confirmation",
+      "txids": [
+        "cb06e8c66e07a7f06da98ba6bc5da2b4efba2e592cc712cf7560134ffc295c72",
+        "65aaba10d6f9926a312b1bf565af18879446641d33020af2c1b70bcc2dd411a8"
+      ],
+      "reviewedAmountSats": 20634
+    },
+    {
+      "name": "restarted installed wallet receives through a new home while old drain confirmations remain pending",
+      "paymentHash": "dbc326ad24084a6e5dbcfd38d7883b4bba556d384f5c2e6a4ada8291ccf19af8",
+      "netReceivedSats": 4895
+    },
+    {
+      "name": "installed drain completes once after both restarts and excludes later receipts",
+      "txids": [
+        "cb06e8c66e07a7f06da98ba6bc5da2b4efba2e592cc712cf7560134ffc295c72",
+        "65aaba10d6f9926a312b1bf565af18879446641d33020af2c1b70bcc2dd411a8"
+      ],
+      "laterCoinSats": 1000
+    }
+  ],
+  "packages": {
+    "chicoryVersion": "0.7.4",
+    "engineUpstreamVersion": "0.32.1",
+    "engineSha256": "05cdb752e1007532edc1366ea14cbf98a96825885a62d47d6001f74c1bed229d",
+    "walletCoreSha256": "4a79550c91ac05303d85d28fe0b5daf4c2a05da97e713a83db54012f7e9a655e",
+    "payerVersion": "0.32.2"
+  },
+  "chain": "regtest",
+  "startedAt": "2026-10-25T04:26:49.045Z",
+  "providerNodeId": "03566ae695170ef89d79c8cac813fcc2ad063303ab419fdfbb8472e40affb566b7",
+  "processes": [
+    94113,
+    94816,
+    95030
+  ],
+  "completedAt": "2026-10-25T04:27:29.137Z",
+  "passed": true
+}

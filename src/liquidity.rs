@@ -54,6 +54,61 @@ const LIQUIDITY_REQUEST_TIMEOUT_SECS: u64 = 5;
 const LSPS2_GETINFO_REQUEST_EXPIRY: Duration = Duration::from_secs(60 * 60 * 24);
 const LSPS2_CHANNEL_CLTV_EXPIRY_DELTA: u32 = 72;
 
+#[cfg(test)]
+mod intercept_routing_tests {
+	use super::*;
+	use crate::builder::NodeBuilder;
+	use crate::io::test_utils::InMemoryStore;
+	use bitcoin::Network;
+	use std::str::FromStr;
+
+	fn test_node(provider: bool) -> crate::Node {
+		let mut builder =
+			NodeBuilder::from_config(Config { network: Network::Regtest, ..Default::default() });
+		builder.set_chain_source_esplora("http://127.0.0.1:1".to_owned(), None);
+		builder.set_entropy_seed_bytes([42; 64]);
+		builder.set_log_facade_logger();
+		if provider {
+			builder.set_liquidity_provider_lsps2(LSPS2ServiceConfig {
+				require_token: None,
+				advertise_service: false,
+				channel_opening_fee_ppm: 0,
+				channel_over_provisioning_ppm: 0,
+				min_channel_opening_fee_msat: 0,
+				min_channel_lifetime: 4032,
+				max_client_to_self_delay: 2016,
+				min_payment_size_msat: 1_000,
+				max_payment_size_msat: 1_000_000,
+				client_trusts_lsp: false,
+			});
+		} else {
+			builder.set_liquidity_source_lsps2(
+				PublicKey::from_str(
+					"0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798",
+				)
+				.unwrap(),
+				SocketAddress::from_str("127.0.0.1:9735").unwrap(),
+				None,
+			);
+		}
+		builder.build_with_store(Arc::new(InMemoryStore::new())).unwrap()
+	}
+
+	#[test]
+	fn lsps_client_and_provider_do_not_claim_unknown_intercepts() {
+		for provider in [false, true] {
+			let node = test_node(provider);
+			let source = node.liquidity_source.as_ref().unwrap();
+			assert!(!node.runtime.block_on(source.handle_htlc_intercepted(
+				42,
+				InterceptId([3; 32]),
+				1_000,
+				PaymentHash([4; 32]),
+			)));
+		}
+	}
+}
+
 struct LSPS1Client {
 	lsp_node_id: PublicKey,
 	lsp_address: SocketAddress,
@@ -1358,10 +1413,10 @@ where
 	pub(crate) async fn handle_htlc_intercepted(
 		&self, intercept_scid: u64, intercept_id: InterceptId, expected_outbound_amount_msat: u64,
 		payment_hash: PaymentHash,
-	) {
+	) -> bool {
 		if let Some(lsps2_service_handler) = self.liquidity_manager.lsps2_service_handler() {
-			if let Err(e) = lsps2_service_handler
-				.htlc_intercepted(
+			match lsps2_service_handler
+				.htlc_intercepted_if_owned(
 					intercept_scid,
 					intercept_id,
 					expected_outbound_amount_msat,
@@ -1369,13 +1424,21 @@ where
 				)
 				.await
 			{
-				log_error!(
-					self.logger,
-					"LSPS2 service failed to handle HTLCIntercepted event: {:?}",
-					e
-				);
+				Ok(handled) => return handled,
+				Err(e) => {
+					log_error!(
+						self.logger,
+						"LSPS2 service failed to handle HTLCIntercepted event: {:?}",
+						e
+					);
+					// The provider may already have failed the intercept. Repeating
+					// failure is safe, and prevents an error from leaving it parked.
+					let _ = self.channel_manager.fail_intercepted_htlc(intercept_id);
+					return true;
+				},
 			}
 		}
+		false
 	}
 
 	pub(crate) async fn handle_htlc_handling_failed(&self, failure_type: HTLCHandlingFailureType) {

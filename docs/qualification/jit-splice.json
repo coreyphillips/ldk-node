@@ -1,0 +1,61 @@
+{
+  "scope": "installed-chicory-portable",
+  "checks": [
+    {
+      "name": "installed Chicory engine and wallet-core pair with native primary"
+    },
+    {
+      "name": "external payer has a confirmed channel to native primary"
+    },
+    {
+      "name": "installed wallet reviews and creates a skim-fee unified JIT request"
+    },
+    {
+      "name": "installed wallet Activity and balances reflect the native JIT payment",
+      "paymentHash": "ef5054842453a50bb6d90b86b22f942acfb509b410b4bb8d443344f212a07d2a",
+      "status": "completed",
+      "activityAmountSats": 20000,
+      "activityFeeSats": 0,
+      "totalSats": 19880,
+      "availableSats": 18880
+    },
+    {
+      "name": "installed wallet restart restores the paid request, balance and channel"
+    },
+    {
+      "name": "installed wallet pays a native primary invoice and records completed Activity"
+    },
+    {
+      "name": "installed wallet receives through one enlarged home with one JIT splice fee",
+      "paymentHash": "f24c6e9747f3bfc391ef09486a8ea58d7cdc60cf66407aa845b035b4ad92ee6f",
+      "amountSats": 30000,
+      "feeSats": 130,
+      "netReceivedSats": 29870,
+      "localBalanceSats": 46750,
+      "activityAmountSats": 30000,
+      "oldFundingTxid": "8c145f276f34ec822b046c9dd7cc1121e983f5145a236f9dd13a2bf6319ef2d2",
+      "fundingTxid": "9664354687f1f8446b403cd4803cd29992f8dc9d27e28cc0eb22b88586b5e7ee",
+      "oldCapacitySats": 40000,
+      "capacitySats": 90000,
+      "receiverChannels": 1,
+      "dispatchedParts": 1,
+      "primaryUsable": true,
+      "incomingAmountMsat": "30001000"
+    }
+  ],
+  "packages": {
+    "chicoryVersion": "0.7.4",
+    "engineUpstreamVersion": "0.32.1",
+    "engineSha256": "05cdb752e1007532edc1366ea14cbf98a96825885a62d47d6001f74c1bed229d",
+    "walletCoreSha256": "4a79550c91ac05303d85d28fe0b5daf4c2a05da97e713a83db54012f7e9a655e",
+    "payerVersion": "0.32.2"
+  },
+  "chain": "regtest",
+  "startedAt": "2026-10-25T04:21:37.532Z",
+  "providerNodeId": "0383298c8330148500326e9469fa2b0411628f8abf6c5891cb8dff3604ae07f469",
+  "processes": [
+    89098
+  ],
+  "completedAt": "2026-10-25T04:21:48.217Z",
+  "passed": true
+}

@@ -1,0 +1,27 @@
+[package]
+name = "ldk-node-daemon"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.89"
+publish = false
+
+[workspace]
+resolver = "2"
+
+[dependencies]
+ldk-node = { path = "../..", features = ["chicory"] }
+serde = { version = "1.0.210", features = ["derive"] }
+serde_json = "1.0.128"
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }
+electrum-client = { version = "0.24.0", default-features = false, features = ["use-rustls-ring"] }
+libc = "0.2"
+
+[patch.crates-io]
+lightning = { path = "../../vendor/lightning" }
+lightning-liquidity = { path = "../../vendor/lightning-liquidity" }
+
+[profile.release]
+panic = "abort"
+
+[profile.dev]
+panic = "abort"

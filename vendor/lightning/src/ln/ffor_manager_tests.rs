@@ -165,6 +165,26 @@ fn native_ffor_vouchers_and_activation() {
 	let journal = activate_native_book(&nodes[0], &nodes[1], channel, &[2_000_000, 2_000_000]);
 	assert_eq!(journal.epoch.slots.len(), 2);
 	assert!(journal.epoch.slots.iter().all(|slot| slot.state == SlotState::Unused));
+	let status = nodes[0].node.list_ffor_epochs();
+	assert_eq!(status.len(), 1);
+	assert_eq!(status[0].channel_id, channel);
+	assert_eq!(status[0].epoch_id, journal.epoch.epoch_id);
+	assert_eq!(status[0].phase, "ACTIVE");
+	assert_eq!(status[0].slot_count, 2);
+	assert_eq!(status[0].reserved_msat, 4_000_000);
+	assert_eq!(status[0].settling_count, 0);
+	assert_eq!(status[0].settled_count, 0);
+	assert!(!status[0].persistence_pending);
+	// Administrative queries must report the durable view, even when memory advances.
+	{
+		let mut runtime = nodes[0].node.ffor_runtime.lock().unwrap();
+		runtime.homes.get_mut(&channel).unwrap().current.epoch.phase = ffor::Phase::Draining;
+	}
+	assert_eq!(nodes[0].node.list_ffor_epochs(), status);
+	let diagnostics = format!("{:?}", status);
+	for slot in &journal.epoch.slots {
+		assert!(!diagnostics.contains(&format!("{:?}", slot.preimage)));
+	}
 }
 
 #[test]

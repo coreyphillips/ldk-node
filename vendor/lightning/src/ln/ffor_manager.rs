@@ -34,6 +34,28 @@ pub struct FforPolicy {
 	/// Minimum signed proportional fee in millionths.
 	pub fee_ppm: u32,
 }
+/// Public, secret-free view of a durably persisted offline reservation.
+/// This is operational status, never authorization to settle or release custody.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FforEpochStatus {
+	/// The native home channel identity.
+	pub channel_id: ChannelId,
+	/// The signed epoch identity.
+	pub epoch_id: [u8; 32],
+	/// The last durable phase, expressed as an uppercase protocol name.
+	pub phase: String,
+	/// Number of immutable vouchers in this epoch.
+	pub slot_count: u16,
+	/// Amount still represented by vouchers without durable removal evidence.
+	pub reserved_msat: u64,
+	/// Vouchers whose delegated settlement is in progress.
+	pub settling_count: u16,
+	/// Vouchers whose delegated settlement is durably complete.
+	pub settled_count: u16,
+	/// Whether additional custody transitions are waiting for persistence.
+	pub persistence_pending: bool,
+}
+
 impl Default for FforPolicy {
 	fn default() -> Self {
 		Self { enabled: false, max_slots: 16, max_budget_msat: 100_000_000,
@@ -160,6 +182,34 @@ where M::Target: chain::Watch<<SP::Target as SignerProvider>::EcdsaSigner>,
 	/// Peer-specific admission additionally requires both negotiated FFOR feature pairs.
 	pub fn ffor_settler_enabled(&self) -> bool {
 		self.ffor_runtime.lock().unwrap().policy.enabled && self.node_signer.supports_ffor_settler()
+	}
+
+	/// List durable offline reservation summaries without exposing preimages or transcripts.
+	/// The result includes closed homes retained for replay protection. It is a point-in-time
+	/// administrative view and must not be used to authorize a protocol transition.
+	pub fn list_ffor_epochs(&self) -> Vec<FforEpochStatus> {
+		let runtime = self.ffor_runtime.lock().unwrap();
+		runtime.homes.iter().filter_map(|(channel_id, home)| {
+			let epoch = &home.durable.as_ref()?.epoch;
+			let phase = match epoch.phase {
+				ffor::Phase::Negotiating => "NEGOTIATING",
+				ffor::Phase::VouchersCommitted => "VOUCHERS_COMMITTED",
+				ffor::Phase::Active => "ACTIVE",
+				ffor::Phase::Draining => "DRAINING",
+				ffor::Phase::Closed => "CLOSED",
+				ffor::Phase::Aborted => "ABORTED",
+			};
+			Some(FforEpochStatus {
+				channel_id: *channel_id, epoch_id: epoch.epoch_id, phase: phase.to_owned(),
+				slot_count: epoch.slots.len() as u16,
+				reserved_msat: epoch.slots.iter()
+					.filter(|slot| slot.removal.is_none() && slot.chain_removal.is_none())
+					.map(|slot| slot.entry.amount_msat).sum(),
+				settling_count: epoch.slots.iter().filter(|slot| slot.state == SlotState::Settling).count() as u16,
+				settled_count: epoch.slots.iter().filter(|slot| slot.state == SlotState::Settled).count() as u16,
+				persistence_pending: !home.pending.is_empty(),
+			})
+		}).collect()
 	}
 
 	pub(super) fn ffor_transport_enabled(&self) -> bool {

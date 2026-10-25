@@ -1278,6 +1278,39 @@ impl Node {
 		))
 	}
 
+	/// Retrieve secret-free summaries of durably persisted Chicory offline reservations.
+	///
+	/// This operator view includes closed homes retained for replay protection. It never exposes
+	/// preimages or signed transcripts and does not authorize a settlement or custody release.
+	#[cfg(feature = "chicory")]
+	pub fn list_chicory_offline_epochs(&self) -> Vec<chicory::OfflineReceiveEpochStatus> {
+		self.channel_manager.list_ffor_epochs()
+	}
+
+	/// Coordinates a manual wallet operation with Chicory JIT funding.
+	///
+	/// Hosts must wrap channel opens, splices and Bitcoin sends in this method when
+	/// operating a Chicory provider. It refuses an overlapping operation before
+	/// calling `operation`, and releases the reservation when the closure returns
+	/// or unwinds. Native pending funding state continues to fence asynchronous
+	/// opens and splices. Network callbacks remain available during the operation.
+	///
+	/// Returns [`Error::WalletOperationFailed`] when another operation is pending
+	/// or provider persistence has failed. Without a Chicory service, simply runs
+	/// the closure. This does not serialize unwrapped calls made by the host.
+	#[cfg(feature = "chicory")]
+	pub fn with_chicory_wallet_operation<T>(
+		&self, operation: impl FnOnce() -> T,
+	) -> Result<T, Error> {
+		let _guard = self
+			.chicory_service
+			.as_ref()
+			.map(|service| service.begin_wallet_operation())
+			.transpose()
+			.map_err(|_| Error::WalletOperationFailed)?;
+		Ok(operation())
+	}
+
 	/// Retrieve a list of known channels.
 	pub fn list_channels(&self) -> Vec<ChannelDetails> {
 		// Build channel_id -> claimable_on_close_sats map from monitors

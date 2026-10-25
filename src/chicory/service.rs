@@ -577,6 +577,16 @@ struct State {
 	relay_global: RelayWindow,
 	pending: Vec<(PublicKey, Envelope)>,
 	faulted: bool,
+	manual_wallet_operation: bool,
+}
+
+// The guard fences JIT funding while the host starts a manual wallet operation.
+// Native pending funding state keeps the fence after asynchronous opens/splices.
+pub(crate) struct WalletOperationGuard<'a>(&'a ChicoryService);
+impl Drop for WalletOperationGuard<'_> {
+	fn drop(&mut self) {
+		self.0.state.lock().unwrap().manual_wallet_operation = false;
+	}
 }
 
 /// Coordinates durable JIT authorization with the native channel manager.
@@ -649,6 +659,7 @@ impl ChicoryService {
 				relay_global: RelayWindow::new(),
 				pending: Vec::new(),
 				faulted: false,
+				manual_wallet_operation: false,
 			}),
 		};
 		{
@@ -656,6 +667,19 @@ impl ChicoryService {
 			service.persist(&state.durable).map_err(|_| BuildError::WriteFailed)?;
 		}
 		Ok(service)
+	}
+
+	pub(crate) fn begin_wallet_operation(&self) -> Result<WalletOperationGuard<'_>, ()> {
+		let mut state = self.state.lock().unwrap();
+		if state.faulted
+			|| state.manual_wallet_operation
+			|| state.durable.funding_lease.is_some()
+			|| self.channel_manager.has_pending_funding_operation()
+		{
+			return Err(());
+		}
+		state.manual_wallet_operation = true;
+		Ok(WalletOperationGuard(self))
 	}
 
 	fn persist(&self, durable: &DurableState) -> Result<(), ()> {
@@ -1039,7 +1063,8 @@ impl ChicoryService {
 	fn funding_available(
 		&self, state: &State, peer: PublicKey, funding: u64,
 	) -> Result<(), &'static str> {
-		if state.durable.funding_lease.is_some()
+		if state.manual_wallet_operation
+			|| state.durable.funding_lease.is_some()
 			|| self.channel_manager.has_pending_funding_operation()
 		{
 			return Err("provider has a native funding operation in progress");
@@ -2453,6 +2478,39 @@ mod tests {
 		assert!(service.select_splice_inputs(&channel, 50_000).is_err());
 		assert_eq!(service.state.lock().unwrap().durable.fronted_sats, 0);
 		assert!(service.state.lock().unwrap().durable.funding_lease.is_none());
+	}
+
+	#[test]
+	fn manual_wallet_operations_exclude_jit_and_remain_fenced_by_native_funding() {
+		let node = native_test_node(Arc::new(InMemoryStore::new()), true);
+		let service = node.chicory_service.as_ref().unwrap();
+		let peer = connect(service);
+		let operation = service.begin_wallet_operation().unwrap();
+		assert!(service.begin_wallet_operation().is_err());
+		assert!(!register(service, peer, &authorization()).accepted);
+		// Peer callbacks must not block on a mutex retained by the operation.
+		service.peer_disconnected(peer);
+		assert!(!service.state.lock().unwrap().connected.contains(&peer));
+		drop(operation);
+		assert!(service.begin_wallet_operation().is_ok());
+		connect(service);
+		let channel = node
+			.with_chicory_wallet_operation(|| {
+				assert!(service.begin_wallet_operation().is_err());
+				native_pending_open(&node, peer, 123)
+			})
+			.unwrap();
+		assert!(service.begin_wallet_operation().is_err());
+		node.channel_manager
+			.force_close_broadcasting_latest_txn(&channel, &peer, "test cancellation".into())
+			.unwrap();
+		assert!(service.begin_wallet_operation().is_ok());
+		// A persisted JIT reservation must exclude the inverse ordering too.
+		service.state.lock().unwrap().durable.funding_lease = Some(super::FundingLease::Recovery);
+		assert!(node.with_chicory_wallet_operation(|| panic!("must not execute")).is_err());
+		service.state.lock().unwrap().durable.funding_lease = None;
+		service.state.lock().unwrap().faulted = true;
+		assert!(service.begin_wallet_operation().is_err());
 	}
 
 	#[test]

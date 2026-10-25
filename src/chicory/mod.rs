@@ -25,6 +25,8 @@ mod peer_storage;
 mod service;
 pub mod wire;
 
+/// Secret-free durable reservation status for an authenticated operator interface.
+pub use lightning::ln::channelmanager::FforEpochStatus as OfflineReceiveEpochStatus;
 /// Native offline receive admission limits. Disabled by default; existing
 /// durable obligations remain recoverable when admission is disabled.
 pub use lightning::ln::channelmanager::FforPolicy as OfflineReceiveConfig;

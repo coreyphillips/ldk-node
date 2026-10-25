@@ -3866,7 +3866,7 @@ macro_rules! handle_new_monitor_update {
 
 #[path = "ffor_manager.rs"]
 pub(crate) mod ffor_manager;
-pub use ffor_manager::{FforMessage, FforPolicy, FforReceipt};
+pub use ffor_manager::{FforEpochStatus, FforMessage, FforPolicy, FforReceipt};
 
 #[path = "splice_conflict_manager.rs"]
 mod splice_conflict_manager;

@@ -1,0 +1,49 @@
+{
+  "scope": "native-administration-additions",
+  "source_revision": "35b49a99bdff7edbe3c97dd5a605edf6e878ead4",
+  "checks": [
+    {
+      "name": "library",
+      "passed": 211,
+      "failed": 0,
+      "log_sha256": "53fe743f2ae71751bcf6b9cd3b79b63f4706a4f150ea2fd9a843875bef11e59d"
+    },
+    {
+      "name": "daemon",
+      "passed": 7,
+      "failed": 0,
+      "log_sha256": "99e801d0a20299bed26b41000459f946584d08ce616adcc6e7cdc9c676082e89"
+    },
+    {
+      "name": "durable_offline_status",
+      "passed": 1,
+      "failed": 0,
+      "log_sha256": "9290767e449d4463f421e27fa1709c3eb7fb755773a89d90cb9a42c7ffc56a2c"
+    },
+    {
+      "name": "doctests",
+      "passed": 13,
+      "failed": 0,
+      "log_sha256": "14a401640d080d7694ec7cc15b4d834ee719bd1b08c7ff222165d9746cf1bf8e"
+    }
+  ],
+  "all_targets_chicory_uniffi_check": "passed",
+  "daemon_build": "passed",
+  "root_and_daemon_format": "passed",
+  "binary_sha256": "d58c3d8f617c7a71fec63f8114dde788bc9b475aa161c11f0f576a236f265cda",
+  "portable_combined_tests": {
+    "passed": 229,
+    "failed": 0
+  },
+  "installer_checks": [
+    "reviewed bundle and source hashes match",
+    "reverse patch applicability",
+    "idempotent reinstall with original backup hashes",
+    "refusal before any replacement when one installed bundle has unrelated changes"
+  ],
+  "limitations": [
+    "Compiler and existing lint warnings remain",
+    "No full coverage, Miri, Loom or production security claim",
+    "Funded container evidence is recorded separately"
+  ]
+}

@@ -8,6 +8,11 @@ chicory_dir=${CHICORY_SOURCE_DIR:-"$script_dir/../../../testing/chicory"}
 chicory_dir=$(CDPATH= cd -- "$chicory_dir" && pwd)
 build_dir=${CHICORY_IOS_BUILD_DIR:-/tmp/chicory-primary-ios-build}
 bundle_id=${CHICORY_IOS_BUNDLE_ID:-com.chicory.primaryqualification}
+build_mode=${CHICORY_IOS_MODE:-harness}
+case "$build_mode" in
+  harness|wallet) ;;
+  *) echo 'CHICORY_IOS_MODE must be harness or wallet.' >&2; exit 1 ;;
+esac
 export DEVELOPER_DIR=${DEVELOPER_DIR:-/Applications/Xcode.app/Contents/Developer}
 test_entry="$chicory_dir/native-tests/LdkPrimary.tsx"
 
@@ -15,7 +20,7 @@ test -d "$chicory_dir/ios/Pods" || {
   echo 'Install the CocoaPods dependencies in Chicory before running this build.' >&2
   exit 1
 }
-test ! -e "$test_entry" || {
+test "$build_mode" = wallet || test ! -e "$test_entry" || {
   echo 'The qualification entry already exists; preserve or remove it before rebuilding.' >&2
   exit 1
 }
@@ -27,7 +32,7 @@ restore_sources() {
   cp "$backup_dir/AppDelegate.swift" "$chicory_dir/ios/chicory/AppDelegate.swift"
   cp "$backup_dir/Info.plist" "$chicory_dir/ios/chicory/Info.plist"
   cp "$backup_dir/Podfile.lock" "$chicory_dir/ios/Podfile.lock"
-  rm -f "$test_entry"
+  if test "$build_mode" = harness; then rm -f "$test_entry"; fi
   rm -rf "$backup_dir"
 }
 trap restore_sources EXIT
@@ -56,22 +61,28 @@ if a != b:
     lock.write_text(b)
 PY
 mkdir -p "$chicory_dir/native-tests"
-cp "$script_dir/chicory-ios-entry.tsx" "$test_entry"
-cp "$script_dir/chicory-ios-scene.swift" "$chicory_dir/ios/chicory/AppDelegate.swift"
-python3 - "$chicory_dir/ios/chicory/Info.plist" "$backup_dir/qualification.entitlements" "$bundle_id" <<'PY'
+entry_file=index.js
+if test "$build_mode" = harness; then
+  entry_file=native-tests/LdkPrimary.tsx
+  cp "$script_dir/chicory-ios-entry.tsx" "$test_entry"
+  cp "$script_dir/chicory-ios-scene.swift" "$chicory_dir/ios/chicory/AppDelegate.swift"
+fi
+python3 - "$chicory_dir/ios/chicory/Info.plist" "$backup_dir/qualification.entitlements" "$bundle_id" "$build_mode" <<'PY'
 import pathlib, plistlib, re, sys
 bundle_id = sys.argv[3]
 if not re.fullmatch(r'com\.chicory\.primaryqualification(?:\.[a-z0-9]+)?', bundle_id):
     raise SystemExit('Refusing an identifier outside the isolated qualification namespace.')
 info = pathlib.Path(sys.argv[1])
 data = plistlib.loads(info.read_bytes())
-data['UIApplicationSceneManifest'] = {
-    'UIApplicationSupportsMultipleScenes': False,
-    'UISceneConfigurations': {'UIWindowSceneSessionRoleApplication': [{
-        'UISceneConfigurationName': 'Qualification',
-        'UISceneDelegateClassName': '$(PRODUCT_MODULE_NAME).QualificationScene',
-    }]},
-}
+if sys.argv[4] == 'harness':
+    data['UIApplicationSceneManifest'] = {
+        'UIApplicationSupportsMultipleScenes': False,
+        'UISceneConfigurations': {'UIWindowSceneSessionRoleApplication': [{
+            'UISceneConfigurationName': 'Qualification',
+            'UISceneDelegateClassName': '$(PRODUCT_MODULE_NAME).QualificationScene',
+        }]},
+    }
+data['CFBundleDisplayName'] = 'Chicory UI Test' if sys.argv[4] == 'wallet' else 'Chicory Harness'
 info.write_bytes(plistlib.dumps(data))
 pathlib.Path(sys.argv[2]).write_bytes(plistlib.dumps({
     'application-identifier': 'LOCALTEST.' + bundle_id,
@@ -79,12 +90,13 @@ pathlib.Path(sys.argv[2]).write_bytes(plistlib.dumps({
 }))
 PY
 cd "$chicory_dir"
-ENTRY_FILE=native-tests/LdkPrimary.tsx FORCE_BUNDLING=1 xcodebuild \
+ENTRY_FILE="$entry_file" FORCE_BUNDLING=1 xcodebuild \
   -workspace ios/chicory.xcworkspace -scheme chicory -configuration Debug \
   -sdk iphonesimulator -destination 'generic/platform=iOS Simulator' \
   -derivedDataPath "$build_dir" \
   PRODUCT_BUNDLE_IDENTIFIER="$bundle_id" \
   IPHONEOS_DEPLOYMENT_TARGET=15.1 \
+  SWIFT_ACTIVE_COMPILATION_CONDITIONS='$(inherited) IROH_QUALIFICATION' \
   CODE_SIGN_ENTITLEMENTS="$backup_dir/qualification.entitlements" \
   CODE_SIGNING_ALLOWED=YES CODE_SIGN_IDENTITY=-
 echo "Qualification app: $build_dir/Build/Products/Debug-iphonesimulator/chicory.app"

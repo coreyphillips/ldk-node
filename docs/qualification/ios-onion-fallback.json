@@ -1,0 +1,92 @@
+{
+  "scope": "ios-native-chicory-same-key-onion-fallback",
+  "checks": [
+    {
+      "name": "installed Chicory engine and wallet-core pair with native primary"
+    },
+    {
+      "name": "external payer has a confirmed channel to native primary"
+    },
+    {
+      "name": "installed wallet reviews and creates a skim-fee unified JIT request"
+    },
+    {
+      "name": "installed wallet Activity and balances reflect the native JIT payment",
+      "paymentHash": "9891deed8c71617d8525a89110f467bac780837c5c6cd288dda71fb78cff5921",
+      "status": "completed",
+      "activityAmountSats": 20000,
+      "activityFeeSats": 0,
+      "totalSats": 19880,
+      "availableSats": 18880
+    },
+    {
+      "name": "installed wallet restart restores the paid request, balance and channel"
+    },
+    {
+      "name": "installed wallet pays a native primary invoice and records completed Activity"
+    },
+    {
+      "name": "installed wallet prepares an active concurrent-v2 offline reservation",
+      "channelId": "60cb1a988aa6e77a2e8b9f72aec75477e4876894917deb44cfd90d569cc68869",
+      "epochId": "470f0f39568be8c34a9e2426470a8b3b137ed5ae65d0c04bd47cf0010249e843",
+      "amountSats": 5000,
+      "paymentHash": "2ff5835b6f008e0959d51f11402569ea40ac45435c72bd02278a5ee8f60f960d"
+    },
+    {
+      "name": "native active offline reservation survives ordinary payments in both directions",
+      "channelId": "60cb1a988aa6e77a2e8b9f72aec75477e4876894917deb44cfd90d569cc68869",
+      "epochId": "470f0f39568be8c34a9e2426470a8b3b137ed5ae65d0c04bd47cf0010249e843",
+      "sentSats": 1000,
+      "receivedSats": 1200,
+      "totalSats": 17080
+    },
+    {
+      "name": "restarted native primary settles the external payment while the phone is stopped",
+      "amountSats": 5000,
+      "paymentHash": "2ff5835b6f008e0959d51f11402569ea40ac45435c72bd02278a5ee8f60f960d"
+    },
+    {
+      "name": "installed phone recovers the durable offline receipt after primary restart",
+      "amountSats": 5000,
+      "totalSats": 22080,
+      "activityRows": 1
+    },
+    {
+      "name": "second phone reopen preserves one offline credit and one completed Activity row",
+      "totalSats": 22080,
+      "activityRows": 1
+    }
+  ],
+  "primaryBinarySha256": "3ed1fc62faa3e72a17dc4eb179425e93d5995a458622151b74260ab92b151711",
+  "packages": {
+    "chicoryVersion": "0.7.4",
+    "engineUpstreamVersion": "0.32.1",
+    "engineSha256": "d1a173ff6eec2dabfaf315f81da4fec0e174950e881e2e37dce5b380000822c9",
+    "walletCoreSha256": "4a79550c91ac05303d85d28fe0b5daf4c2a05da97e713a83db54012f7e9a655e",
+    "payerVersion": "0.32.2"
+  },
+  "chain": "regtest",
+  "startedAt": "2026-10-25T13:33:15.634Z",
+  "irohFallback": {
+    "primaryEndpointStopped": true,
+    "imageId": "sha256:08012c047db5e83558620220aaabc39391f4ade85835968b8e3c88a9095a1032",
+    "version": "Tor version 0.4.9.14.",
+    "bootstrapped": true,
+    "onion": "hiomlxxgwnkdxlunsmqacwkw3c7t2hcybzmu7co632hyzddbrosuauad.onion",
+    "nativeTor": true,
+    "persistedUsingPublicSettings": true,
+    "containerRemoved": true,
+    "networkRemoved": true,
+    "nativeDialCountersInstrumented": false,
+    "evidenceNote": "Native dial counters were not instrumented. The stopped provider endpoint and completed native Tor wallet flow establish fallback; initial placeholder zero counters are omitted."
+  },
+  "providerNodeId": "0371f095d92d903c96a065fac7f6cc315ac05d220421900b39b47bdff0a2f11445",
+  "processes": [
+    23264,
+    26375,
+    26426
+  ],
+  "irohOfflineSetupDelayMs": 0,
+  "completedAt": "2026-10-25T13:37:54.946Z",
+  "passed": true
+}

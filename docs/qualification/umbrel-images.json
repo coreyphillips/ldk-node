@@ -1,0 +1,69 @@
+{
+  "amd64": {
+    "architecture": "amd64",
+    "image_id": "sha256:fd496b324a9e6dcac4fe3a757023ebe9410500718163137823413bf500b36601",
+    "checks": [
+      "image architecture verified",
+      "unauthenticated access denied",
+      "mainnet first-run default",
+      "native regtest sync",
+      "native address and unpaid invoice",
+      "authenticated pairing and QR",
+      "native Iroh addon loads",
+      "native stop/start retains identity",
+      "container restart autostarts same native identity",
+      "Docker termination reaches graceful native shutdown",
+      "dashboard starts real Iroh relay and discovery bridge",
+      "native and Iroh identities survive supervised restart"
+    ],
+    "network": "regtest",
+    "funds_sent": false,
+    "physical_umbrel": false,
+    "date": "2026-10-25T13:21:34.808Z",
+    "native_binary_sha256": "a733a3e805426f11a59be85bae414bb8807c7a8eded2a8da6b64287605a7ba1b",
+    "execution_host": "Docker Desktop on ARM64 macOS with AMD64 CPU emulation"
+  },
+  "arm64": {
+    "architecture": "arm64",
+    "image_id": "sha256:aefb2be42dfd48df2bf80bba3d6ab993fe7dcdeeb66720ece1cc16a8d8af5d27",
+    "checks": [
+      "image architecture verified",
+      "unauthenticated access denied",
+      "mainnet first-run default",
+      "native regtest sync",
+      "native address and unpaid invoice",
+      "authenticated pairing and QR",
+      "native Iroh addon loads",
+      "native stop/start retains identity",
+      "container restart autostarts same native identity",
+      "Docker termination reaches graceful native shutdown",
+      "dashboard starts real Iroh relay and discovery bridge",
+      "native and Iroh identities survive supervised restart"
+    ],
+    "network": "regtest",
+    "funds_sent": false,
+    "physical_umbrel": false,
+    "date": "2026-10-25T13:21:00.596Z",
+    "native_binary_sha256": "9c32115bcd926489690c5c063dd261f3eebb541c8f34593e1a865de765c510ab",
+    "execution_host": "Docker Desktop on ARM64 macOS"
+  },
+  "source": {
+    "native_runtime_commit": "35b49a99bdff7edbe3c97dd5a605edf6e878ead4",
+    "snapshot_head_before_runtime_commit": "f3e29bc7d5a155b9ac3c2cfb65a97f30fac0eb96",
+    "snapshot_manifest_sha256": "1b0bc54eff66ed6b503ee179934a9a08fbf990c1b4fc33151b1e603280db4328",
+    "snapshot_files": 977,
+    "notes": "Snapshot included the then-uncommitted daemon. Native runtime source matches the later saved commit; documentation and client fixture files changed separately."
+  },
+  "archives": [
+    {
+      "file": "ldk-node-umbrel-0.1.0-amd64.tar",
+      "sha256": "973dfe335f99a5b9acae0e89ee4c7201eb8618fb8c95d502200bd1c7438692c6",
+      "bytes": 106975744
+    },
+    {
+      "file": "ldk-node-umbrel-0.1.0-arm64.tar",
+      "sha256": "03a25e80bbe7b1da2e034ae3188303e6663ed9c6c90c3118eddd24e634237b2a",
+      "bytes": 105977344
+    }
+  ]
+}

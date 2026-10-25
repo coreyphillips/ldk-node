@@ -1,0 +1,39 @@
+{
+  "scope": "normal-ios-ui-regtest",
+  "startedAt": "2026-10-25T12:31:00.016Z",
+  "primaryBinarySha256": "3ed1fc62faa3e72a17dc4eb179425e93d5995a458622151b74260ab92b151711",
+  "operations": [
+    {
+      "operation": "funded-regtest-peers",
+      "at": "2026-10-25T12:31:04.180Z"
+    },
+    {
+      "operation": "pay",
+      "status": "COMPLETED",
+      "paymentHash": "db8c700e9690123be28663a15883d28870241d96f38fd1b5b108499d76688281",
+      "amountSats": 20000,
+      "at": "2026-10-25T12:38:08.180Z"
+    },
+    {
+      "operation": "restored-regtest-peers",
+      "at": "2026-10-25T12:49:53.989Z"
+    },
+    {
+      "operation": "liquidity",
+      "channelId": "ad1758e731e83a3d5b7a2652a2e38809f4e9dea6259b5f115ef48a09988adf6e",
+      "amountSats": 100000,
+      "at": "2026-10-25T12:50:25.875Z"
+    },
+    {
+      "operation": "pay",
+      "amountSats": 5000,
+      "paymentHash": "714933a63409ddfdd4d3112b31224199bddb1206eb1e08fe854a6106633a8951",
+      "at": "2026-10-25T12:52:10.830Z",
+      "status": "COMPLETED",
+      "completedAt": "2026-10-25T12:52:11.073Z"
+    }
+  ],
+  "providerNodeId": "030a4fbed33e3c3dec836501881c148c174906cc7a317e9b675d0c22957bbe7269",
+  "completedAt": "2026-10-25T12:55:41.128Z",
+  "cleanedUpAt": "2026-10-25T12:55:41.657Z"
+}

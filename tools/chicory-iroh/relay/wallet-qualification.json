@@ -1,0 +1,323 @@
+{
+  "scope": "installed-chicory-portable-forced-public-relay",
+  "checks": [
+    {
+      "name": "installed Chicory engine and wallet-core pair with native primary"
+    },
+    {
+      "name": "external payer has a confirmed channel to native primary"
+    },
+    {
+      "name": "installed wallet reviews and creates a skim-fee unified JIT request"
+    },
+    {
+      "name": "installed wallet Activity and balances reflect the native JIT payment",
+      "paymentHash": "1985c7d5e6e08dbb4aa58bc2f0ca4f00d5f0c7484c0e97867d90999bb237c8b4",
+      "status": "completed",
+      "activityAmountSats": 20000,
+      "activityFeeSats": 0,
+      "totalSats": 19880,
+      "availableSats": 18880
+    },
+    {
+      "name": "installed wallet restart restores the paid request, balance and channel"
+    },
+    {
+      "name": "installed wallet pays a native primary invoice and records completed Activity"
+    },
+    {
+      "name": "installed wallet prepares an active concurrent-v2 offline reservation",
+      "channelId": "1820a3b64a2597de7fb284a8cd571d68acfb84b8dc214ecf83fa961b1a213697",
+      "epochId": "b2d712236c406b6b4ad2fbcb5a5a2603cd704820ccac6022fe20652bd4614675",
+      "amountSats": 5000,
+      "paymentHash": "69bea8595065ec3f7f7fc1019da3848dcf5323e3bec42e930d141c9a392655b1"
+    },
+    {
+      "name": "native active offline reservation survives ordinary payments in both directions",
+      "channelId": "1820a3b64a2597de7fb284a8cd571d68acfb84b8dc214ecf83fa961b1a213697",
+      "epochId": "b2d712236c406b6b4ad2fbcb5a5a2603cd704820ccac6022fe20652bd4614675",
+      "sentSats": 1000,
+      "receivedSats": 1200,
+      "totalSats": 17080
+    },
+    {
+      "name": "restarted native primary settles the external payment while the phone is stopped",
+      "amountSats": 5000,
+      "paymentHash": "69bea8595065ec3f7f7fc1019da3848dcf5323e3bec42e930d141c9a392655b1"
+    },
+    {
+      "name": "installed phone recovers the durable offline receipt after primary restart",
+      "amountSats": 5000,
+      "totalSats": 22080,
+      "activityRows": 1
+    },
+    {
+      "name": "second phone reopen preserves one offline credit and one completed Activity row",
+      "totalSats": 22080,
+      "activityRows": 1
+    }
+  ],
+  "primaryBinarySha256": "3ed1fc62faa3e72a17dc4eb179425e93d5995a458622151b74260ab92b151711",
+  "packages": {
+    "chicoryVersion": "0.7.4",
+    "engineUpstreamVersion": "0.32.1",
+    "engineSha256": "05cdb752e1007532edc1366ea14cbf98a96825885a62d47d6001f74c1bed229d",
+    "walletCoreSha256": "4a79550c91ac05303d85d28fe0b5daf4c2a05da97e713a83db54012f7e9a655e",
+    "payerVersion": "0.32.2"
+  },
+  "chain": "regtest",
+  "startedAt": "2026-10-25T12:56:30.166Z",
+  "irohIsolation": [
+    {
+      "container": "chicory-iroh-relay-d88d8ecd102a1904",
+      "image": "chicory-iroh-relay-local:1.1.0",
+      "endpointProcessUid": 1000,
+      "completed": [
+        {
+          "endpointId": "a1c6013e87ae75b9ffd54938ebdf4420918f3b1f2a531d6d8ebe84abcedb7778",
+          "path": "relay",
+          "directObserved": false,
+          "relayTxBytes": 80445,
+          "relayRxBytes": 14974
+        }
+      ],
+      "capabilities": "0000000000000000",
+      "permittedCapabilities": "0000000000000000",
+      "inheritableCapabilities": "0000000000000000",
+      "ambientCapabilities": "0000000000000000",
+      "noNewPrivileges": "1",
+      "bindingVersion": "1.1.0",
+      "firewall": {
+        "iptables": {
+          "rules": "-P INPUT ACCEPT\n-P FORWARD ACCEPT\n-P OUTPUT ACCEPT\n-N CHICORY_RELAY_ONLY\n-A OUTPUT -p udp -m owner --uid-owner 1000 -j CHICORY_RELAY_ONLY\n-A CHICORY_RELAY_ONLY -d 127.0.0.11/32 -j ACCEPT\n-A CHICORY_RELAY_ONLY -j DROP\n",
+          "counters": "Chain CHICORY_RELAY_ONLY (1 references)\n    pkts      bytes target     prot opt in     out     source               destination         \n      17     1207 ACCEPT     all  --  *      *       0.0.0.0/0            127.0.0.11          \n      61    41319 DROP       all  --  *      *       0.0.0.0/0            0.0.0.0/0           \n"
+        },
+        "ip6tables": {
+          "rules": "-P INPUT ACCEPT\n-P FORWARD ACCEPT\n-P OUTPUT ACCEPT\n-N CHICORY_RELAY_ONLY\n-A OUTPUT -p udp -m owner --uid-owner 1000 -j CHICORY_RELAY_ONLY\n-A CHICORY_RELAY_ONLY -j DROP\n",
+          "counters": "Chain CHICORY_RELAY_ONLY (1 references)\n    pkts      bytes target     prot opt in     out     source               destination         \n       0        0 DROP       all  --  *      *       ::/0                 ::/0                \n"
+        }
+      },
+      "imageId": "sha256:8752e66123930ec355550b72ccdafb2806b276bb74271c2fb46f9a1802120a9c",
+      "initialFirewall": {
+        "iptables": {
+          "rules": "-P INPUT ACCEPT\n-P FORWARD ACCEPT\n-P OUTPUT ACCEPT\n-N CHICORY_RELAY_ONLY\n-A OUTPUT -p udp -m owner --uid-owner 1000 -j CHICORY_RELAY_ONLY\n-A CHICORY_RELAY_ONLY -d 127.0.0.11/32 -j ACCEPT\n-A CHICORY_RELAY_ONLY -j DROP\n",
+          "counters": "Chain CHICORY_RELAY_ONLY (1 references)\n    pkts      bytes target     prot opt in     out     source               destination         \n       4      284 ACCEPT     all  --  *      *       0.0.0.0/0            127.0.0.11          \n       6     5234 DROP       all  --  *      *       0.0.0.0/0            0.0.0.0/0           \n"
+        },
+        "ip6tables": {
+          "rules": "-P INPUT ACCEPT\n-P FORWARD ACCEPT\n-P OUTPUT ACCEPT\n-N CHICORY_RELAY_ONLY\n-A OUTPUT -p udp -m owner --uid-owner 1000 -j CHICORY_RELAY_ONLY\n-A CHICORY_RELAY_ONLY -j DROP\n",
+          "counters": "Chain CHICORY_RELAY_ONLY (1 references)\n    pkts      bytes target     prot opt in     out     source               destination         \n       0        0 DROP       all  --  *      *       ::/0                 ::/0                \n"
+        }
+      },
+      "final": {
+        "address": {
+          "endpointId": "fd0cf49cf8d82b8281f42f87f85ef8920c97cd959696b3bb1418963639dba48b",
+          "relayUrl": "https://use1-1.relay.n0.iroh.link./",
+          "directAddressCount": 1
+        },
+        "completed": [],
+        "active": [
+          {
+            "endpointId": "a1c6013e87ae75b9ffd54938ebdf4420918f3b1f2a531d6d8ebe84abcedb7778",
+            "path": "relay",
+            "directObserved": false,
+            "relayTxBytes": 80406,
+            "relayRxBytes": 14974
+          }
+        ]
+      },
+      "exited": true,
+      "containerRemoved": true,
+      "networkRemoved": true
+    },
+    {
+      "container": "chicory-iroh-relay-db8be2c432bad71f",
+      "image": "chicory-iroh-relay-local:1.1.0",
+      "endpointProcessUid": 1000,
+      "completed": [
+        {
+          "endpointId": "a1c6013e87ae75b9ffd54938ebdf4420918f3b1f2a531d6d8ebe84abcedb7778",
+          "path": "relay",
+          "directObserved": false,
+          "relayTxBytes": 88800,
+          "relayRxBytes": 24086
+        }
+      ],
+      "capabilities": "0000000000000000",
+      "permittedCapabilities": "0000000000000000",
+      "inheritableCapabilities": "0000000000000000",
+      "ambientCapabilities": "0000000000000000",
+      "noNewPrivileges": "1",
+      "bindingVersion": "1.1.0",
+      "firewall": {
+        "iptables": {
+          "rules": "-P INPUT ACCEPT\n-P FORWARD ACCEPT\n-P OUTPUT ACCEPT\n-N CHICORY_RELAY_ONLY\n-A OUTPUT -p udp -m owner --uid-owner 1000 -j CHICORY_RELAY_ONLY\n-A CHICORY_RELAY_ONLY -d 127.0.0.11/32 -j ACCEPT\n-A CHICORY_RELAY_ONLY -j DROP\n",
+          "counters": "Chain CHICORY_RELAY_ONLY (1 references)\n    pkts      bytes target     prot opt in     out     source               destination         \n      17     1207 ACCEPT     all  --  *      *       0.0.0.0/0            127.0.0.11          \n      88    43020 DROP       all  --  *      *       0.0.0.0/0            0.0.0.0/0           \n"
+        },
+        "ip6tables": {
+          "rules": "-P INPUT ACCEPT\n-P FORWARD ACCEPT\n-P OUTPUT ACCEPT\n-N CHICORY_RELAY_ONLY\n-A OUTPUT -p udp -m owner --uid-owner 1000 -j CHICORY_RELAY_ONLY\n-A CHICORY_RELAY_ONLY -j DROP\n",
+          "counters": "Chain CHICORY_RELAY_ONLY (1 references)\n    pkts      bytes target     prot opt in     out     source               destination         \n       0        0 DROP       all  --  *      *       ::/0                 ::/0                \n"
+        }
+      },
+      "imageId": "sha256:8752e66123930ec355550b72ccdafb2806b276bb74271c2fb46f9a1802120a9c",
+      "initialFirewall": {
+        "iptables": {
+          "rules": "-P INPUT ACCEPT\n-P FORWARD ACCEPT\n-P OUTPUT ACCEPT\n-N CHICORY_RELAY_ONLY\n-A OUTPUT -p udp -m owner --uid-owner 1000 -j CHICORY_RELAY_ONLY\n-A CHICORY_RELAY_ONLY -d 127.0.0.11/32 -j ACCEPT\n-A CHICORY_RELAY_ONLY -j DROP\n",
+          "counters": "Chain CHICORY_RELAY_ONLY (1 references)\n    pkts      bytes target     prot opt in     out     source               destination         \n       4      284 ACCEPT     all  --  *      *       0.0.0.0/0            127.0.0.11          \n       6     5234 DROP       all  --  *      *       0.0.0.0/0            0.0.0.0/0           \n"
+        },
+        "ip6tables": {
+          "rules": "-P INPUT ACCEPT\n-P FORWARD ACCEPT\n-P OUTPUT ACCEPT\n-N CHICORY_RELAY_ONLY\n-A OUTPUT -p udp -m owner --uid-owner 1000 -j CHICORY_RELAY_ONLY\n-A CHICORY_RELAY_ONLY -j DROP\n",
+          "counters": "Chain CHICORY_RELAY_ONLY (1 references)\n    pkts      bytes target     prot opt in     out     source               destination         \n       0        0 DROP       all  --  *      *       ::/0                 ::/0                \n"
+        }
+      },
+      "final": {
+        "address": {
+          "endpointId": "fd0cf49cf8d82b8281f42f87f85ef8920c97cd959696b3bb1418963639dba48b",
+          "relayUrl": "https://use1-1.relay.n0.iroh.link./",
+          "directAddressCount": 1
+        },
+        "completed": [],
+        "active": [
+          {
+            "endpointId": "a1c6013e87ae75b9ffd54938ebdf4420918f3b1f2a531d6d8ebe84abcedb7778",
+            "path": "relay",
+            "directObserved": false,
+            "relayTxBytes": 88759,
+            "relayRxBytes": 24086
+          }
+        ]
+      },
+      "exited": true,
+      "containerRemoved": true,
+      "networkRemoved": true
+    },
+    {
+      "container": "chicory-iroh-relay-7f9f4722cea7999d",
+      "image": "chicory-iroh-relay-local:1.1.0",
+      "endpointProcessUid": 1000,
+      "completed": [
+        {
+          "endpointId": "a1c6013e87ae75b9ffd54938ebdf4420918f3b1f2a531d6d8ebe84abcedb7778",
+          "path": "relay",
+          "directObserved": false,
+          "relayTxBytes": 79099,
+          "relayRxBytes": 77991
+        }
+      ],
+      "capabilities": "0000000000000000",
+      "permittedCapabilities": "0000000000000000",
+      "inheritableCapabilities": "0000000000000000",
+      "ambientCapabilities": "0000000000000000",
+      "noNewPrivileges": "1",
+      "bindingVersion": "1.1.0",
+      "firewall": {
+        "iptables": {
+          "rules": "-P INPUT ACCEPT\n-P FORWARD ACCEPT\n-P OUTPUT ACCEPT\n-N CHICORY_RELAY_ONLY\n-A OUTPUT -p udp -m owner --uid-owner 1000 -j CHICORY_RELAY_ONLY\n-A CHICORY_RELAY_ONLY -d 127.0.0.11/32 -j ACCEPT\n-A CHICORY_RELAY_ONLY -j DROP\n",
+          "counters": "Chain CHICORY_RELAY_ONLY (1 references)\n    pkts      bytes target     prot opt in     out     source               destination         \n      17     1207 ACCEPT     all  --  *      *       0.0.0.0/0            127.0.0.11          \n      40    26016 DROP       all  --  *      *       0.0.0.0/0            0.0.0.0/0           \n"
+        },
+        "ip6tables": {
+          "rules": "-P INPUT ACCEPT\n-P FORWARD ACCEPT\n-P OUTPUT ACCEPT\n-N CHICORY_RELAY_ONLY\n-A OUTPUT -p udp -m owner --uid-owner 1000 -j CHICORY_RELAY_ONLY\n-A CHICORY_RELAY_ONLY -j DROP\n",
+          "counters": "Chain CHICORY_RELAY_ONLY (1 references)\n    pkts      bytes target     prot opt in     out     source               destination         \n       0        0 DROP       all  --  *      *       ::/0                 ::/0                \n"
+        }
+      },
+      "imageId": "sha256:8752e66123930ec355550b72ccdafb2806b276bb74271c2fb46f9a1802120a9c",
+      "initialFirewall": {
+        "iptables": {
+          "rules": "-P INPUT ACCEPT\n-P FORWARD ACCEPT\n-P OUTPUT ACCEPT\n-N CHICORY_RELAY_ONLY\n-A OUTPUT -p udp -m owner --uid-owner 1000 -j CHICORY_RELAY_ONLY\n-A CHICORY_RELAY_ONLY -d 127.0.0.11/32 -j ACCEPT\n-A CHICORY_RELAY_ONLY -j DROP\n",
+          "counters": "Chain CHICORY_RELAY_ONLY (1 references)\n    pkts      bytes target     prot opt in     out     source               destination         \n       4      284 ACCEPT     all  --  *      *       0.0.0.0/0            127.0.0.11          \n       6     5234 DROP       all  --  *      *       0.0.0.0/0            0.0.0.0/0           \n"
+        },
+        "ip6tables": {
+          "rules": "-P INPUT ACCEPT\n-P FORWARD ACCEPT\n-P OUTPUT ACCEPT\n-N CHICORY_RELAY_ONLY\n-A OUTPUT -p udp -m owner --uid-owner 1000 -j CHICORY_RELAY_ONLY\n-A CHICORY_RELAY_ONLY -j DROP\n",
+          "counters": "Chain CHICORY_RELAY_ONLY (1 references)\n    pkts      bytes target     prot opt in     out     source               destination         \n       0        0 DROP       all  --  *      *       ::/0                 ::/0                \n"
+        }
+      },
+      "final": {
+        "address": {
+          "endpointId": "fd0cf49cf8d82b8281f42f87f85ef8920c97cd959696b3bb1418963639dba48b",
+          "relayUrl": null,
+          "directAddressCount": 1
+        },
+        "completed": [],
+        "active": [
+          {
+            "endpointId": "a1c6013e87ae75b9ffd54938ebdf4420918f3b1f2a531d6d8ebe84abcedb7778",
+            "path": "relay",
+            "directObserved": false,
+            "relayTxBytes": 79058,
+            "relayRxBytes": 77991
+          }
+        ]
+      },
+      "exited": true,
+      "containerRemoved": true,
+      "networkRemoved": true
+    },
+    {
+      "container": "chicory-iroh-relay-a4a0af70c1f5de84",
+      "image": "chicory-iroh-relay-local:1.1.0",
+      "endpointProcessUid": 1000,
+      "completed": [
+        {
+          "endpointId": "a1c6013e87ae75b9ffd54938ebdf4420918f3b1f2a531d6d8ebe84abcedb7778",
+          "path": "relay",
+          "directObserved": false,
+          "relayTxBytes": 78847,
+          "relayRxBytes": 77727
+        }
+      ],
+      "capabilities": "0000000000000000",
+      "permittedCapabilities": "0000000000000000",
+      "inheritableCapabilities": "0000000000000000",
+      "ambientCapabilities": "0000000000000000",
+      "noNewPrivileges": "1",
+      "bindingVersion": "1.1.0",
+      "firewall": {
+        "iptables": {
+          "rules": "-P INPUT ACCEPT\n-P FORWARD ACCEPT\n-P OUTPUT ACCEPT\n-N CHICORY_RELAY_ONLY\n-A OUTPUT -p udp -m owner --uid-owner 1000 -j CHICORY_RELAY_ONLY\n-A CHICORY_RELAY_ONLY -d 127.0.0.11/32 -j ACCEPT\n-A CHICORY_RELAY_ONLY -j DROP\n",
+          "counters": "Chain CHICORY_RELAY_ONLY (1 references)\n    pkts      bytes target     prot opt in     out     source               destination         \n      17     1207 ACCEPT     all  --  *      *       0.0.0.0/0            127.0.0.11          \n      40    26016 DROP       all  --  *      *       0.0.0.0/0            0.0.0.0/0           \n"
+        },
+        "ip6tables": {
+          "rules": "-P INPUT ACCEPT\n-P FORWARD ACCEPT\n-P OUTPUT ACCEPT\n-N CHICORY_RELAY_ONLY\n-A OUTPUT -p udp -m owner --uid-owner 1000 -j CHICORY_RELAY_ONLY\n-A CHICORY_RELAY_ONLY -j DROP\n",
+          "counters": "Chain CHICORY_RELAY_ONLY (1 references)\n    pkts      bytes target     prot opt in     out     source               destination         \n       0        0 DROP       all  --  *      *       ::/0                 ::/0                \n"
+        }
+      },
+      "imageId": "sha256:8752e66123930ec355550b72ccdafb2806b276bb74271c2fb46f9a1802120a9c",
+      "initialFirewall": {
+        "iptables": {
+          "rules": "-P INPUT ACCEPT\n-P FORWARD ACCEPT\n-P OUTPUT ACCEPT\n-N CHICORY_RELAY_ONLY\n-A OUTPUT -p udp -m owner --uid-owner 1000 -j CHICORY_RELAY_ONLY\n-A CHICORY_RELAY_ONLY -d 127.0.0.11/32 -j ACCEPT\n-A CHICORY_RELAY_ONLY -j DROP\n",
+          "counters": "Chain CHICORY_RELAY_ONLY (1 references)\n    pkts      bytes target     prot opt in     out     source               destination         \n       4      284 ACCEPT     all  --  *      *       0.0.0.0/0            127.0.0.11          \n       6     5234 DROP       all  --  *      *       0.0.0.0/0            0.0.0.0/0           \n"
+        },
+        "ip6tables": {
+          "rules": "-P INPUT ACCEPT\n-P FORWARD ACCEPT\n-P OUTPUT ACCEPT\n-N CHICORY_RELAY_ONLY\n-A OUTPUT -p udp -m owner --uid-owner 1000 -j CHICORY_RELAY_ONLY\n-A CHICORY_RELAY_ONLY -j DROP\n",
+          "counters": "Chain CHICORY_RELAY_ONLY (1 references)\n    pkts      bytes target     prot opt in     out     source               destination         \n       0        0 DROP       all  --  *      *       ::/0                 ::/0                \n"
+        }
+      },
+      "final": {
+        "address": {
+          "endpointId": "fd0cf49cf8d82b8281f42f87f85ef8920c97cd959696b3bb1418963639dba48b",
+          "relayUrl": null,
+          "directAddressCount": 1
+        },
+        "completed": [],
+        "active": [
+          {
+            "endpointId": "a1c6013e87ae75b9ffd54938ebdf4420918f3b1f2a531d6d8ebe84abcedb7778",
+            "path": "relay",
+            "directObserved": false,
+            "relayTxBytes": 78806,
+            "relayRxBytes": 77727
+          }
+        ]
+      },
+      "exited": true,
+      "containerRemoved": true,
+      "networkRemoved": true
+    }
+  ],
+  "irohDiscovery": false,
+  "irohRelayUrl": "https://use1-1.relay.n0.iroh.link./",
+  "irohEndpointId": "a1c6013e87ae75b9ffd54938ebdf4420918f3b1f2a531d6d8ebe84abcedb7778",
+  "providerNodeId": "03af3ba2712287254a622986dfd3fad1bce53f9a576de6f4b6cb3480a66f26fb20",
+  "irohOfflineSetupDelayMs": 0,
+  "completedAt": "2026-10-25T12:56:53.891Z",
+  "passed": true
+}

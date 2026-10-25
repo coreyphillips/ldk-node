@@ -1,0 +1,174 @@
+diff --git a/ios/chicory/AppDelegate.swift b/ios/chicory/AppDelegate.swift
+index e1d7594..2111ae4 100644
+--- a/ios/chicory/AppDelegate.swift
++++ b/ios/chicory/AppDelegate.swift
+@@ -11,14 +11,6 @@ let roast = UIColor(red: 17 / 255, green: 14 / 255, blue: 12 / 255, alpha: 1)
+ 
+ @main
+ class AppDelegate: UIResponder, UIApplicationDelegate {
+-  var window: UIWindow?
+-
+-  var reactNativeDelegate: ReactNativeDelegate?
+-  var reactNativeFactory: RCTReactNativeFactory?
+-
+-  /// The privacy cover while it is up (REDESIGN.md 6, app switcher).
+-  private var privacyCover: UIView?
+-
+   func application(
+     _ application: UIApplication,
+     didFinishLaunchingWithOptions launchOptions: [UIApplication.LaunchOptionsKey: Any]? = nil
+@@ -36,16 +28,59 @@ class AppDelegate: UIResponder, UIApplicationDelegate {
+     } catch {
+       fatalError("Could not exclude wallet state from stale system backups.")
+     }
++    return true
++  }
++
++  func application(
++    _ application: UIApplication,
++    configurationForConnecting session: UISceneSession,
++    options: UIScene.ConnectionOptions
++  ) -> UISceneConfiguration {
++    let configuration = UISceneConfiguration(name: "Wallet", sessionRole: session.role)
++    configuration.delegateClass = ChicorySceneDelegate.self
++    return configuration
++  }
++}
++
++/// The single wallet scene owns its native window and React runtime. Scene
++/// callbacks also cover a foreground return after iOS suspends the app.
++class ChicorySceneDelegate: UIResponder, UIWindowSceneDelegate {
++  var window: UIWindow?
++  private var reactNativeDelegate: ReactNativeDelegate?
++  private var reactNativeFactory: RCTReactNativeFactory?
++  private var privacyCover: UIView?
++
++  func scene(
++    _ scene: UIScene,
++    willConnectTo session: UISceneSession,
++    options connectionOptions: UIScene.ConnectionOptions
++  ) {
++    guard let windowScene = scene as? UIWindowScene else { return }
+     let delegate = ReactNativeDelegate()
+-    let factory = RCTReactNativeFactory(delegate: delegate)
+     delegate.dependencyProvider = RCTAppDependencyProvider()
++    let factory = RCTReactNativeFactory(delegate: delegate)
+ 
+     reactNativeDelegate = delegate
+     reactNativeFactory = factory
+ 
+-    window = UIWindow(frame: UIScreen.main.bounds)
++    window = UIWindow(windowScene: windowScene)
+     window?.backgroundColor = roast
+ 
++    // React Native reads a cold payment link from its launch options before
++    // JavaScript has subscribed to later Linking events.
++    var launchOptions: [UIApplication.LaunchOptionsKey: Any] = [:]
++    if let url = connectionOptions.urlContexts.first?.url {
++      launchOptions[.url] = url
++    }
++    if let activity = connectionOptions.userActivities.first(where: {
++      $0.activityType == NSUserActivityTypeBrowsingWeb
++    }) {
++      launchOptions[.userActivityDictionary] = [
++        UIApplication.LaunchOptionsKey.userActivityType.rawValue: activity.activityType,
++        "UIApplicationLaunchOptionsUserActivityKey": activity,
++      ]
++    }
++
+     factory.startReactNative(
+       withModuleName: "chicory",
+       in: window,
+@@ -56,7 +91,6 @@ class AppDelegate: UIResponder, UIApplicationDelegate {
+     // painted yet, so roast holds from the launch screen through that gap.
+     window?.rootViewController?.view.backgroundColor = roast
+ 
+-    return true
+   }
+ 
+   // The privacy cover (REDESIGN.md 6, app switcher). The picture the app
+@@ -68,11 +102,11 @@ class AppDelegate: UIResponder, UIApplicationDelegate {
+   // does that too, and the screen stays behind those, and an app-to-app
+   // switch animates from a picture iOS takes before the app is told it is
+   // leaving, which no cover reaches (P16).
+-  func applicationDidEnterBackground(_ application: UIApplication) {
++  func sceneDidEnterBackground(_ scene: UIScene) {
+     showPrivacyCover()
+   }
+ 
+-  func applicationDidBecomeActive(_ application: UIApplication) {
++  func sceneDidBecomeActive(_ scene: UIScene) {
+     privacyCover?.removeFromSuperview()
+     privacyCover = nil
+   }
+@@ -96,23 +130,28 @@ class AppDelegate: UIResponder, UIApplicationDelegate {
+   // A payment link opened while the app runs reaches React Native's Linking,
+   // which only hears about it through these. A cold start reads the launch
+   // URL on its own.
+-  func application(
+-    _ app: UIApplication,
+-    open url: URL,
+-    options: [UIApplication.OpenURLOptionsKey: Any] = [:]
+-  ) -> Bool {
+-    return RCTLinkingManager.application(app, open: url, options: options)
++  func scene(_ scene: UIScene, openURLContexts contexts: Set<UIOpenURLContext>) {
++    for context in contexts {
++      var options: [UIApplication.OpenURLOptionsKey: Any] = [
++        .openInPlace: context.options.openInPlace,
++      ]
++      if let source = context.options.sourceApplication {
++        options[.sourceApplication] = source
++      }
++      if let annotation = context.options.annotation {
++        options[.annotation] = annotation
++      }
++      _ = RCTLinkingManager.application(
++        UIApplication.shared, open: context.url, options: options
++      )
++    }
+   }
+ 
+-  func application(
+-    _ application: UIApplication,
+-    continue userActivity: NSUserActivity,
+-    restorationHandler: @escaping ([UIUserActivityRestoring]?) -> Void
+-  ) -> Bool {
+-    return RCTLinkingManager.application(
+-      application,
++  func scene(_ scene: UIScene, continue userActivity: NSUserActivity) {
++    _ = RCTLinkingManager.application(
++      UIApplication.shared,
+       continue: userActivity,
+-      restorationHandler: restorationHandler
++      restorationHandler: { _ in }
+     )
+   }
+ }
+diff --git a/ios/chicory/Info.plist b/ios/chicory/Info.plist
+index b61a724..539bc2b 100644
+--- a/ios/chicory/Info.plist
++++ b/ios/chicory/Info.plist
+@@ -57,6 +57,23 @@
+ 	<true/>
+ 	<key>UILaunchStoryboardName</key>
+ 	<string>LaunchScreen</string>
++	<key>UIApplicationSceneManifest</key>
++	<dict>
++		<key>UIApplicationSupportsMultipleScenes</key>
++		<false/>
++		<key>UISceneConfigurations</key>
++		<dict>
++			<key>UIWindowSceneSessionRoleApplication</key>
++			<array>
++				<dict>
++					<key>UISceneConfigurationName</key>
++					<string>Wallet</string>
++					<key>UISceneDelegateClassName</key>
++					<string>$(PRODUCT_MODULE_NAME).ChicorySceneDelegate</string>
++				</dict>
++			</array>
++		</dict>
++	</dict>
+ 	<key>UIRequiredDeviceCapabilities</key>
+ 	<array>
+ 		<string>arm64</string>

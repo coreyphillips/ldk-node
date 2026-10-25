@@ -1,0 +1,41 @@
+{
+  "passed": true,
+  "completedAt": "2026-10-25T13:13:18.368238+00:00",
+  "device": "DCCF9DDB-C3C0-4979-8D83-E61E03BDA160",
+  "bundleId": "com.chicory.primaryqualification.ui1",
+  "scope": "Actual normal UI payment-link delivery in a fresh simulator",
+  "checks": [
+    {
+      "scheme": "lightning",
+      "launch": "warm",
+      "amountSats": 1000,
+      "explicitReview": true,
+      "screenshot": "/tmp/chicory-ios-link-warm-lightning.png"
+    },
+    {
+      "scheme": "lightning",
+      "launch": "cold",
+      "amountSats": 1000,
+      "explicitReview": true,
+      "screenshot": "/tmp/chicory-ios-link-cold-lightning.png"
+    },
+    {
+      "scheme": "bitcoin",
+      "launch": "warm",
+      "amountSats": 1000,
+      "explicitReview": true,
+      "screenshot": "/tmp/chicory-ios-link-warm-bitcoin.png"
+    },
+    {
+      "scheme": "bitcoin",
+      "launch": "cold",
+      "amountSats": 1000,
+      "explicitReview": true,
+      "screenshot": "/tmp/chicory-ios-link-cold-bitcoin.png"
+    }
+  ],
+  "funded": false,
+  "finalActivityRows": 0,
+  "finalVisibleBalanceSats": 0,
+  "reviewLimitation": "Empty disconnected regtest wallet reaches Send with decoded amount. Explicit review refuses Lightning until primary reconnects. No payment submitted."
+}

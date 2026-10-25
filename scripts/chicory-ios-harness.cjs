@@ -12,9 +12,17 @@ async function createIosHarness() {
   let serial = 0;
   let poll;
   let settings;
+  let authorizedFallback;
+  const walletIds = new Set();
   const deviceId = process.env.CHICORY_IOS_DEVICE_ID;
-  const bundleId = process.env.CHICORY_IOS_BUNDLE_ID || 'com.chicory.primaryqualification';
+  let bundleId = process.env.CHICORY_IOS_BUNDLE_ID || 'com.chicory.primaryqualification';
+  const secondBundleId = process.env.CHICORY_IOS_SECOND_BUNDLE_ID;
   assert.match(bundleId, /^com\.chicory\.primaryqualification(?:\.[a-z0-9]+)?$/);
+  if (secondBundleId) {
+    assert.match(secondBundleId, /^com\.chicory\.primaryqualification\.[a-z0-9]+$/);
+    assert.notEqual(secondBundleId, bundleId);
+    assert.ok(deviceId, 'A second isolated app requires a simulator identifier');
+  }
   if (deviceId) assert.match(deviceId, /^[0-9A-Fa-f-]{36}$/);
   const simulator = (...args) => execFileSync('xcrun', ['simctl', ...args], {
     env: { ...process.env, DEVELOPER_DIR: '/Applications/Xcode.app/Contents/Developer' },
@@ -36,7 +44,7 @@ async function createIosHarness() {
   const server = http.createServer(async (request, response) => {
     try {
       if (request.method === 'GET' && request.url === '/config') {
-        json(response, { network: 'regtest', settings });
+        json(response, { network: 'regtest', settings, walletIds: [...walletIds], authorizedFallback });
         return;
       }
       if (request.method === 'GET' && request.url === '/next') {
@@ -91,7 +99,7 @@ async function createIosHarness() {
       const index = queue.findIndex(item => item.id === id);
       if (index >= 0) queue.splice(index, 1);
       reject(Error('Simulator command timed out: ' + operation));
-    }, 180000);
+    }, authorizedFallback && ['updatePrimary', 'startWallet'].includes(operation) ? 360000 : 180000);
     pending.set(id, { resolve, reject, timer });
     const item = { id, operation, ...fields };
     if (poll) { const response = poll; poll = undefined; json(response, item); }
@@ -101,12 +109,38 @@ async function createIosHarness() {
     constructor({ runtime, walletId }) { this.runtime = runtime; this.walletId = walletId; }
     async createWallet(options) {
       assert.equal(options.network, 'regtest');
-      assert.match(options.primaryUri, /^[0-9a-f]{66}@127\.0\.0\.1:\d+$/);
+      assert.ok(isQualificationPrimaryUri(options.primaryUri), 'Expected isolated TCP or explicit public-relay Iroh URI');
       settings = {network: 'regtest', primaryUri: options.primaryUri,
         electrum: options.electrum, transport: 'native', relayUrl: '', relayToken: ''};
+      if (walletIds.size) {
+        // The real device adapter has one wallet per network. A genuinely new
+        // DF receiver must use a second app identity, never erase the first.
+        assert.ok(secondBundleId && bundleId !== secondBundleId,
+          'Install a second fresh qualification app for the new receiver');
+        assert.equal(pending.size, 0);
+        simulator('terminate', deviceId, bundleId);
+        if (poll) { json(poll, {}); poll = undefined; }
+        resetReady();
+        bundleId = secondBundleId;
+        walletIds.clear();
+        simulator('launch', deviceId, bundleId);
+        let timer;
+        try {
+          await Promise.race([ready, new Promise((_, reject) => {
+            timer = setTimeout(() => reject(Error('Second qualification app did not start')), 60000);
+          })]);
+        } finally { clearTimeout(timer); }
+      }
       const wallet = await command('createWallet', { options });
+      assert.equal(typeof wallet.id, 'string');
+      assert.ok(wallet.id.length > 0 && wallet.id.length <= 160 && !walletIds.has(wallet.id));
+      walletIds.add(wallet.id);
       this.walletId = wallet.id;
       return wallet;
+    }
+    updatePrimary(primaryUri, fallbackUri) {
+      assert.deepEqual({ primaryUri, fallbackUri }, authorizedFallback, 'Only the generated disposable fallback is authorized');
+      return command('updatePrimary', { primaryUri, fallbackUri });
     }
     startWallet() { return command('startWallet', { walletId: this.walletId }); }
     close() { return this.runtime.close(); }
@@ -116,6 +150,11 @@ async function createIosHarness() {
   }
   return {
     EmbeddedWalletClient: DeviceClient,
+    authorizePrimaryFallback(primaryUri, fallbackUri) {
+      assert.equal(authorizedFallback, undefined, 'Fallback authorization is immutable');
+      assert.equal(isQualificationFallbackPair(primaryUri, fallbackUri), true);
+      authorizedFallback = Object.freeze({ primaryUri, fallbackUri });
+    },
     async createPortableRuntime() {
       let timer;
       try {
@@ -160,4 +199,25 @@ async function createIosHarness() {
   };
 }
 
+function isQualificationPrimaryUri(value) {
+  if (typeof value !== 'string') return false;
+  const tcp = /^0[23][0-9a-f]{64}@127\.0\.0\.1:([0-9]{1,5})$/.exec(value);
+  if (tcp) return Number(tcp[1]) > 0 && Number(tcp[1]) <= 65535;
+  const match = /^0[23][0-9a-f]{64}@iroh:[0-9a-f]{64}\?relay=([^&]+)$/.exec(value);
+  if (!match) return false;
+  try {
+    return /^https:\/\/[a-z0-9-]+\.relay\.n0\.iroh\.link\.?\/$/.test(decodeURIComponent(match[1]));
+  } catch { return false; }
+}
+
 module.exports = { createIosHarness };
+
+module.exports.isQualificationPrimaryUri = isQualificationPrimaryUri;
+
+function isQualificationFallbackPair(primaryUri, fallbackUri) {
+  if (!isQualificationPrimaryUri(primaryUri) || !primaryUri.includes('@iroh:')) return false;
+  if (typeof fallbackUri !== 'string') return false;
+  const onion = /^(0[23][0-9a-f]{64})@([a-z2-7]{56})\.onion:9735$/.exec(fallbackUri);
+  return !!onion && onion[1] === primaryUri.split('@')[0];
+}
+module.exports.isQualificationFallbackPair = isQualificationFallbackPair;

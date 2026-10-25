@@ -4,6 +4,6 @@
   "private": true,
   "description": "Optional Iroh byte transport for a local native LDK Node",
   "engines": { "node": ">=20.3.0" },
-  "scripts": { "test": "node --test bridge.test.cjs", "start": "node bridge.cjs" },
+  "scripts": { "test": "node --test bridge.test.cjs", "test:relay": "node --test relay.test.cjs relay-worker.test.cjs isolated-provider.test.cjs", "test:tor": "node --test tor.test.cjs tor-socket.test.cjs", "start": "node bridge.cjs" },
   "dependencies": { "@number0/iroh": "1.1.0" }
 }

@@ -1,0 +1,45 @@
+{
+  "scope": "installed-chicory-portable",
+  "checks": [
+    {
+      "name": "installed Chicory engine and wallet-core pair with native primary"
+    },
+    {
+      "name": "external payer has a confirmed channel to native primary"
+    },
+    {
+      "name": "installed wallet reviews and creates a skim-fee unified JIT request"
+    },
+    {
+      "name": "installed wallet Activity and balances reflect the native JIT payment",
+      "paymentHash": "bbdab6ec4564ba11fb27595e0f22e2e9c3aa4a39d7ab7288706002c159b1dcfa",
+      "status": "completed",
+      "activityAmountSats": 20000,
+      "activityFeeSats": 0,
+      "totalSats": 19880,
+      "availableSats": 18880
+    },
+    {
+      "name": "installed wallet restart restores the paid request, balance and channel"
+    },
+    {
+      "name": "installed wallet pays a native primary invoice and records completed Activity"
+    }
+  ],
+  "primaryBinarySha256": "129862ad7c4efcbac9217743acbecc1f7236973abb62294314c46cf36eb82b0b",
+  "packages": {
+    "chicoryVersion": "0.7.4",
+    "engineUpstreamVersion": "0.32.1",
+    "engineSha256": "d1a173ff6eec2dabfaf315f81da4fec0e174950e881e2e37dce5b380000822c9",
+    "walletCoreSha256": "4a79550c91ac05303d85d28fe0b5daf4c2a05da97e713a83db54012f7e9a655e",
+    "payerVersion": "0.32.2"
+  },
+  "chain": "regtest",
+  "startedAt": "2026-10-25T13:26:44.333Z",
+  "providerNodeId": "0292a806ad021bd1c7ea7ddb90b0ada211bc7a5b96401629d1873a54d2c6a4e76c",
+  "processes": [
+    90867
+  ],
+  "completedAt": "2026-10-25T13:26:52.227Z",
+  "passed": true
+}

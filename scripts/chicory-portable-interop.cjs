@@ -379,6 +379,22 @@ function startDirectFundingPayer(directory, primaryUri, requestUri, amountSats, 
 
 async function main() {
   assert.ok(['tcp:', 'ssl:'].includes(electrum.protocol));
+  const relayIroh = process.env.CHICORY_TEST_IROH_RELAY === '1';
+  const discoveryIroh = process.env.CHICORY_TEST_IROH_DISCOVERY === '1';
+  const fallbackIroh = process.env.CHICORY_TEST_IROH_FALLBACK === '1';
+  const providerRelayIroh = process.env.CHICORY_TEST_IROH_PROVIDER_RELAY === '1';
+  if (providerRelayIroh) {
+    assert.equal(process.env.CHICORY_TEST_IROH, '1', 'Provider relay qualification requires Iroh');
+    assert.equal(process.env.CHICORY_TEST_IOS, '1', 'Provider isolation currently qualifies native iOS');
+    assert(!relayIroh && !discoveryIroh && !fallbackIroh, 'Run provider relay isolation separately');
+  }
+  if (fallbackIroh) {
+    assert.equal(process.env.CHICORY_TEST_IROH, '1', 'Fallback qualification requires Iroh');
+    assert(!relayIroh && !discoveryIroh, 'Run same-key fallback separately');
+  }
+  if (relayIroh || discoveryIroh) assert.equal(process.env.CHICORY_TEST_IROH, '1', 'Relay qualification requires Iroh');
+  if (discoveryIroh) assert.ok(relayIroh, 'Discovery qualification requires public relays');
+  if (relayIroh) assert.notEqual(process.env.CHICORY_TEST_IOS, '1', 'Container relay isolation applies to the Node endpoint only');
   const autoExpireOffline = process.env.CHICORY_TEST_OFFLINE_AUTO_EXPIRE === '1';
   const unpaidOffline = process.env.CHICORY_TEST_OFFLINE_UNPAID === '1' || autoExpireOffline;
   if (unpaidOffline) {
@@ -420,11 +436,13 @@ async function main() {
   let succeeded = false;
   let iosHarness;
   let irohBridge;
+  let fallbackTor;
+  const fallbackEndpoints = [];
   try {
     if (process.env.CHICORY_TEST_IOS === '1') {
       for (const flag of ['INITIAL_DEPOSIT', 'RECOVERY', 'RECOVERY_SWEEP', 'JIT_SPLICE',
-        'SPLICES', 'DIRECT_FUNDING', 'CONFLICT', 'SEND_MAX', 'DRAIN']) {
-        assert.ok(!process.env['CHICORY_TEST_' + flag], 'Native simulator fixture supports baseline and offline cases only');
+        'SPLICES', 'CONFLICT', 'SEND_MAX', 'DRAIN']) {
+        assert.ok(!process.env['CHICORY_TEST_' + flag], 'Native simulator fixture supports baseline, direct funding and offline cases only');
       }
       iosHarness = await require('./chicory-ios-harness.cjs').createIosHarness();
       ({ createPortableRuntime, EmbeddedWalletClient } = iosHarness);
@@ -433,30 +451,87 @@ async function main() {
     primary = await startPrimary(path.join(temp, 'primary'), port);
     const providerKey = primary.ready.nodeId;
     let walletPrimaryUri = primary.ready.uri;
+    let walletPrimaryFallbackUri;
     let iroh;
     if (process.env.CHICORY_TEST_IROH === '1') {
-      assert.notEqual(process.env.CHICORY_TEST_IOS, '1', 'Qualify the native Iroh adapter separately');
       for (const flag of ['INITIAL_DEPOSIT', 'RECOVERY', 'RECOVERY_SWEEP', 'JIT_SPLICE',
         'SPLICES', 'DIRECT_FUNDING', 'CONFLICT', 'SEND_MAX', 'DRAIN']) {
         assert.ok(!process.env['CHICORY_TEST_' + flag], 'Iroh fixture supports baseline and offline cases only');
       }
-      const { startBridge } = require('../tools/chicory-iroh/bridge.cjs');
-      const { createNodeIrohEndpoint } = require(path.join(source, 'dist/lightning/transport/iroh-node.js'));
-      irohBridge = await startBridge({ identityPath: path.join(temp, 'iroh.key'), port,
-        bindAddress: '127.0.0.1:0', discovery: false, relays: [] });
-      walletPrimaryUri = providerKey + '@iroh:' + irohBridge.address().endpointId;
-      iroh = { discovery: false, relays: [], factory: async options => {
-        const endpoint = await createNodeIrohEndpoint({ ...options, discovery: false, relays: [] });
-        const connect = endpoint.connect.bind(endpoint);
-        endpoint.connect = (address, timeout) => {
-          const primaryAddress = irohBridge.address();
-          assert.equal(address.endpointId, primaryAddress.endpointId);
-          return connect({ ...address, directAddresses: primaryAddress.directAddresses }, timeout);
-        };
-        return endpoint;
-      } };
-      evidence.scope = 'installed-chicory-portable-direct-iroh';
-      evidence.irohEndpointId = irohBridge.address().endpointId;
+      if (process.env.CHICORY_TEST_IOS === '1' && !fallbackIroh) {
+        if (providerRelayIroh) {
+          const setup = await require('../tools/chicory-iroh/isolated-provider-fixture.cjs')
+            .createIsolatedProviderFixture({ directory: temp, port, providerKey, source, evidence });
+          irohBridge = setup.bridge; walletPrimaryUri = setup.uri;
+        } else {
+          const { startBridge } = require('../tools/chicory-iroh/bridge.cjs');
+          irohBridge = await startBridge({ identityPath: path.join(temp, 'iroh.key'), port,
+            discovery: true, defaultRelays: true });
+          const address = irohBridge.address();
+          assert(address.relayUrl, 'Native Iroh pairing requires a reachable relay address');
+          walletPrimaryUri = providerKey + '@iroh:' + address.endpointId + '?relay=' + encodeURIComponent(address.relayUrl);
+          evidence.scope = 'ios-native-chicory-iroh';
+          evidence.irohEndpointId = address.endpointId;
+          evidence.irohRelayUrl = address.relayUrl;
+        }
+        // openDeviceWallet selects the actual native Iroh factory from this URI.
+      } else if (fallbackIroh) {
+        const { startBridge } = require('../tools/chicory-iroh/bridge.cjs');
+        irohBridge = await startBridge({ identityPath: path.join(temp, 'iroh.key'), port,
+          discovery: false, defaultRelays: true });
+        const address = irohBridge.address();
+        walletPrimaryUri = providerKey + '@iroh:' + address.endpointId + '?relay=' + encodeURIComponent(address.relayUrl);
+        await irohBridge.close();
+        evidence.irohFallback = { primaryEndpointStopped: true };
+        fallbackTor = await require('../tools/chicory-iroh/tor-fixture.cjs').startTor({ port, evidence: evidence.irohFallback });
+        walletPrimaryFallbackUri = providerKey + '@' + fallbackTor.host + ':' + fallbackTor.port;
+        if (iosHarness) {
+          iosHarness.authorizePrimaryFallback(walletPrimaryUri, walletPrimaryFallbackUri);
+          evidence.scope = 'ios-native-chicory-same-key-onion-fallback';
+          evidence.irohFallback.nativeTor = true;
+          evidence.irohFallback.nativeDialCountersInstrumented = false;
+        } else {
+          const { createNodeIrohEndpoint } = require(path.join(source, 'dist/lightning/transport/iroh-node.js'));
+          evidence.scope = 'installed-chicory-portable-same-key-onion-fallback';
+          evidence.irohFallback.attempts = 0;
+          evidence.irohFallback.unexpectedIrohConnections = 0;
+          iroh = { discovery: false, factory: async options => {
+            const endpoint = await createNodeIrohEndpoint({ ...options, discovery: false });
+            fallbackEndpoints.push(endpoint);
+            const connect = endpoint.connect.bind(endpoint);
+            endpoint.connect = async (target, timeout) => {
+              evidence.irohFallback.attempts++;
+              const socket = await connect(target, timeout);
+              evidence.irohFallback.unexpectedIrohConnections++;
+              return socket;
+            };
+            return endpoint;
+          } };
+        }
+      } else if (relayIroh) {
+        const setup = await require('../tools/chicory-iroh/relay-fixture.cjs').createRelayFixture({
+          directory: temp, port, providerKey, discovery: discoveryIroh, source, evidence,
+        });
+        irohBridge = setup.bridge; walletPrimaryUri = setup.uri; iroh = setup.iroh;
+      } else {
+        const { startBridge } = require('../tools/chicory-iroh/bridge.cjs');
+        const { createNodeIrohEndpoint } = require(path.join(source, 'dist/lightning/transport/iroh-node.js'));
+        irohBridge = await startBridge({ identityPath: path.join(temp, 'iroh.key'), port,
+          bindAddress: '127.0.0.1:0', discovery: false, relays: [] });
+        walletPrimaryUri = providerKey + '@iroh:' + irohBridge.address().endpointId;
+        iroh = { discovery: false, relays: [], factory: async options => {
+          const endpoint = await createNodeIrohEndpoint({ ...options, discovery: false, relays: [] });
+          const connect = endpoint.connect.bind(endpoint);
+          endpoint.connect = (address, timeout) => {
+            const primaryAddress = irohBridge.address();
+            assert.equal(address.endpointId, primaryAddress.endpointId);
+            return connect({ ...address, directAddresses: primaryAddress.directAddresses }, timeout);
+          };
+          return endpoint;
+        } };
+        evidence.scope = 'installed-chicory-portable-direct-iroh';
+        evidence.irohEndpointId = irohBridge.address().endpointId;
+      }
     }
     evidence.providerNodeId = providerKey;
     evidence.processes = [primary.child.pid];
@@ -472,9 +547,24 @@ async function main() {
     const databaseFactory = await createSqlJsDatabaseFactory({
       load: volume.read, save: volume.write, wasmBinary: fs.readFileSync(wasmFile),
     });
+    let onionSocketFactory;
+    if (fallbackTor && !iosHarness) {
+      const { socks5SocketFactory } = require(path.join(source, 'dist/lightning/transport/peer-manager.js'));
+      const [host, rawPort] = fallbackTor.proxy.split(':');
+      onionSocketFactory = require('../tools/chicory-iroh/tor-socket.cjs').createTorSocketFactory({
+        host: fallbackTor.host, port: fallbackTor.port,
+        connect: socks5SocketFactory({ host, port: Number(rawPort) }, 20000),
+      });
+      evidence.irohFallback.hostOwnsOnionRouting = true;
+    }
     // This implements the installed portable SocketFactory interface. It only
     // transports bytes; the unchanged engine performs Electrum and BOLT 8.
     const socketFactory = target => {
+      if (onionSocketFactory && target.host === fallbackTor.host) {
+        const socket = onionSocketFactory(target);
+        sockets.add(socket); socket.once('close', () => sockets.delete(socket));
+        return socket;
+      }
       const isElectrum = target.host === endpoint.host && target.port === endpoint.port &&
         target.tls === endpoint.tls;
       const isPrimary = !irohBridge && target.host === '127.0.0.1' && target.port === port && !target.tls;
@@ -500,6 +590,12 @@ async function main() {
       name: 'Native primary portable regtest', network: 'regtest',
       primaryUri: walletPrimaryUri, electrum: endpoint,
     });
+    if (walletPrimaryFallbackUri) {
+      // The installed public create API accepts only the primary URI. Persist
+      // the same-key onion through the public settings operation before pairing.
+      await client.updatePrimary(walletPrimaryUri, walletPrimaryFallbackUri);
+      evidence.irohFallback.persistedUsingPublicSettings = true;
+    }
     let walletId = created.id;
     rpc = (route, method = 'GET', body) => runtime.request({
       method, path: `/wallets/${walletId}/api${route}`, body,
@@ -897,14 +993,7 @@ async function main() {
           native?.isUsable && home.fundingTxid === native.fundingTxid &&
           native.valueSats === nativeBefore.valueSats + 100000;
       });
-      if (irohBridge) {
-        // Installed portable runtime 0.32.1 has a one-shot 8-second redial
-        // watchdog that confuses FFOR admission holds with reestablishment.
-        // Let it observe the stable usable channel before starting the book.
-        // This fixture scheduling workaround does not modify the phone engine.
-        await delay(9000);
-        evidence.irohOfflineSetupDelayMs = 9000;
-      }
+      if (irohBridge || process.env.CHICORY_TEST_IOS === '1') evidence.irohOfflineSetupDelayMs = 0;
       let before = (await client.snapshot()).balance.totalSats;
       const amountSats = 5000;
       const quote = await client.quoteReceive({ amountSats, mode: 'offline', description: 'Installed Chicory offline receive' });
@@ -1692,6 +1781,14 @@ async function main() {
     if (primary) await primary.stop();
     if (iosHarness) await iosHarness.close();
     if (irohBridge) await irohBridge.close();
+    if (fallbackTor) {
+      await Promise.all(fallbackEndpoints.map(endpoint => endpoint.close()));
+      await fallbackTor.close();
+      if (!iosHarness) {
+        assert(evidence.irohFallback.attempts > 0);
+        assert.equal(evidence.irohFallback.unexpectedIrohConnections, 0, 'Fallback qualification used Iroh');
+      }
+    }
     if (process.env.BEIGNET_EVIDENCE_FILE) fs.writeFileSync(process.env.BEIGNET_EVIDENCE_FILE,
       JSON.stringify({ ...evidence, passed: succeeded }, null, 2) + '\n', { mode: 0o600 });
     if (succeeded && process.env.CHICORY_KEEP_TEST_STATE !== '1') fs.rmSync(temp, { recursive: true, force: true });

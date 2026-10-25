@@ -146,8 +146,9 @@ native wallet. The lifetime allocation ceiling is charged before funding and
 retained conservatively across failures and restarts; it is not a daily limit.
 Mining fees and the wallet's required reserves are additional. The provider does
 not fund an offline reservation merely because a phone requested one.
-The durable funding lease coordinates JIT-owned attempts only. A host that also
-calls manual funding APIs must coordinate those operations separately. Offline
+A host that also calls manual funding APIs must wrap channel opens, splices and
+Bitcoin sends with `Node::with_chicory_wallet_operation`. The native daemon does
+this automatically; unwrapped host calls remain outside the funding lease. Offline
 custody has non-evicting lifetime limits of 128 home identities globally and
 4,096 archived voucher hashes or burned epoch identifiers per home. The opaque
 backup store admits 1,024 peers. Exhaustion refuses new admissions; restarting
@@ -176,16 +177,21 @@ failed this check. Raising only the funding transaction fee does not change the
 commitment fee.
 
 The fixed commitment-fee mismatch is tracked in [Beignet issue 1873](https://github.com/coreyphillips/beignet/issues/1873).
+The local client patch now selects fresh initial commitment fees instead of the
+fixed floor. Apply the exact reviewed bundle with the installer described in
+[the compatibility record](chicory-primary.md#local-client-compatibility-fixes)
+and rebuild Chicory. The native safety check is retained. Core also rejects a
+fixed 253 sat/kw when its mempool minimum rises above it, so selecting Core is not
+a substitute for this correction.
 
-This is a conditional limitation, not a guarantee supplied by choosing Core:
-Core also rejects 253 sat/kw if its mempool minimum rises above that value. Keep
-the native safety check. A native-funded JIT home uses the primary's commitment
-fee, and a subsequent incoming splice preserves it, so those paths are not
-blocked by the phone's fresh-open fee mismatch. Complete installed-phone
-compatibility with an Electrum or Esplora primary has not been qualified. Core
-conflict proofs also require its transaction index for arbitrary confirmed
-transaction lookup; unavailable proof causes a refusal. Esplora and Electrum
-have separate verified proof paths.
+A native-funded JIT home uses the primary's commitment fee, and a subsequent
+incoming splice preserves it. Core conflict proofs also require its transaction
+index for arbitrary confirmed transaction lookup; unavailable proof causes a
+refusal. Esplora and Electrum have separate verified proof paths. Consult the
+recorded funded backend checks rather than assuming that one backend's result
+qualifies every other backend. The final local client passed native iOS existing-home
+and fresh-channel direct funding against Electrum, including receipts and
+subsequent Lightning spends; see [the evidence](qualification/ios-electrum-direct-funding.json).
 
 ## Fund, connect, and select the primary
 
@@ -236,8 +242,8 @@ LDK still terminates BOLT8 and owns every channel and Lightning key.
 
 Direct local testing supplies explicit socket addresses outside the URI. For
 remote reachability, choose explicit relay/discovery options as documented by
-the bridge. The direct transport tests do not establish public-relay or native
-iOS Iroh interoperability. Use the current verification record for any additional
+the bridge. Forced public-relay, discovery, fallback and native iOS checks have
+separate evidence. Use the current verification record for their exact
 installed-phone evidence rather than assuming transport success proves payments.
 
 The installed portable runtime has a separate reconnect-watchdog limitation.
@@ -251,3 +257,15 @@ unchanged and is not a production fix. See the bridge documentation for the
 owning source and the measured scope, and
 [Beignet issue 1872](https://github.com/coreyphillips/beignet/issues/1872) for the
 integration report.
+
+
+## Dashboard daemon
+
+For persistent administration use the [native daemon](../tools/ldk-node-daemon/README.md)
+and the separate local `ldk-node-umbrel` checkout. The daemon accepts Mainnet,
+Testnet, Signet or Regtest with a matching Core, Electrum or Esplora backend. Its
+private JSONL pipe is intended for an authenticated manager, not direct network
+exposure. The dashboard supplies operator authentication, payment review, peer
+and channel controls, pairing QR codes, durable events, and offline custody status.
+Use the package's local image loading instructions for AMD64 or ARM64. There is
+no published registry image or public app-store URL for this local build.

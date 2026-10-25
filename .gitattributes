@@ -1,0 +1,3 @@
+# Unified diffs preserve context prefixes, including blank lines and indented XML.
+# Validate these data files with git apply; ordinary source whitespace checks remain enabled.
+patches/** -whitespace

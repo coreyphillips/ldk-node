@@ -1,0 +1,6 @@
+{
+  "name": "chicory-iroh-relay-qualification",
+  "version": "0.1.0",
+  "private": true,
+  "dependencies": { "@number0/iroh": "1.1.0" }
+}

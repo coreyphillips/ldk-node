@@ -11,12 +11,14 @@ Requires Node 20.3 or newer and the pinned `@number0/iroh` 1.1.0 native addon:
 cd tools/chicory-iroh
 npm install
 node bridge.cjs --identity /absolute/private/path/iroh.key \
-  --port 9735 --node-id NATIVE_LDK_COMPRESSED_PUBLIC_KEY
+  --port 9735 --node-id NATIVE_LDK_COMPRESSED_PUBLIC_KEY \
+  --default-relays --discovery
 ```
 
 The ready JSON contains the public endpoint id, direct addresses, and an Iroh
 connection URI. Direct addresses are separate from that URI. Discovery and relays
-are disabled by default. An explicit `--discovery` enables n0 address discovery;
+are disabled unless requested. The pairing command above enables both so the
+phone can resolve and reach its endpoint. An explicit `--discovery` enables n0 address discovery;
 `--default-relays` enables its production relay map, or repeat `--relay URL` for
 up to four explicit relays. Explicit relay startup waits at most 10 seconds for
 a usable home relay before returning its address. Relay reachability and the installed phone's Iroh
@@ -46,8 +48,13 @@ ordinary payments with an active reservation, settlement while the phone was
 stopped, primary restarts, and exactly one recovered 5,000-sat credit through two
 phone reopens. The evidence is retained in
 [`final-iroh.json`](../../docs/qualification/final-iroh.json). The wait is a test
-scheduling workaround; it does not fix the installed wallet. Public relays,
-fallback and native iOS Iroh remain unqualified.
+scheduling workaround; it does not fix the installed wallet. Those historical
+results establish only the direct portable path.
+
+The local portable-engine patch now limits that watchdog to an incomplete
+reestablishment exchange and cancels stale connection generations. The current
+fixture no longer inserts a delay before offline setup. Its historical evidence
+still records the original workaround accurately.
 
 A later bounded check reached the public relay with discovery disabled and no
 supplied direct addresses, using a fresh unfunded normal-feature native host.
@@ -58,8 +65,31 @@ strict relay-only check failed. The pinned addon does not expose the Rust
 Its `watchPaths` diagnostic API also aborted when called without a Tokio runtime;
 the bridge does not use that API. Snapshots are not treated as continuous proof.
 This test used read-only Electrum access at `mint.local:60401`, moved no funds,
-and closed both endpoints and the native host afterward. Relay-only wallet
-payments, fallback and native iOS Iroh remain unqualified.
+and closed both endpoints and the native host afterward. That exploratory test
+did not establish continuous relay-only traffic.
+
+A subsequent isolated-container test now forces public relay transport by
+blocking endpoint UDP in its own network namespace. Ordered bytes with both
+explicit relay addressing and default discovery, plus authenticated native
+BOLT8, passed with exact firewall and process-privilege evidence. A disposable
+Tor hidden-service ordered-byte check also passed. The unchanged installed
+portable wallet then passed all eleven funded baseline and concurrent offline
+checks over forced public relays with no artificial setup delay, including
+provider restarts and exactly one recovered offline credit. See the
+[relay and fallback qualification procedure](relay/README.md) for its trust
+boundary, bounds, commands, and saved evidence. With the corrected local client,
+all eleven discovery checks passed again with a bare endpoint URI. Native iOS
+then passed the same eleven checks using its production native endpoint and a
+provider isolated behind the UDP prohibition. See
+[`ios-forced-relay.json`](../../docs/qualification/ios-forced-relay.json).
+Native iOS also passed eleven checks through its actual nitro-tor same-key onion
+fallback while the provider Iroh endpoint was stopped. The same offline payment
+was recovered exactly once after provider restarts, without a host socket
+override or setup delay. See
+[`ios-onion-fallback.json`](../../docs/qualification/ios-onion-fallback.json).
+The portable host also passed the eleven-check onion fallback flow with its
+bounded host adapter, five unsuccessful Iroh attempts and no successful Iroh
+connection. See [`onion-fallback.json`](../../docs/qualification/onion-fallback.json).
 
 The endpoint identity is a separate random 32-byte file, created exclusively with
 mode `0600` and synced before use. Existing files must have the same size, owner,

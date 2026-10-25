@@ -1,0 +1,54 @@
+{
+  "bundleId": "com.chicory.primaryqualification.ui1",
+  "mode": "normal UI",
+  "platform": "iPhone Air iOS27.0 simulator; Xcode27.1 SDK",
+  "files": {
+    "chicory": "37e80b6173b936bd8df46946c6ef4bb0cbd477761e3071b914020e273814ba1e",
+    "chicory.debug.dylib": "cb07a9314c107d9ab24ac585c772f313ef921e2cbb16dcaab568653fce883e9f",
+    "main.jsbundle": "a6668f71952a66c5ad939cbe2e99ef2d15dd84d97eddcdec84852d6672135cd0"
+  },
+  "checks": [
+    {
+      "check": "normal launch after UIScene fix",
+      "passed": true
+    },
+    {
+      "check": "normal UI regtest primary configuration",
+      "passed": true
+    },
+    {
+      "check": "JIT receive20k fee120 home19880",
+      "passed": true
+    },
+    {
+      "check": "background privacy app switcher",
+      "passed": true
+    },
+    {
+      "check": "primary restart in background and foreground reconnect",
+      "passed": true
+    },
+    {
+      "check": "normal UI send1000 after restart, home18880",
+      "passed": true
+    },
+    {
+      "check": "cold process restart retains18,880 andtwoActivity rows",
+      "passed": true
+    }
+  ],
+  "completedAt": "2026-10-25T12:55:41.112Z",
+  "passed": true,
+  "offlineReceive": {
+    "amountSats": 5000,
+    "finalVisibleBalanceSats": 23880,
+    "matchingActivityEntries": 1,
+    "providerRestarts": 2,
+    "phoneTerminatedDuringPayment": true,
+    "coldReopenDeduplicated": true,
+    "screenshots": [
+      "/tmp/chicory-ios-ui-offline-received.png",
+      "/tmp/chicory-ios-ui-offline-cold-reopen.png"
+    ]
+  }
+}

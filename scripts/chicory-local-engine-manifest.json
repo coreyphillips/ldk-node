@@ -1,0 +1,25 @@
+{
+  "schema": 1,
+  "source_revision": "c9acc05f61899468f4eefd71d599d0de0bea9190",
+  "source_base_revision": "67bc9cf0ba3e55fa1e1d7ad73e360bb04321a62c",
+  "upstream_beignet_revision": "daed636187e42bfbd156e5f5b74fda9c7a6379cd",
+  "source_files": {
+    "portable-tests/reestablish-watchdog.test.cjs": "9ca6458bbcf89f51dc20a0249ea40ee2b04fe5b7b30db22fbf00442c430f2781",
+    "portable/reestablish-watchdog.cjs": "ffe3241db4c52731c502bb3f653d2ca2fff11b2e2065d35983b13687b3d338c2",
+    "portable/runtime.ts": "856be46759d039fbdcccf303f698e678dfc5f50ad83e814e6e2f00233bb3b37a",
+    "src/lightning/advisor/fee-advisor.ts": "46e3c3b072d1bd7d2df0012050aa6275aef9915b19747fb7656af54cd273de3d",
+    "src/lightning/channel/channel-manager.ts": "6b8070131bea16dfdae461a48271f092252f4b37161c936c78f34a6be649f3d2",
+    "src/lightning/channel/channel.ts": "e2150c258969b13ad7126814dc7fbb858d6874f1c45a151720b8a47765dbe087",
+    "src/lightning/node/lightning-node.ts": "341ecd780a039a4f1defec056f7f30dd6172c5f4100e4a4d9fa1252ae6c53d11"
+  },
+  "bundles": {
+    "dist/portable.cjs": {
+      "original": "05cdb752e1007532edc1366ea14cbf98a96825885a62d47d6001f74c1bed229d",
+      "patched": "d1a173ff6eec2dabfaf315f81da4fec0e174950e881e2e37dce5b380000822c9"
+    },
+    "dist/portable.mjs": {
+      "original": "d3c4ecedab13893d936742542affde9c0b1e8628dd370dfd8beefca3eeb481e6",
+      "patched": "7b98cf137c21dd1b84f9c27175c13ce844be180ed7da7b883001579b39e94fae"
+    }
+  }
+}

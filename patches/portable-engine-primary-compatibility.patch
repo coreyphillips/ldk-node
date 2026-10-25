@@ -1,0 +1,422 @@
+diff --git a/portable-tests/reestablish-watchdog.test.cjs b/portable-tests/reestablish-watchdog.test.cjs
+new file mode 100644
+index 0000000..74f0b44
+--- /dev/null
++++ b/portable-tests/reestablish-watchdog.test.cjs
+@@ -0,0 +1,56 @@
++const { test } = require('node:test');
++const assert = require('node:assert/strict');
++const { EventEmitter } = require('node:events');
++const { awaitingReestablishment, watchReestablishment } = require('../portable/reestablish-watchdog.cjs');
++
++function fixture() {
++  const node = new EventEmitter(); let serial = 0; const timers = new Map();
++  const state = { channels: [], connected: true, closed: false, held: false, redials: 0, probes: 0 };
++  node.listChannels = () => state.channels;
++  const pendingTimers = new Set();
++  const stop = watchReestablishment({ node, primaryPubkey: () => 'primary', peerKey: peer => peer,
++    primaryConnected: () => state.connected, isClosed: () => state.closed, recoveryHold: () => state.held,
++    onConnect: () => state.probes++, redial: () => state.redials++, pendingTimers,
++    schedule: fn => { const id = ++serial; timers.set(id, fn); return id; }, cancel: id => timers.delete(id) });
++  const fire = async () => { const jobs = [...timers.values()]; timers.clear(); for (const job of jobs) job(); await Promise.resolve(); };
++  return { node, state, timers, pendingTimers, stop, fire };
++}
++
++test('a healthy channel never redials for quiescence, splice, offline custody or a funding wait', async () => {
++  for (const state of ['NORMAL','SPLICING','AWAITING_FUNDING_LOCKED','SHUTTING_DOWN','CLOSED','FORCE_CLOSED']) {
++    const f = fixture();
++    f.state.channels = [{peerPubkey:'primary',state,htlcUsable:false,restoreRecencyUnproven:true}];
++    f.node.emit('peer:connect','primary'); await f.fire();
++    assert.equal(f.state.redials,0,state); assert.equal(f.state.probes,1); assert.equal(f.pendingTimers.size,0);
++    f.stop();
++  }
++});
++
++test('an actual incomplete reestablishment redials at most three times and resets after success', async () => {
++  const f = fixture(); f.state.channels = [{peerPubkey:'primary',state:'AWAITING_REESTABLISH',htlcUsable:false}];
++  for (let i=0;i<5;i++) { f.node.emit('peer:connect','primary'); await f.fire(); }
++  assert.equal(f.state.redials,3);
++  f.state.channels[0].state='NORMAL'; f.node.emit('peer:connect','primary'); await f.fire();
++  f.state.channels[0].state='AWAITING_REESTABLISH'; f.node.emit('peer:connect','primary'); await f.fire();
++  assert.equal(f.state.redials,4); f.stop();
++});
++
++test('a stale connection callback cannot tear down a newer connection', async () => {
++  const f = fixture(); f.state.channels = [{peerPubkey:'primary',state:'AWAITING_REESTABLISH'}];
++  f.node.emit('peer:connect','primary'); const old = [...f.timers.values()][0];
++  f.node.emit('peer:disconnect','primary'); f.node.emit('peer:connect','primary');
++  old(); await Promise.resolve(); assert.equal(f.state.redials,0); assert.equal(f.pendingTimers.size,1);
++  await f.fire(); assert.equal(f.state.redials,1); f.stop();
++});
++
++test('disconnected, closed, recovery-held and unrelated peers cannot trigger a redial', async () => {
++  for (const key of ['connected','closed','held']) {
++    const f = fixture(); f.state.channels=[{peerPubkey:'primary',state:'AWAITING_REESTABLISH'}];
++    f.state[key] = key !== 'connected';
++    f.node.emit('peer:connect','primary'); await f.fire(); assert.equal(f.state.redials,0); f.stop();
++  }
++  const f = fixture(); f.node.emit('peer:connect','other'); assert.equal(f.pendingTimers.size,0);
++  assert.equal(awaitingReestablishment([{peerPubkey:'other',state:'AWAITING_REESTABLISH'}],'primary'),false);
++  f.node.emit('peer:connect','primary'); f.stop(); assert.equal(f.pendingTimers.size,0);
++  assert.equal(f.node.listenerCount('peer:connect'),0);
++});
+diff --git a/portable/reestablish-watchdog.cjs b/portable/reestablish-watchdog.cjs
+new file mode 100644
+index 0000000..9b696e8
+--- /dev/null
++++ b/portable/reestablish-watchdog.cjs
+@@ -0,0 +1,59 @@
++'use strict';
++
++// HTLC admission is independent of reestablishment. In particular, a valid
++// splice or offline activation may temporarily refuse adds after reconnect.
++function awaitingReestablishment(channels, primary) {
++  return channels.some(channel => channel.peerPubkey === primary &&
++    channel.state === 'AWAITING_REESTABLISH');
++}
++
++function watchReestablishment({ node, primaryPubkey, peerKey, primaryConnected,
++  recoveryHold, isClosed, onConnect, redial, onDiagnostic, pendingTimers,
++  schedule = setTimeout, cancel = clearTimeout, timeoutMs = 8000, maxRedials = 3 }) {
++  let generation = 0;
++  let pending;
++  let redials = 0;
++  const clear = () => {
++    generation++;
++    if (pending !== undefined) {
++      cancel(pending); pendingTimers.delete(pending); pending = undefined;
++    }
++  };
++  const connected = peer => {
++    const primary = primaryPubkey();
++    if (peerKey(peer) !== primary) return;
++    clear();
++    const current = generation;
++    onConnect?.();
++    if (current !== generation || isClosed()) return;
++    const timer = schedule(() => {
++      pendingTimers.delete(timer);
++      if (pending === timer) pending = undefined;
++      if (current !== generation || primary !== primaryPubkey() || isClosed() || recoveryHold() || !primaryConnected()) return;
++      if (!awaitingReestablishment(node.listChannels(), primaryPubkey())) {
++        redials = 0;
++        return;
++      }
++      if (redials >= maxRedials) return;
++      redials++;
++      onDiagnostic?.({ phase: 'primary-redial',
++        message: `channel reestablishment incomplete ${timeoutMs / 1000}s after connecting, dialling again (${redials}/${maxRedials})` });
++      // The runtime coordinator reports failures and owns subsequent retries.
++      Promise.resolve().then(() => {
++        if (current === generation && primary === primaryPubkey() && !isClosed() && !recoveryHold() && primaryConnected()) return redial();
++      }).catch(() => {});
++    }, timeoutMs);
++    pending = timer;
++    pendingTimers.add(timer);
++  };
++  const disconnected = peer => { if (peerKey(peer) === primaryPubkey()) clear(); };
++  node.on('peer:connect', connected);
++  node.on('peer:disconnect', disconnected);
++  return () => {
++    clear();
++    node.off('peer:connect', connected);
++    node.off('peer:disconnect', disconnected);
++  };
++}
++
++module.exports = { awaitingReestablishment, watchReestablishment };
+diff --git a/portable/runtime.ts b/portable/runtime.ts
+index 155175d..18676cc 100644
+--- a/portable/runtime.ts
++++ b/portable/runtime.ts
+@@ -21,6 +21,7 @@ import { drainFence } from './drain-fence.cjs';
+ import { closeNotStarted } from './drain-close-state.cjs';
+ import { reconcileSpliceRow, watchBroadcastErrors } from './splice-status.cjs';
+ import { engineDiagnostics } from './engine-diagnostics.cjs';
++import { watchReestablishment } from './reestablish-watchdog.cjs';
+ import { readRecoveryImport, validateRecoveryImport, recoveryRefusal, hasInstalledRecovery } from './recovery';
+ export { createRelaySocketFactory } from './relay';
+ export { IrohTransport, IROH_ALPN } from '../src/lightning/transport/iroh';
+@@ -633,56 +634,20 @@ export async function createPortableRuntime(options: any) {
+ 					activity,
+ 					save: () => save('/wallet/activity.json', activity)
+ 				});
+-				// A first connection after a cold start has been seen to come up
+-				// dead: the handshake completes, the primary never answers
+-				// channel_reestablish, and nothing notices until the first ping
+-				// fails thirty seconds later. Reestablishment gets
+-				// REESTABLISH_WATCHDOG_MS after a connect; a home channel still not
+-				// usable by then, with the peer still listed as connected, is
+-				// dialled again rather than waited on. Bounded per start so a
+-				// primary that genuinely cannot reestablish is not hammered.
+-				const REESTABLISH_WATCHDOG_MS = 8000;
+-				const REESTABLISH_REDIALS_MAX = 3;
+-				let reestablishRedials = 0;
+-				const homeChannelUsable = (): boolean => {
+-					const primaryPubkey = record?.lfbw?.primaryPubkey;
+-					const mine = node!
+-						.listChannels()
+-						.filter(
+-							(c: any) =>
+-								c.peerPubkey === primaryPubkey &&
+-								c.state !== 'CLOSED' &&
+-								c.state !== 'FORCE_CLOSED'
+-						);
+-					return (
+-						mine.length === 0 ||
+-						mine.some((c: any) => c.htlcUsable ?? c.state === 'NORMAL')
+-					);
+-				};
+-				node.on('peer:connect', (first: any) => {
+-					if (peerKey(first) !== record?.lfbw?.primaryPubkey) return;
+-					probeOfflineReceive();
+-					const pending = setTimeout(() => {
+-						pendingTimers.delete(pending);
+-						if (closed || !node) return;
+-						if (recoveryHold()) return;
+-						if (homeChannelUsable()) {
+-							reestablishRedials = 0;
+-							return;
+-						}
+-						if (
+-							!primaryConnected() ||
+-							reestablishRedials >= REESTABLISH_REDIALS_MAX
+-						)
+-							return;
+-						reestablishRedials += 1;
+-						options.onDiagnostic?.({
+-							phase: 'primary-redial',
+-							message: `channel not usable ${REESTABLISH_WATCHDOG_MS / 1000}s after connecting, dialling again (${reestablishRedials}/${REESTABLISH_REDIALS_MAX})`
+-						});
+-						void redialPrimary({ force: true });
+-					}, REESTABLISH_WATCHDOG_MS);
+-					pendingTimers.add(pending);
++				// Only an incomplete channel_reestablish exchange needs this bounded
++				// redial. Quiescence, splicing and custody holds can legitimately
++				// refuse HTLCs on a live, fully reestablished connection.
++				watchReestablishment({
++					node,
++					primaryPubkey: () => record?.lfbw?.primaryPubkey,
++					peerKey,
++					primaryConnected,
++					recoveryHold,
++					isClosed: () => closed || !node,
++					onConnect: probeOfflineReceive,
++					redial: () => redialPrimary({ force: true }),
++					onDiagnostic: options.onDiagnostic,
++					pendingTimers
+ 				});
+ 				// A transport error on the primary's connection is followed by a
+ 				// redial after a short pause, rather than waiting for the poll.
+diff --git a/src/lightning/advisor/fee-advisor.ts b/src/lightning/advisor/fee-advisor.ts
+index ae81559..9636612 100644
+--- a/src/lightning/advisor/fee-advisor.ts
++++ b/src/lightning/advisor/fee-advisor.ts
+@@ -26,12 +26,14 @@ export class FeeAdvisor {
+ 	private samples: number[] = [];
+ 	private pointer = 0;
+ 	private filled = false;
++	private latestSampleAtMs = 0;
+ 
+ 	/**
+ 	 * Record a new fee rate sample (sat/vByte).
+ 	 */
+ 	recordSample(satPerVbyte: number): void {
+-		if (satPerVbyte <= 0) return;
++		if (!Number.isFinite(satPerVbyte) || satPerVbyte <= 0) return;
++		this.latestSampleAtMs = Date.now();
+ 		if (this.samples.length < MAX_SAMPLES) {
+ 			this.samples.push(satPerVbyte);
+ 		} else {
+@@ -89,6 +91,14 @@ export class FeeAdvisor {
+ 		return this.samples[idx];
+ 	}
+ 
++	/** Return zero if the latest sample is missing, stale, or predates a clock rollback. */
++	getFreshRate(maxAgeMs: number, nowMs = Date.now()): number {
++		const age = nowMs - this.latestSampleAtMs;
++		return this.samples.length > 0 && age >= 0 && age <= maxAgeMs
++			? this.getCurrentRate()
++			: 0;
++	}
++
+ 	/**
+ 	 * Get the number of recorded samples.
+ 	 */
+diff --git a/src/lightning/channel/channel-manager.ts b/src/lightning/channel/channel-manager.ts
+index 74c1ed4..ce42132 100644
+--- a/src/lightning/channel/channel-manager.ts
++++ b/src/lightning/channel/channel-manager.ts
+@@ -1444,7 +1444,7 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
+ 		fundingSatoshis: bigint,
+ 		pushMsat?: bigint,
+ 		beforeNegotiate?: (temporaryChannelId: Buffer) => void,
+-		opts?: { trusted?: boolean }
++		opts?: { trusted?: boolean; commitmentFeeratePerkw?: number }
+ 	): Channel {
+ 		peerPubkey = normalizeHexPubkey(peerPubkey);
+ 		// Verify peer is connected before creating channel state
+@@ -1461,12 +1461,28 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
+ 			);
+ 		}
+ 
++		const commitmentRate = opts?.commitmentFeeratePerkw;
++		if (
++			commitmentRate !== undefined &&
++			(!Number.isInteger(commitmentRate) ||
++				commitmentRate < 253 ||
++				commitmentRate > 0xffffffff)
++		) {
++			throw new Error(
++				'Initial commitment fee must be an integer from 253 to 4294967295 sat/kw'
++			);
++		}
+ 		const chKeys = this.deriveKeysForNewChannel();
+ 		const state = createOpenerState({
+ 			temporaryChannelId: randomBytes(32),
+ 			fundingSatoshis,
+ 			pushMsat: pushMsat || 0n,
+-			localConfig: this.config.localConfig || DEFAULT_CHANNEL_CONFIG,
++			localConfig: {
++				...(this.config.localConfig || DEFAULT_CHANNEL_CONFIG),
++				...(commitmentRate !== undefined
++					? { feeratePerKw: commitmentRate }
++					: {})
++			},
+ 			localBasepoints: chKeys.basepoints,
+ 			localPerCommitmentSeed: chKeys.perCommitmentSeed
+ 		});
+diff --git a/src/lightning/channel/channel.ts b/src/lightning/channel/channel.ts
+index 67892ba..865dd9f 100644
+--- a/src/lightning/channel/channel.ts
++++ b/src/lightning/channel/channel.ts
+@@ -314,7 +314,6 @@ import {
+ 	spliceFeeSats,
+ 	dualFundingContributionWeight,
+ 	SPLICE_TX_BASE_WEIGHT,
+-	SHARED_FUNDING_INPUT_WEIGHT,
+ 	outputWeight
+ } from './splice-weight';
+ import type { ISpliceTxInput, ISpliceTxOutput } from './splice-tx';
+@@ -597,6 +596,18 @@ function auditMinInputWeightWu(input: IInteractiveTxInput): number {
+ 	return base + 107;
+ }
+ 
++/**
++ * Shared 2-of-2 splice input minimum for the tx_complete audit. Both signatures
++ * may use low-R DER encoding (71 bytes including SIGHASH_ALL): base 164 plus
++ * count 1, dummy 1, two length 1 + signature 71 pairs, script length 1 and script 71.
++ * The funding-side estimate remains 386 WU, so our own contributions keep their
++ * cushion. Using that estimate as this minimum rejects valid peer splices (#359).
++ * BOLT 2 tx_signatures makes the sender responsible for its actual witness fee;
++ * this pre-signature minimum does not replace cryptographic witness validation.
++ * https://github.com/lightning/bolts/blob/master/02-peer-protocol.md#the-tx_signatures-message
++ */
++const AUDIT_MIN_SHARED_INPUT_WEIGHT = 164 + 1 + 1 + 2 * (1 + 71) + 1 + 71;
++
+ /** A force close this channel cannot perform, and why. */
+ export interface IForceClosePlanRefused {
+ 	ok: false;
+@@ -18050,7 +18061,7 @@ export class Channel {
+ 				if (unsupported) return unsupported;
+ 			}
+ 			weight += isShared
+-				? SHARED_FUNDING_INPUT_WEIGHT
++				? AUDIT_MIN_SHARED_INPUT_WEIGHT
+ 				: auditMinInputWeightWu(input);
+ 			if (isShared) {
+ 				// Pre-splice capacity rolls over; it is nobody's new contribution.
+diff --git a/src/lightning/node/lightning-node.ts b/src/lightning/node/lightning-node.ts
+index 72a7648..fd62456 100644
+--- a/src/lightning/node/lightning-node.ts
++++ b/src/lightning/node/lightning-node.ts
+@@ -1601,6 +1601,7 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
+ 	private _pendingReconnects = 0;
+ 	private liquidityAdvisor = new LiquidityAdvisor();
+ 	private feeAdvisor = new FeeAdvisor();
++	private initialCommitmentFeeRefreshAtMs = 0;
+ 	private channelSuggestions = new ChannelSuggestions();
+ 	// Advisor execution (both OFF by default; see INodeConfig)
+ 	private autoRebalanceConfig: ResolvedNodeConfig['autoRebalance'];
+@@ -2072,8 +2073,8 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
+ 			// request_funds and fund the contribution via the fundingProvider.
+ 			leaseRates: config.leaseRates,
+ 			// Cooperative closes are priced from the LIVE feerate, not the
+-			// commitment feerate (pinned to the 253 sat/kw floor on anchors,
+-			// where fees ride on CPFP — a closing tx has no anchor to bump).
++			// initial commitment feerate. A cooperative closing transaction
++			// has no anchor output available for a later CPFP fee bump.
+ 			getClosingFeeratePerKw: (): number | undefined => {
+ 				const satPerVbyte = this.feeAdvisor.getCurrentRate();
+ 				return satPerVbyte > 0
+@@ -12098,7 +12099,7 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
+ 					this.fundingMaxRequests.add(tempId);
+ 				}
+ 			},
+-			{ trusted }
++			{ trusted, commitmentFeeratePerkw: this.initialCommitmentFeeratePerkw() }
+ 		);
+ 	}
+ 
+@@ -12128,6 +12129,7 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
+ 		params: {
+ 			fundingSatoshis: bigint;
+ 			fundingFeeratePerkw?: number;
++			/** Explicit initial commitment policy; otherwise use the fresh local estimate. */
+ 			commitmentFeeratePerkw?: number;
+ 			locktime?: number;
+ 			/**
+@@ -12280,7 +12282,7 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
+ 			fundingFeeratePerkw:
+ 				params.fundingFeeratePerkw ?? localConfig.feeratePerKw,
+ 			commitmentFeeratePerkw:
+-				params.commitmentFeeratePerkw ?? localConfig.feeratePerKw,
++				params.commitmentFeeratePerkw ?? this.initialCommitmentFeeratePerkw(),
+ 			dustLimitSatoshis: localConfig.dustLimitSatoshis,
+ 			maxHtlcValueInFlightMsat: localConfig.maxHtlcValueInFlightMsat,
+ 			htlcMinimumMsat: localConfig.htlcMinimumMsat,
+@@ -29768,6 +29770,44 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
+ 		return raw > 0 ? this.clampEstimatedFeeRate(raw) : null;
+ 	}
+ 
++	/**
++	 * Pin a new channel's commitment fee independently of its funding fee.
++	 * Anchors support later CPFP but do not make a below-mempool commitment
++	 * acceptable to every peer. Existing channels and splices keep their
++	 * negotiated rate. A configured estimator must have a recent sample before
++	 * any opening state or external funding contribution is created.
++	 */
++	private initialCommitmentFeeratePerkw(): number {
++		const config = this.channelManager['config'] as {
++			localConfig?: import('../channel/types').IChannelConfig;
++		};
++		const configured = (config.localConfig ?? DEFAULT_CHANNEL_CONFIG)
++			.feeratePerKw;
++		if (!this.feeEstimator) return configured;
++		const now = Date.now();
++		const rate = this.feeAdvisor.getFreshRate(30 * 60 * 1000, now);
++		if (!(rate > 0)) {
++			// Bound retries of the existing asynchronous refresh path. A stale
++			// cached sample never authorizes a new open while this is in flight.
++			if (
++				now - this.initialCommitmentFeeRefreshAtMs >= 5000 ||
++				now < this.initialCommitmentFeeRefreshAtMs
++			) {
++				this.initialCommitmentFeeRefreshAtMs = now;
++				this.warmFeeAdvisor();
++			}
++			throw new ChannelFundingUnavailableError(
++				ChannelFundingUnavailableCode.FEE_ESTIMATE_NOT_READY,
++				'fee estimate not ready or stale for the initial commitment; retry after the estimator refreshes'
++			);
++		}
++		return Math.max(
++			configured,
++			253,
++			Math.ceil(this.clampEstimatedFeeRate(rate) * 250)
++		);
++	}
++
+ 	/**
+ 	 * Sanity-clamp an IFeeEstimator sample before it feeds any LN operation
+ 	 * (see clampFeeRateSatPerVbyte), logging a structured warning when the

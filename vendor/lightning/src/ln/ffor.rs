@@ -26,6 +26,11 @@ pub(crate) const MAX_SLOTS: usize = 483;
 pub(crate) const MAX_BODY: usize = 65_533;
 pub(crate) const MAX_TLVS: usize = 64;
 
+/// Experimental option_ff_receive pair, synchronized with Beignet's 440/441 assignment.
+pub(crate) const RECEIVE_FEATURE_BIT: usize = 440;
+/// Experimental option_ff_concurrent pair. The former 560-563 range belongs to Eclair.
+pub(crate) const CONCURRENT_FEATURE_BIT: usize = 442;
+
 /// Pure parser exercise for a separate fuzz target. No node, signer, network or
 /// secret output is constructed. `cfg(fuzzing)` does not bypass this module's
 /// signature verification; do not enable the separate `secp256k1_fuzz` cfg when

@@ -5,6 +5,41 @@ use crate::ln::msgs::ChannelMessageHandler;
 use crate::sign::KeysManager;
 
 #[test]
+fn native_ffor_feature_negotiation_uses_collision_free_pairs() {
+	let chanmon_cfgs = create_chanmon_cfgs(2);
+	let node_cfgs = create_node_cfgs(2, &chanmon_cfgs);
+	let node_chanmgrs = create_node_chanmgrs(2, &node_cfgs, &[None, None]);
+	let nodes = create_network(2, &node_cfgs, &node_chanmgrs);
+	let peer = nodes[1].node.get_our_node_id();
+	assert!(!nodes[0].node.supports_ffor_settler(&peer));
+	nodes[0].node.peer_disconnected(peer);
+	nodes[1].node.peer_disconnected(nodes[0].node.get_our_node_id());
+	for enabled in [false, true] {
+		nodes[0].node.set_ffor_policy(FforPolicy { enabled, ..Default::default() }).unwrap();
+		// Exercise every required/optional combination, including mixed old and new pairs.
+		for current_mask in 0u8..16 {
+			for foreign_mask in 0u8..16 {
+				let mut flags = provided_init_features(&test_default_channel_config()).le_flags().to_vec();
+				flags.resize(71, 0);
+				flags[440 / 8] |= current_mask;
+				flags[560 / 8] |= foreign_mask;
+				let init = msgs::Init {
+					features: InitFeatures::from_le_bytes(flags),
+					networks: None,
+					remote_network_address: None,
+				};
+				nodes[0].node.peer_connected(peer, &init, false).unwrap();
+				assert_eq!(nodes[0].node.supports_ffor_settler(&peer),
+					enabled && current_mask & 3 != 0 && current_mask & 12 != 0,
+					"enabled={enabled}, current_mask={current_mask}, foreign_mask={foreign_mask}");
+				nodes[0].node.peer_disconnected(peer);
+				assert!(!nodes[0].node.supports_ffor_settler(&peer));
+			}
+		}
+	}
+}
+
+#[test]
 fn native_ffor_idle_custom_drain_does_not_wake_or_persist() {
 	let chanmon_cfgs = create_chanmon_cfgs(1);
 	let node_cfgs = create_node_cfgs(1, &chanmon_cfgs);

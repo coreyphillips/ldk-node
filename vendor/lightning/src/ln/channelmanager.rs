@@ -65,6 +65,7 @@ use crate::ln::channel::{
 	WithChannelContext,
 };
 use crate::ln::channel_state::ChannelDetails;
+use crate::ln::ffor;
 use crate::ln::funding::SpliceContribution;
 use crate::ln::inbound_payment;
 use crate::ln::interactivetxs::InteractiveTxMessageSend;
@@ -14864,8 +14865,8 @@ where
 	pub fn init_features(&self) -> InitFeatures {
 		let mut features = provided_init_features(&self.config.read().unwrap());
 		if self.ffor_transport_enabled() {
-			let _ = features.set_optional_custom_bit(561);
-			let _ = features.set_optional_custom_bit(563);
+			let _ = features.set_optional_custom_bit(ffor::RECEIVE_FEATURE_BIT + 1);
+			let _ = features.set_optional_custom_bit(ffor::CONCURRENT_FEATURE_BIT + 1);
 		}
 		features
 	}

@@ -524,8 +524,8 @@ where M::Target: chain::Watch<<SP::Target as SignerProvider>::EcdsaSigner>,
 		peers.get(peer).is_some_and(|lock| {
 			let state = lock.lock().unwrap();
 			let flags = state.latest_features.le_flags();
-			let has_pair = |odd: usize| flags.get(odd / 8).is_some_and(|byte| byte & (3 << (odd - 1) % 8) != 0);
-			state.is_connected && has_pair(561) && has_pair(563)
+			let has_pair = |even: usize| flags.get(even / 8).is_some_and(|byte| byte & (3 << (even % 8)) != 0);
+			state.is_connected && has_pair(ffor::RECEIVE_FEATURE_BIT) && has_pair(ffor::CONCURRENT_FEATURE_BIT)
 		})
 	}
 

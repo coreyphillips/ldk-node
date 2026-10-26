@@ -3297,10 +3297,17 @@ mod tests {
 			let node = builder.build_with_store(Arc::new(InMemoryStore::new())).unwrap();
 			assert_eq!(node.channel_manager.ffor_settler_enabled(), enabled);
 			let features = node.channel_manager.provided_init_features(node.node_id());
-			for bit in [561, 563] {
+			for bit in [441, 443] {
 				assert_eq!(
 					features.le_flags().get(bit / 8).copied().unwrap_or(0) & (1 << (bit % 8)) != 0,
 					enabled
+				);
+			}
+			for bit in [440, 442, 444, 445, 560, 561, 562, 563] {
+				assert_eq!(
+					features.le_flags().get(bit / 8).copied().unwrap_or(0) & (1 << (bit % 8)),
+					0,
+					"Unexpected feature bit {bit}"
 				);
 			}
 			assert!(!node.channel_manager.get_current_config().accept_intercept_htlcs);

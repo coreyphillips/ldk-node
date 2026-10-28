@@ -2,8 +2,8 @@
 
 use crate::chain::BestBlock;
 use crate::ln::types::ChannelId;
-use bitcoin::{BlockHash, Transaction, Txid};
 use bitcoin::secp256k1::PublicKey;
+use bitcoin::{BlockHash, Transaction, Txid};
 
 pub(crate) const MAX_RETIRED_SPLICES: usize = 16;
 
@@ -31,17 +31,26 @@ impl_writeable_tlv_based!(SpliceConflictRecord, {
 	(16, update_id, required),
 });
 impl SpliceConflictRecord {
-	pub(crate) fn validate(&self, candidate: &Transaction, conflict: &Transaction,
-		shared: bitcoin::OutPoint) -> Result<(), ()> {
-		if candidate.compute_txid() != self.splice_txid || conflict.compute_txid() != self.conflict_txid
-			|| self.splice_txid == self.conflict_txid || self.confirmation_height == 0
-			|| self.confirmation_height.checked_add(5).map_or(true, |height| height > self.verified_tip.height) {
+	pub(crate) fn validate(
+		&self, candidate: &Transaction, conflict: &Transaction, shared: bitcoin::OutPoint,
+	) -> Result<(), ()> {
+		if candidate.compute_txid() != self.splice_txid
+			|| conflict.compute_txid() != self.conflict_txid
+			|| self.splice_txid == self.conflict_txid
+			|| self.confirmation_height == 0
+			|| self
+				.confirmation_height
+				.checked_add(5)
+				.map_or(true, |height| height > self.verified_tip.height)
+		{
 			return Err(());
 		}
 		let input = candidate.input.get(self.input_index as usize).ok_or(())?.previous_output;
-		if input == shared || conflict.input.iter().any(|input| input.previous_output == shared)
+		if input == shared
+			|| conflict.input.iter().any(|input| input.previous_output == shared)
 			|| !candidate.input.iter().any(|input| input.previous_output == shared)
-			|| !conflict.input.iter().any(|conflict_input| conflict_input.previous_output == input) {
+			|| !conflict.input.iter().any(|conflict_input| conflict_input.previous_output == input)
+		{
 			return Err(());
 		}
 		Ok(())

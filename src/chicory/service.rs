@@ -20,7 +20,7 @@ use bitcoin::{Amount, OutPoint};
 use lightning::events::bump_transaction::Input;
 use lightning::ln::chan_utils::{make_funding_redeemscript, FUNDING_TRANSACTION_WITNESS_WEIGHT};
 use lightning::ln::channel_state::{ChannelDetails, ChannelShutdownState};
-use lightning::ln::channelmanager::{FforMessage, InterceptId};
+use lightning::ln::channelmanager::InterceptId;
 use lightning::ln::funding::{FundingTxInput, SpliceContribution};
 use lightning::ln::msgs::Init;
 use lightning::ln::types::ChannelId;
@@ -37,7 +37,6 @@ use super::wire::{
 	RelayFrame, DIRECT_FUNDING_RELAY, JIT_ACK, JIT_AUTHORIZATION, JIT_QUOTE, JIT_QUOTE_REQUEST,
 	PROTOCOL_VERSION,
 };
-use super::{offline, OfflineReceiveConfig};
 use crate::builder::BuildError;
 use crate::chain::ChainSource;
 use crate::config::{default_user_config, Config};
@@ -53,8 +52,6 @@ const RELAY_PEER_MESSAGES_PER_SECOND: usize = 32;
 const RELAY_PEER_BYTES_PER_SECOND: usize = 128 * 1024;
 const RELAY_GLOBAL_MESSAGES_PER_SECOND: usize = 128;
 const RELAY_GLOBAL_BYTES_PER_SECOND: usize = 1024 * 1024;
-const FFOR_RECEIVE_REQUEST: u16 = 80;
-const FFOR_RECEIVE_RESPONSE: u16 = 81;
 
 /// Operator limits for the experimental native JIT provider.
 ///
@@ -65,16 +62,12 @@ const FFOR_RECEIVE_RESPONSE: u16 = 81;
 /// This provider supports at most 16 parts per receive and new private
 /// channels, with optional locally funded splices of an existing private home.
 /// Funding attempts are serialized globally. A failed payment keeps its funding
-/// lease until native funding resolves, including across restart. Offline
-/// receiving has an independent native policy. Guardian and swap services are
-/// not implemented here.
+/// lease until native funding resolves, including across restart. Guardian and
+/// swap services are not implemented here.
 #[derive(Clone, Debug)]
 pub struct JitServiceConfig {
 	/// Explicit JIT opt-in. The default refuses funding and registration.
 	pub enabled: bool,
-	/// Independent native offline receive policy, disabled by default. Offline
-	/// reservations use an existing compatible home and never fund a new one.
-	pub offline_receive: OfflineReceiveConfig,
 	/// Fund a splice of an existing private home when native forwarding proves
 	/// that additional local balance resolves the shortage. A pending splice,
 	/// channel policy limit or disconnect may still fail the payment safely.
@@ -127,7 +120,6 @@ impl Default for JitServiceConfig {
 	fn default() -> Self {
 		Self {
 			enabled: false,
-			offline_receive: OfflineReceiveConfig::default(),
 			allow_splice_jit: false,
 			relay_enabled: false,
 			allow_confirmed_v2: false,
@@ -170,12 +162,6 @@ impl JitServiceConfig {
 	/// Validate bounded provider limits before enabling peer requests.
 	pub fn validate(&self) -> Result<(), JitConfigError> {
 		if self.max_live_intents == 0
-			|| !(1..=483).contains(&self.offline_receive.max_slots)
-			|| self.offline_receive.max_budget_msat == 0
-			|| self.offline_receive.max_budget_msat > 2_100_000_000_000_000_000
-			|| !(1008..=5040).contains(&self.offline_receive.max_epoch_blocks)
-			|| self.offline_receive.fee_base_msat > 1_000_000
-			|| self.offline_receive.fee_ppm > 100_000
 			|| !(1..=144).contains(&self.inbound_splice_minimum_depth)
 			|| self.max_live_intents > 1024
 			|| self.max_live_intents_per_peer == 0
@@ -613,9 +599,6 @@ impl ChicoryService {
 		config: Arc<Config>,
 	) -> Result<Self, BuildError> {
 		policy.validate().map_err(|_| BuildError::KVStoreSetupFailed)?;
-		channel_manager
-			.set_ffor_policy(policy.offline_receive.clone())
-			.map_err(|_| BuildError::KVStoreSetupFailed)?;
 		let mut durable =
 			match KVStoreSync::read(kv_store.as_ref(), STORAGE_NAMESPACE, "", STORAGE_KEY) {
 				Ok(bytes) if bytes.len() <= MAX_STORE_BYTES => {
@@ -758,19 +741,6 @@ impl ChicoryService {
 		self.conflicts.handle_next(source).await;
 	}
 
-	pub(crate) fn get_and_clear_pending_ffor_messages(&self) -> Vec<FforMessage> {
-		self.channel_manager.get_and_clear_pending_ffor_messages()
-	}
-
-	pub(crate) fn handle_ffor_message(&self, peer: PublicKey, message_type: u16, payload: &[u8]) {
-		if !self.state.lock().unwrap().connected.contains(&peer) {
-			return;
-		}
-		// Native channel and monitor state authorize every transition, including
-		// recovery of obligations when policy no longer admits new epochs.
-		let _ = self.channel_manager.handle_ffor_message(&peer, message_type, payload);
-	}
-
 	pub(crate) fn owns_scid(&self, scid: u64) -> bool {
 		self.state.lock().unwrap().durable.intents.iter().any(|intent| intent.scid == scid)
 			|| (self.policy.enabled
@@ -804,12 +774,6 @@ impl ChicoryService {
 			return;
 		}
 		let response = match envelope.subtype {
-			FFOR_RECEIVE_REQUEST => {
-				let Some(payload) = offline::response(&envelope.payload, peer, self) else {
-					return;
-				};
-				Envelope { version: PROTOCOL_VERSION, subtype: FFOR_RECEIVE_RESPONSE, payload }
-			},
 			JIT_AUTHORIZATION => {
 				let Ok(auth) = JitAuthorization::decode(&envelope.payload) else {
 					return;
@@ -1685,35 +1649,6 @@ impl ChicoryService {
 	}
 }
 
-impl offline::Backend for ChicoryService {
-	fn terms(&self, peer: PublicKey) -> Result<offline::Terms, &'static str> {
-		if !self.channel_manager.supports_ffor_settler(&peer) {
-			return Err("This node does not provide offline receiving.");
-		}
-		Ok(offline::Terms {
-			fee_base_msat: self.policy.offline_receive.fee_base_msat,
-			fee_ppm: self.policy.offline_receive.fee_ppm,
-		})
-	}
-
-	fn settled_receipts(
-		&self, peer: PublicKey, channel: ChannelId, epoch: [u8; 32],
-	) -> Result<Vec<offline::Receipt>, &'static str> {
-		self.channel_manager
-			.settled_ffor_receipts(&peer, &channel, &epoch)
-			.map(|receipts| {
-				receipts
-					.into_iter()
-					.map(|receipt| offline::Receipt {
-						slot: receipt.slot,
-						preimage: receipt.preimage,
-					})
-					.collect()
-			})
-			.map_err(|_| "Unknown receive reservation")
-	}
-}
-
 fn unix_now() -> Option<u64> {
 	SystemTime::now().duration_since(UNIX_EPOCH).ok().map(|duration| duration.as_secs())
 }
@@ -2017,8 +1952,7 @@ mod tests {
 
 	use super::{
 		opening_fee, validate_durable, ChicoryService, DurableState, Hold, Intent,
-		JitServiceConfig, FFOR_RECEIVE_REQUEST, FFOR_RECEIVE_RESPONSE,
-		RELAY_PEER_MESSAGES_PER_SECOND, STORAGE_NAMESPACE,
+		JitServiceConfig, RELAY_PEER_MESSAGES_PER_SECOND, STORAGE_NAMESPACE,
 	};
 	use crate::builder::NodeBuilder;
 	use crate::chicory::wire::{
@@ -3222,61 +3156,40 @@ mod tests {
 	}
 
 	#[test]
-	fn offline_receive_refusal_is_explicit_and_bound_to_valid_request_id() {
+	fn removed_offline_protocol_is_not_served_or_advertised() {
 		let node = native_test_node(Arc::new(InMemoryStore::new()), false);
 		let service = node.chicory_service.as_ref().unwrap();
-		let sender = connect(service);
-		let id = "0123456789abcdef0123456789abcdef";
-		let request = serde_json::to_vec(&serde_json::json!({"id":id,"op":"quote"})).unwrap();
-		service.handle_message(
-			sender,
-			Envelope { version: PROTOCOL_VERSION, subtype: FFOR_RECEIVE_REQUEST, payload: request },
-		);
-		let responses = service.get_and_clear_pending_msg();
-		assert_eq!(responses.len(), 1);
-		assert_eq!(responses[0].0, sender);
-		assert_eq!(responses[0].1.subtype, FFOR_RECEIVE_RESPONSE);
-		let response: serde_json::Value = serde_json::from_slice(&responses[0].1.payload).unwrap();
-		assert_eq!(response["id"], id);
-		assert_eq!(response["ok"], false);
-		assert_eq!(response["error"], "This node does not provide offline receiving.");
-		for invalid in [
-			vec![0; 60_001],
-			b"not json".to_vec(),
-			br#"{"id":"0123456789ABCDEF0123456789ABCDEF"}"#.to_vec(),
-		] {
+		let peer = connect(service);
+		for subtype in [80, 81] {
 			service.handle_message(
-				sender,
+				peer,
 				Envelope {
 					version: PROTOCOL_VERSION,
-					subtype: FFOR_RECEIVE_REQUEST,
-					payload: invalid,
+					subtype,
+					payload: br#"{"id":"0123456789abcdef0123456789abcdef","op":"quote"}"#.to_vec(),
 				},
 			);
 		}
 		assert!(service.get_and_clear_pending_msg().is_empty());
+		assert!(service.state.lock().unwrap().durable.intents.is_empty());
+		let features = node.channel_manager.provided_init_features(peer);
+		for bit in [440, 441, 442, 443, 444, 445] {
+			assert_eq!(
+				features.le_flags().get(bit / 8).copied().unwrap_or(0) & (1 << (bit % 8)),
+				0,
+				"Removed offline protocol feature bit {bit} must not be advertised"
+			);
+		}
 	}
 
 	#[test]
 	fn defaults_require_explicit_opt_in_and_validate() {
 		let config = JitServiceConfig::default();
 		assert!(!config.enabled);
-		assert!(!config.offline_receive.enabled);
 		assert!(!config.allow_confirmed_v2);
 		assert_eq!(config.inbound_splice_minimum_depth, 6);
 		assert!(!config.reuse_funding_key_on_splice);
 		assert!(config.validate().is_ok());
-		for max_slots in [0, 484, u16::MAX] {
-			let mut invalid = config.clone();
-			invalid.offline_receive.max_slots = max_slots;
-			assert!(invalid.validate().is_err());
-		}
-		for (base, ppm) in [(1_000_001, 0), (0, 100_001)] {
-			let mut invalid = config.clone();
-			invalid.offline_receive.fee_base_msat = base;
-			invalid.offline_receive.fee_ppm = ppm;
-			assert!(invalid.validate().is_err());
-		}
 		for inbound_splice_minimum_depth in [0, 145, u32::MAX] {
 			assert!(JitServiceConfig { inbound_splice_minimum_depth, ..config.clone() }
 				.validate()
@@ -3291,7 +3204,6 @@ mod tests {
 
 	#[test]
 	fn confirmed_v2_opt_in_is_independent_of_jit_funding() {
-		use lightning::ln::msgs::BaseMessageHandler;
 		for allow_confirmed_v2 in [false, true] {
 			let mut builder =
 				NodeBuilder::from_config(Config { network: Network::Regtest, ..Config::default() });
@@ -3319,37 +3231,6 @@ mod tests {
 				node.channel_manager.provided_init_features(node.node_id()).supports_dual_fund(),
 				allow_confirmed_v2
 			);
-		}
-	}
-
-	#[test]
-	fn offline_policy_uses_native_signer_and_feature_negotiation() {
-		for enabled in [false, true] {
-			let mut builder =
-				NodeBuilder::from_config(Config { network: Network::Regtest, ..Config::default() });
-			builder.set_chain_source_esplora("http://127.0.0.1:1".into(), None);
-			builder.set_entropy_seed_bytes([53; 64]);
-			builder.set_log_facade_logger();
-			let mut policy = JitServiceConfig::default();
-			policy.offline_receive.enabled = enabled;
-			builder.set_chicory_service(policy).unwrap();
-			let node = builder.build_with_store(Arc::new(InMemoryStore::new())).unwrap();
-			assert_eq!(node.channel_manager.ffor_settler_enabled(), enabled);
-			let features = node.channel_manager.provided_init_features(node.node_id());
-			for bit in [441, 443] {
-				assert_eq!(
-					features.le_flags().get(bit / 8).copied().unwrap_or(0) & (1 << (bit % 8)) != 0,
-					enabled
-				);
-			}
-			for bit in [440, 442, 444, 445, 560, 561, 562, 563] {
-				assert_eq!(
-					features.le_flags().get(bit / 8).copied().unwrap_or(0) & (1 << (bit % 8)),
-					0,
-					"Unexpected feature bit {bit}"
-				);
-			}
-			assert!(!node.channel_manager.get_current_config().accept_intercept_htlcs);
 		}
 	}
 

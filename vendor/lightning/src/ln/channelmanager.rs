@@ -65,7 +65,6 @@ use crate::ln::channel::{
 	WithChannelContext,
 };
 use crate::ln::channel_state::ChannelDetails;
-use crate::ln::ffor;
 use crate::ln::funding::{FundingSigningDetails, FundingTxInput, SpliceContribution};
 use crate::ln::inbound_payment;
 use crate::ln::interactivetxs::InteractiveTxMessageSend;
@@ -740,7 +739,6 @@ impl Default for OptionalOfferPaymentParams {
 pub(crate) enum SentHTLCId {
 	PreviousHopData { prev_outbound_scid_alias: u64, htlc_id: u64 },
 	OutboundRoute { session_priv: [u8; SECRET_KEY_SIZE] },
-	FforVoucher { channel_id: ChannelId, epoch_id: [u8; 32], slot: u16 },
 }
 impl SentHTLCId {
 	pub(crate) fn from_source(source: &HTLCSource) -> Self {
@@ -752,9 +750,6 @@ impl SentHTLCId {
 			HTLCSource::OutboundRoute { session_priv, .. } => {
 				Self::OutboundRoute { session_priv: session_priv.secret_bytes() }
 			},
-			HTLCSource::FforVoucher { channel_id, epoch_id, slot } => {
-				Self::FforVoucher { channel_id: *channel_id, epoch_id: *epoch_id, slot: *slot }
-			},
 		}
 	}
 }
@@ -765,11 +760,6 @@ impl_writeable_tlv_based_enum!(SentHTLCId,
 	},
 	(2, OutboundRoute) => {
 		(0, session_priv, required),
-	},
-	(4, FforVoucher) => {
-		(0, channel_id, required),
-		(2, epoch_id, required),
-		(4, slot, required),
 	},
 );
 
@@ -787,12 +777,6 @@ mod fuzzy_channelmanager {
 	#[derive(Clone, Debug, PartialEq, Eq)]
 	pub enum HTLCSource {
 		PreviousHopData(HTLCPreviousHopData),
-		/// A native parked voucher, never an ordinary outbound payment.
-		FforVoucher {
-			channel_id: ChannelId,
-			epoch_id: [u8; 32],
-			slot: u16,
-		},
 		OutboundRoute {
 			path: Path,
 			session_priv: SecretKey,
@@ -836,12 +820,6 @@ pub(crate) use self::fuzzy_channelmanager::*;
 impl core::hash::Hash for HTLCSource {
 	fn hash<H: core::hash::Hasher>(&self, hasher: &mut H) {
 		match self {
-			HTLCSource::FforVoucher { channel_id, epoch_id, slot } => {
-				2u8.hash(hasher);
-				channel_id.hash(hasher);
-				epoch_id.hash(hasher);
-				slot.hash(hasher);
-			},
 			HTLCSource::PreviousHopData(prev_hop_data) => {
 				0u8.hash(hasher);
 				prev_hop_data.hash(hasher);
@@ -1355,18 +1333,6 @@ pub(crate) enum MonitorUpdateCompletionAction {
 	SpliceConflictPersisted {
 		record: crate::ln::splice_conflict::SpliceConflictRecord,
 	},
-	FforJournalPersisted {
-		token: crate::ln::ffor_monitor::FforPersistenceToken,
-	},
-	FforUpstreamClaimed {
-		home_channel: ChannelId,
-		epoch: [u8; 32],
-		slot: u16,
-		upstream_peer: PublicKey,
-		upstream_funding: OutPoint,
-		upstream_channel: ChannelId,
-		upstream_htlc_id: u64,
-	},
 	/// Indicates that a payment ultimately destined for us was claimed and we should emit an
 	/// [`events::Event::PaymentClaimed`] to the user if we haven't yet generated such an event for
 	/// this payment. Note that this is only best-effort. On restart it's possible such a duplicate
@@ -1411,12 +1377,6 @@ pub(crate) enum MonitorUpdateCompletionAction {
 
 impl_writeable_tlv_based_enum_upgradable!(MonitorUpdateCompletionAction,
 	(8, SpliceConflictPersisted) => { (0, record, required), },
-	(4, FforJournalPersisted) => { (0, token, required), },
-	(6, FforUpstreamClaimed) => {
-		(0, home_channel, required), (2, epoch, required), (4, slot, required),
-		(6, upstream_peer, required), (8, upstream_funding, required),
-		(10, upstream_channel, required), (12, upstream_htlc_id, required),
-	},
 	(0, PaymentClaimed) => {
 		(0, payment_hash, required),
 		(9999999999, pending_mpp_claim, (static_value, None)),
@@ -2800,7 +2760,6 @@ pub struct ChannelManager<
 	///
 	/// See `ChannelManager` struct-level documentation for lock order requirements.
 	pending_intercepted_htlcs: Mutex<HashMap<InterceptId, PendingAddHTLCInfo>>,
-	ffor_runtime: Mutex<ffor_manager::FforRuntime>,
 	splice_conflict_runtime: Mutex<splice_conflict_manager::SpliceConflictRuntime>,
 
 	/// Outbound SCID Alias -> pending `update_add_htlc`s to decode.
@@ -3798,7 +3757,6 @@ macro_rules! handle_new_monitor_update {
 		if $self.background_events_processed_since_startup.load(Ordering::Acquire) {
 			let update_res = $self.chain_monitor.update_channel($chan_id, &$in_flight_updates[$update_idx]);
 			handle_new_monitor_update!($self, update_res, $logger, $chan_id, _internal, {
-				$self.ffor_monitor_update_persisted($chan_id, $in_flight_updates[$update_idx].update_id);
 				$self.splice_conflict_monitor_persisted($chan_id, $in_flight_updates[$update_idx].update_id);
 				$completed
 			})
@@ -3880,10 +3838,6 @@ macro_rules! handle_new_monitor_update {
 			})
 	} };
 }
-
-#[path = "ffor_manager.rs"]
-pub(crate) mod ffor_manager;
-pub use ffor_manager::{FforEpochStatus, FforMessage, FforPolicy, FforReceipt};
 
 #[path = "splice_conflict_manager.rs"]
 mod splice_conflict_manager;
@@ -4051,7 +4005,6 @@ where
 			decode_update_add_htlcs: Mutex::new(new_hash_map()),
 			claimable_payments: Mutex::new(ClaimablePayments { claimable_payments: new_hash_map(), pending_claiming_payments: new_hash_map() }),
 			pending_intercepted_htlcs: Mutex::new(new_hash_map()),
-			ffor_runtime: Mutex::new(ffor_manager::FforRuntime::new()),
 			splice_conflict_runtime: Mutex::new(splice_conflict_manager::SpliceConflictRuntime::new()),
 			short_to_chan_info: FairRwLock::new(new_hash_map()),
 
@@ -5213,9 +5166,6 @@ where
 				return Err(LocalHTLCFailureReason::InvalidTrampolineForward);
 			}
 		};
-		if self.ffor_known_hash(&msg.payment_hash) {
-			return check_incoming_htlc_cltv(self.best_block.read().unwrap().height.saturating_add(1), next_packet_details.outgoing_cltv_value, msg.cltv_expiry);
-		}
 		match self.do_funded_channel_callback(outgoing_scid, |chan: &mut FundedChannel<SP>| {
 			self.can_forward_htlc_to_outgoing_channel(chan, msg, next_packet_details)
 		}) {
@@ -7631,30 +7581,6 @@ where
 		failed_forwards: &mut Vec<FailedHTLCForward>,
 		phantom_receives: &mut Vec<PerSourcePendingForward>,
 	) {
-		pending_forwards.retain(|forward| {
-			if let HTLCForwardInfo::AddHTLC(payment) = forward {
-				if let Some(result) = self.process_ffor_forward(short_chan_id, payment) {
-					if result.is_err() {
-						let target =
-							self.short_to_chan_info.read().unwrap().get(&short_chan_id).cloned();
-						failed_forwards.push((
-							HTLCSource::PreviousHopData(payment.htlc_previous_hop_data()),
-							payment.forward_info.payment_hash,
-							HTLCFailReason::reason(
-								LocalHTLCFailureReason::UnknownNextPeer,
-								Vec::new(),
-							),
-							HTLCHandlingFailureType::Forward {
-								node_id: target.map(|x| x.0),
-								channel_id: target.map(|x| x.1).unwrap_or(ChannelId([0; 32])),
-							},
-						));
-					}
-					return false;
-				}
-			}
-			true
-		});
 		let mut forwarding_counterparty = None;
 
 		let chan_info_opt = self.short_to_chan_info.read().unwrap().get(&short_chan_id).cloned();
@@ -8489,8 +8415,6 @@ where
 	/// [`ChannelConfig`]: crate::util::config::ChannelConfig
 	pub fn timer_tick_occurred(&self) {
 		PersistenceNotifierGuard::optionally_notify(self, || {
-			self.ffor_progress();
-			self.replay_ffor_claims();
 			let mut should_persist = NotifyOption::SkipPersistNoEvents;
 
 			let mut handle_errors: Vec<(Result<(), _>, _)> = Vec::new();
@@ -8892,9 +8816,6 @@ where
 		// from block_connected which may run during initialization prior to the chain_monitor
 		// being fully configured. See the docs for `ChannelManagerReadArgs` for more.
 		match source {
-			HTLCSource::FforVoucher { channel_id, epoch_id, slot } => {
-				self.ffor_voucher_result(*channel_id, *epoch_id, *slot, None);
-			},
 			HTLCSource::OutboundRoute { ref path, ref session_priv, ref payment_id, .. } => {
 				let logger = WithContext::from(&self.logger, None, None, Some(*payment_hash));
 				self.pending_outbound_payments.fail_htlc(
@@ -9379,39 +9300,11 @@ where
 							// the post-update action no matter the situation.
 							let in_flight_mons = peer_state.in_flight_monitor_updates.get(&chan_id);
 							if in_flight_mons.map(|(_, mons)| !mons.is_empty()).unwrap_or(false) {
-								let actions = peer_state
+								peer_state
 									.monitor_update_blocked_actions
 									.entry(chan_id)
-									.or_insert_with(Vec::new);
-								// Periodic recovery must not accumulate callbacks while the
-								// same upstream preimage update remains in flight.
-								let claim_key =
-									|action: &MonitorUpdateCompletionAction| match action {
-										MonitorUpdateCompletionAction::FforUpstreamClaimed {
-											home_channel,
-											epoch,
-											slot,
-											upstream_peer,
-											upstream_funding,
-											upstream_channel,
-											upstream_htlc_id,
-										} => Some((
-											*home_channel,
-											*epoch,
-											*slot,
-											*upstream_peer,
-											*upstream_funding,
-											*upstream_channel,
-											*upstream_htlc_id,
-										)),
-										_ => None,
-									};
-								let duplicate = claim_key(&action).is_some_and(|key| {
-									actions.iter().any(|old| claim_key(old) == Some(key))
-								});
-								if !duplicate {
-									actions.push(action);
-								}
+									.or_insert_with(Vec::new)
+									.push(action);
 								return;
 							}
 
@@ -9456,12 +9349,6 @@ where
 							) {
 								debug_assert!(during_init,
 									"Duplicate claims should always either be for forwarded payments(freeing another channel immediately) or during init (for claim replay)");
-								mem::drop(per_peer_state);
-								self.handle_monitor_update_completion_actions([action]);
-							} else if matches!(
-								action,
-								MonitorUpdateCompletionAction::FforUpstreamClaimed { .. }
-							) {
 								mem::drop(per_peer_state);
 								self.handle_monitor_update_completion_actions([action]);
 							} else {
@@ -9555,12 +9442,6 @@ This indicates a bug inside LDK. Please report this error at https://github.com/
 	fn finalize_claims(&self, sources: Vec<(HTLCSource, Option<AttributionData>)>) {
 		// Decode attribution data to hold times.
 		let hold_times = sources.into_iter().filter_map(|(source, attribution_data)| {
-			if let HTLCSource::FforVoucher { channel_id, epoch_id, slot } = &source {
-				// A received fulfill is not yet durable evidence of redemption. Native
-				// finalization follows the commitment and revocation monitor barrier.
-				self.ffor_voucher_finalized(*channel_id, *epoch_id, *slot);
-				return None;
-			}
 			if let HTLCSource::OutboundRoute { ref session_priv, ref path, .. } = source {
 				// If the path has trampoline hops, we need to hash the session private key to get the outer session key.
 				let derived_key;
@@ -9603,11 +9484,6 @@ This indicates a bug inside LDK. Please report this error at https://github.com/
 			!self.background_events_processed_since_startup.load(Ordering::Acquire);
 		let htlc_id = SentHTLCId::from_source(&source);
 		match source {
-			HTLCSource::FforVoucher { .. } => {
-				// Offchain redemption is recorded by finalize_claims only after the
-				// native commitment update is persisted. Onchain redemption uses the
-				// separately authenticated FforVoucherResolved monitor event.
-			},
 			HTLCSource::OutboundRoute {
 				session_priv, payment_id, path, bolt12_invoice, ..
 			} => {
@@ -9805,11 +9681,6 @@ This indicates a bug inside LDK. Please report this error at https://github.com/
 		for action in actions.into_iter() {
 			match action {
 				MonitorUpdateCompletionAction::SpliceConflictPersisted { record } => self.splice_conflict_persisted(record),
-				MonitorUpdateCompletionAction::FforJournalPersisted { token } => self.ffor_journal_persisted(token),
-				MonitorUpdateCompletionAction::FforUpstreamClaimed { home_channel, epoch, slot, upstream_peer, upstream_funding, upstream_channel, upstream_htlc_id } => {
-					self.ffor_upstream_claimed(home_channel, epoch, slot, crate::ln::ffor::Upstream {
-						counterparty_node_id: upstream_peer, funding_txo: upstream_funding, channel_id: upstream_channel.0, htlc_id: upstream_htlc_id });
-				},
 				MonitorUpdateCompletionAction::PaymentClaimed { payment_hash, pending_mpp_claim } => {
 					if let Some((counterparty_node_id, chan_id, claim_ptr)) = pending_mpp_claim {
 						let per_peer_state = self.per_peer_state.read().unwrap();
@@ -10138,7 +10009,6 @@ This indicates a bug inside LDK. Please report this error at https://github.com/
 		debug_assert!(self.total_consistency_lock.try_write().is_err()); // Caller holds read lock
 
 		if let Some(update_id) = highest_applied_update_id {
-			self.ffor_monitor_update_persisted(*channel_id, update_id);
 			self.splice_conflict_monitor_persisted(*channel_id, update_id);
 		}
 		let per_peer_state = self.per_peer_state.read().unwrap();
@@ -12264,7 +12134,6 @@ This indicates a bug inside LDK. Please report this error at https://github.com/
 							my_current_per_commitment_point: PublicKey::from_slice(&[2u8; 33]).unwrap(),
 							next_funding: None,
 							my_current_funding_locked: None,
-							ffor_epoch: None,
 						},
 					});
 					return Err(MsgHandleErrInternal::send_err_msg_no_close(
@@ -12489,34 +12358,7 @@ This indicates a bug inside LDK. Please report this error at https://github.com/
 		{
 			for monitor_event in monitor_events.drain(..) {
 				match monitor_event {
-					MonitorEvent::FforVoucherResolved {
-						epoch_id,
-						slot,
-						commitment_txid,
-						output_index,
-						resolving_txid,
-						fulfilled,
-					} => {
-						self.ffor_chain_result(
-							channel_id,
-							epoch_id,
-							slot,
-							counterparty_node_id,
-							funding_outpoint,
-							crate::ln::ffor::ChainRemoval {
-								commitment_txid: commitment_txid.to_byte_array(),
-								output_index,
-								resolving_txid: resolving_txid.to_byte_array(),
-								fulfilled,
-							},
-						);
-					},
 					MonitorEvent::HTLCEvent(htlc_update) => {
-						// Voucher custody is retired only by the monitor's authenticated
-						// anti-reorg proof and the subsequent durable journal transition.
-						if matches!(&htlc_update.source, HTLCSource::FforVoucher { .. }) {
-							continue;
-						}
 						let logger = WithContext::from(
 							&self.logger,
 							Some(counterparty_node_id),
@@ -14229,7 +14071,6 @@ where
 
 	#[rustfmt::skip]
 	fn peer_disconnected(&self, counterparty_node_id: PublicKey) {
-		self.ffor_disconnected(counterparty_node_id);
 		let _persistence_guard = PersistenceNotifierGuard::optionally_notify(self, || {
 			let mut splice_failed_events = Vec::new();
 			let mut failed_channels: Vec<(Result<Infallible, _>, _)> = Vec::new();
@@ -14364,7 +14205,6 @@ where
 
 	#[rustfmt::skip]
 	fn peer_connected(&self, counterparty_node_id: PublicKey, init_msg: &msgs::Init, inbound: bool) -> Result<(), ()> {
-		self.ffor_peer_connected(counterparty_node_id);
 		let logger = WithContext::from(&self.logger, Some(counterparty_node_id), None, None);
 		if !init_msg.features.supports_static_remote_key() {
 			log_debug!(logger, "Peer {} does not support static remote key, disconnecting", log_pubkey!(counterparty_node_id));
@@ -14507,8 +14347,6 @@ where
 				result = NotifyOption::DoPersist;
 			}
 
-			self.ffor_progress();
-
 			// Quiescence is an in-memory protocol, so we don't have to persist because of it.
 			self.maybe_send_stfu();
 
@@ -14532,7 +14370,6 @@ where
 				pending_events.append(&mut broadcast_msgs);
 			}
 
-			self.ffor_filter_replay_events(&mut pending_events);
 			if !pending_events.is_empty() {
 				events.replace(pending_events);
 			}
@@ -15143,12 +14980,7 @@ where
 	/// Fetches the set of [`InitFeatures`] flags that are provided by or required by
 	/// [`ChannelManager`].
 	pub fn init_features(&self) -> InitFeatures {
-		let mut features = provided_init_features(&self.config.read().unwrap());
-		if self.ffor_transport_enabled() {
-			let _ = features.set_optional_custom_bit(ffor::RECEIVE_FEATURE_BIT + 1);
-			let _ = features.set_optional_custom_bit(ffor::CONCURRENT_FEATURE_BIT + 1);
-		}
-		features
+		provided_init_features(&self.config.read().unwrap())
 	}
 }
 
@@ -15494,9 +15326,6 @@ where
 	) {
 		let _persistence_guard = PersistenceNotifierGuard::notify_on_drop(self);
 		let res = self.internal_channel_reestablish(&counterparty_node_id, msg);
-		if res.is_ok() {
-			self.ffor_reestablished(counterparty_node_id, msg);
-		}
 		let _ = handle_error!(self, res, counterparty_node_id);
 	}
 
@@ -16564,21 +16393,6 @@ impl Readable for HTLCSource {
 				})
 			}
 			1 => Ok(HTLCSource::PreviousHopData(Readable::read(reader)?)),
-			2 => {
-				_init_and_read_len_prefixed_tlv_fields!(reader, {
-					(0, channel_id, required),
-					(2, epoch_id, required),
-					(4, slot, required),
-				});
-				let slot: u16 = _init_tlv_based_struct_field!(slot, required);
-				if slot == 0 || slot as usize > crate::ln::ffor::MAX_SLOTS {
-					return Err(DecodeError::InvalidValue);
-				}
-				Ok(HTLCSource::FforVoucher {
-					channel_id: _init_tlv_based_struct_field!(channel_id, required),
-					epoch_id: _init_tlv_based_struct_field!(epoch_id, required), slot,
-				})
-			},
 			_ => Err(DecodeError::UnknownRequiredFeature),
 		}
 	}
@@ -16605,14 +16419,6 @@ impl Writeable for HTLCSource {
 				   (5, None::<PaymentParameters>, option), // payment_params in LDK versions prior to 0.0.115
 				   (6, path.blinded_tail, option),
 				   (7, bolt12_invoice, option),
-				});
-			},
-			HTLCSource::FforVoucher { channel_id, epoch_id, slot } => {
-				2u8.write(writer)?;
-				write_tlv_fields!(writer, {
-					(0, channel_id, required),
-					(2, epoch_id, required),
-					(4, slot, required),
 				});
 			},
 			HTLCSource::PreviousHopData(ref field) => {
@@ -16847,7 +16653,6 @@ where
 				}
 			}
 		}
-
 
 		// Since some FundingNegotiation variants are not persisted, any splice in such state must
 		// be failed upon reload. However, as the necessary information for the SpliceFailed event
@@ -18118,7 +17923,6 @@ where
 						);
 						let htlc_id = SentHTLCId::from_source(&htlc_source);
 						match htlc_source {
-							HTLCSource::FforVoucher { .. } => {},
 							HTLCSource::PreviousHopData(prev_hop_data) => {
 								let pending_forward_matches_htlc = |info: &PendingAddHTLCInfo| {
 									info.prev_funding_outpoint == prev_hop_data.outpoint
@@ -18653,7 +18457,6 @@ where
 		)
 		.with_async_payments_offers_cache(async_receive_offer_cache);
 
-		let mut ffor_runtime = ffor_manager::FforRuntime::new();
 		let mut splice_conflict_runtime = splice_conflict_manager::SpliceConflictRuntime::new();
 		for (_, monitor) in args.channel_monitors.iter() {
 			splice_conflict_runtime.restore(
@@ -18662,31 +18465,6 @@ where
 				monitor.get_splice_conflict_records(),
 				monitor.get_latest_update_id(),
 			)?;
-			if let Some(journal) = monitor.get_ffor_journal() {
-				for slot in journal
-					.epoch
-					.slots
-					.iter()
-					.filter(|slot| slot.state == crate::ln::ffor::SlotState::Settling)
-				{
-					let upstream = slot.upstream.as_ref().ok_or(DecodeError::InvalidValue)?;
-					// The immutable admission tuple retains the historical funding
-					// outpoint. A legitimate upstream splice can change its current
-					// outpoint without changing this native monitor's identity.
-					if !args.channel_monitors.values().any(|upstream_monitor| {
-						upstream_monitor.channel_id().0 == upstream.channel_id
-							&& upstream_monitor.get_counterparty_node_id()
-								== upstream.counterparty_node_id
-					}) {
-						return Err(DecodeError::InvalidValue);
-					}
-				}
-				ffor_runtime.restore(
-					journal,
-					monitor.get_funding_txo(),
-					monitor.get_latest_update_id(),
-				)?;
-			}
 		}
 
 		let channel_manager = ChannelManager {
@@ -18702,7 +18480,6 @@ where
 			inbound_payment_key: expanded_inbound_key,
 			pending_outbound_payments: pending_outbounds,
 			pending_intercepted_htlcs: Mutex::new(pending_intercepted_htlcs.unwrap()),
-			ffor_runtime: Mutex::new(ffor_runtime),
 			splice_conflict_runtime: Mutex::new(splice_conflict_runtime),
 
 			forward_htlcs: Mutex::new(forward_htlcs),
@@ -18755,14 +18532,6 @@ where
 			testing_dnssec_proof_offer_resolution_override: Mutex::new(new_hash_map()),
 		};
 
-		for (_, monitor) in args.channel_monitors.iter() {
-			// Recover the gap after native revocation persistence and before the
-			// separate custody journal records the finalized voucher redemption.
-			for (epoch, slot) in monitor.get_ffor_redeemed_slots() {
-				channel_manager.ffor_voucher_finalized(monitor.channel_id(), epoch, slot);
-			}
-		}
-		channel_manager.replay_ffor_claims();
 		let mut processed_claims: HashSet<Vec<MPPClaimHTLCSource>> = new_hash_set();
 		for (_, monitor) in args.channel_monitors.iter() {
 			for (payment_hash, (payment_preimage, payment_claims)) in monitor.get_stored_preimages()
@@ -20161,7 +19930,6 @@ mod tests {
 				dummy_malformed_htlc(htlc_id)
 			}
 		}).collect();
-
 
 		let (scid_1, scid_2) = (42, 43);
 		let mut forward_htlcs = new_hash_map();

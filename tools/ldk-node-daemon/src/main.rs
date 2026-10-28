@@ -41,7 +41,6 @@ const METHODS: &[&str] = &[
 	"splice_in",
 	"splice_out",
 	"sync",
-	"offline_status",
 	"events",
 	"stop",
 ];
@@ -236,7 +235,7 @@ fn handle(
                 "best_block_height":status.current_best_block.height,"best_block_hash":status.current_best_block.block_hash.to_string(),
                 "is_running":status.is_running,"listening_addresses":node.listening_addresses().unwrap_or_default().iter().map(ToString::to_string).collect::<Vec<_>>(),
                 "latest_lightning_sync":status.latest_lightning_wallet_sync_timestamp,"latest_onchain_sync":status.latest_onchain_wallet_sync_timestamp,
-                "capabilities":METHODS,"provider_enabled":config.chicory.enabled,"offline_enabled":config.chicory.offline_enabled}),
+                "capabilities":METHODS,"provider_enabled":config.chicory.enabled}),
 			)
 		},
 		"balance" => {
@@ -441,12 +440,6 @@ fn handle(
 			only(p, &[])?;
 			node.sync_wallets().map_err(native)?;
 			Ok(json!({"synced":true}))
-		},
-		"offline_status" => {
-			only(p, &[])?;
-			Ok(
-				json!({"enabled":config.chicory.offline_enabled,"epochs":node.list_chicory_offline_epochs().into_iter().map(|epoch|json!({"channel_id":epoch.channel_id.to_string(),"epoch_id":hex(&epoch.epoch_id),"phase":epoch.phase,"slot_count":epoch.slot_count,"reserved_msat":money(epoch.reserved_msat),"settling_count":epoch.settling_count,"settled_count":epoch.settled_count,"persistence_pending":epoch.persistence_pending})).collect::<Vec<_>>()}),
-			)
 		},
 		"events" => {
 			only(p, &[])?;

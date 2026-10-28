@@ -595,7 +595,9 @@ impl ChannelDetails {
 			is_announced: context.should_announce(),
 			inbound_htlc_minimum_msat: Some(context.get_holder_htlc_minimum_msat()),
 			inbound_htlc_maximum_msat: context.get_holder_htlc_maximum_msat(funding),
-			inbound_htlc_value_in_flight_maximum_msat: Some(context.get_holder_inflight_htlc_limit_msat()),
+			inbound_htlc_value_in_flight_maximum_msat: Some(
+				context.get_holder_inflight_htlc_limit_msat(),
+			),
 			config: Some(context.config()),
 			channel_shutdown_state: Some(context.shutdown_state()),
 			pending_inbound_htlcs: context.get_pending_inbound_htlc_details(funding),

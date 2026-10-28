@@ -19,8 +19,7 @@ This driver always uses Bitcoin regtest and listens on loopback. Configure an
 actual regtest chain source and fund its returned regtest address before opening
 channels. It prints newline JSON to stdout and accepts administrative commands
 on stdin, for example `{"id":1,"method":"balance"}` or
-`{"id":2,"method":"stop"}`. Keep stdin open while it runs. Set
-`CHICORY_ENABLE_OFFLINE=1` to enable its optional offline receive provider.
+`{"id":2,"method":"stop"}`. Keep stdin open while it runs.
 An Electrum `tcp://host:port` URL is also accepted; the installed phone's fixed
 commitment fee can be below that backend's required fee floor, as explained in
 the [running guide](../../docs/chicory-running.md).

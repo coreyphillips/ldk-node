@@ -801,8 +801,12 @@ fn test_explicit_zero_conf_channel_routes_without_confirmations() {
 	// Reload with ordinary default configuration. Existing channel policy must
 	// survive in the serialized native channel type without the opening override.
 	reload_node!(
-		nodes[0], &encoded_manager, &[&encoded_monitor], persister,
-		new_chain_monitor, new_channelmanager
+		nodes[0],
+		&encoded_manager,
+		&[&encoded_monitor],
+		persister,
+		new_chain_monitor,
+		new_channelmanager
 	);
 	let channel = &nodes[0].node.list_channels()[0];
 	assert_eq!(channel.confirmations_required, Some(0));

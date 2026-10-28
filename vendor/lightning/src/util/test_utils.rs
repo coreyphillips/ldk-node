@@ -906,7 +906,10 @@ fn test_store_async_completion_overwrites_same_namespace_key() {
 		store.complete_all_async_writes();
 		assert!(matches!(write.as_mut().poll(&mut context), Poll::Ready(Ok(()))));
 		assert_eq!(KVStoreSync::read(&store, "monitors", secondary, "channel").unwrap(), vec![2]);
-		assert_eq!(KVStoreSync::list(&store, "monitors", secondary).unwrap(), vec!["channel".to_owned()]);
+		assert_eq!(
+			KVStoreSync::list(&store, "monitors", secondary).unwrap(),
+			vec!["channel".to_owned()]
+		);
 	}
 }
 
@@ -939,7 +942,8 @@ impl TestStore {
 		let mut persisted_lock = self.persisted_bytes.lock().unwrap();
 		let mut writes_lock = self.pending_async_writes.lock().unwrap();
 
-		let pending_writes = writes_lock.get_mut(&pending_key).expect("No pending writes for given key");
+		let pending_writes =
+			writes_lock.get_mut(&pending_key).expect("No pending writes for given key");
 		pending_writes.retain(|(id, res, data)| {
 			if *id <= write_id {
 				let namespace = persisted_lock.entry(prefix.clone()).or_insert(new_hash_map());
@@ -1881,14 +1885,6 @@ impl NodeSigner for TestKeysInterface {
 
 	fn sign_message(&self, msg: &[u8]) -> Result<String, ()> {
 		self.backing.sign_message(msg)
-	}
-
-	fn supports_ffor_settler(&self) -> bool {
-		self.backing.supports_ffor_settler()
-	}
-
-	fn sign_ffor_message(&self, message_type: u16, unsigned: &[u8]) -> Result<Signature, ()> {
-		self.backing.sign_ffor_message(message_type, unsigned)
 	}
 }
 

@@ -256,7 +256,9 @@ impl ChannelSigner for TestChannelSigner {
 
 	fn supports_funding_key_reuse(&self) -> bool {
 		#[cfg(test)]
-		if !self.is_signer_available(SignerOp::FundingKeyReuse) { return false; }
+		if !self.is_signer_available(SignerOp::FundingKeyReuse) {
+			return false;
+		}
 		self.inner.supports_funding_key_reuse()
 	}
 

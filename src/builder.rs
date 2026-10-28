@@ -343,7 +343,7 @@ impl NodeBuilder {
 	/// Enables the experimental native Beignet JIT service used by Chicory.
 	///
 	/// The policy bounds funds the node may allocate to authenticated peers. This
-	/// does not enable FFOR, zero-reserve channels, or a complete direct-funding flow.
+	/// does not enable zero-reserve channels or a complete direct-funding flow.
 	/// Confirmed inbound v2 acceptance has a separate opt-in in the policy.
 	/// The service is disabled by default and is not a complete Chicory primary.
 	/// Invalid policies are rejected without replacing the current policy.

@@ -18,18 +18,6 @@ pub mod channel_keys;
 pub mod channel_state;
 pub mod channelmanager;
 mod features;
-// Protocol groundwork only. No feature bits or channel handlers are enabled.
-#[allow(dead_code)]
-pub(crate) mod ffor;
-pub(crate) mod ffor_monitor;
-
-/// Exercise the bounded FFOR wire and custody-state parsers without a node.
-/// Available only to a dedicated fuzz build, not the production API.
-#[cfg(fuzzing)]
-pub fn fuzz_ffor_parsers(data: &[u8]) {
-	ffor::fuzz_parsers(data);
-}
-
 pub mod funding;
 pub mod inbound_payment;
 pub mod msgs;

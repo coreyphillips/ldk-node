@@ -33,7 +33,9 @@ use crate::ln::chan_utils::{
 	HTLCOutputInCommitment, HolderCommitmentTransaction,
 };
 use crate::ln::msgs::DecodeError;
-use crate::sign::{ecdsa::EcdsaChannelSigner, ChannelSigner, EntropySource, HTLCDescriptor, SignerProvider};
+use crate::sign::{
+	ecdsa::EcdsaChannelSigner, ChannelSigner, EntropySource, HTLCDescriptor, SignerProvider,
+};
 use crate::util::logger::Logger;
 use crate::util::ser::{
 	MaybeReadable, Readable, ReadableArgs, UpgradableRequired, Writeable, Writer,

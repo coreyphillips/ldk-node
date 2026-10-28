@@ -919,9 +919,6 @@ pub struct UpdateFee {
 /// [`channel_reestablish`]: https://github.com/lightning/bolts/blob/master/02-peer-protocol.md#message-retransmission
 #[derive(Clone, Debug, Hash, PartialEq, Eq)]
 pub struct ChannelReestablish {
-	/// Exact optional FFOR epoch metadata at odd TLV 55001.
-	/// Protocol admission verifies the epoch, state and activation transcript.
-	pub ffor_epoch: Option<[u8; 67]>,
 	/// The channel ID
 	pub channel_id: ChannelId,
 	/// The next commitment number for the sender
@@ -2947,7 +2944,6 @@ impl_writeable_msg!(ChannelReestablish, {
 }, {
 	(1, next_funding, option),
 	(5, my_current_funding_locked, option),
-	(55001, ffor_epoch, option),
 });
 
 impl_writeable!(NextFunding, {
@@ -3682,7 +3678,8 @@ where
 						}),
 				} => {
 					if amt.is_some()
-						|| cltv_value.is_some() || total_msat.is_some()
+						|| cltv_value.is_some()
+						|| total_msat.is_some()
 						|| keysend_preimage.is_some()
 						|| invoice_request.is_some()
 					{
@@ -3832,7 +3829,8 @@ where
 						}),
 				} => {
 					if amt.is_some()
-						|| cltv_value.is_some() || total_msat.is_some()
+						|| cltv_value.is_some()
+						|| total_msat.is_some()
 						|| keysend_preimage.is_some()
 						|| invoice_request.is_some()
 					{
@@ -4405,32 +4403,6 @@ mod tests {
 	use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6, ToSocketAddrs};
 	use types::features::{BlindedHopFeatures, Bolt12InvoiceFeatures};
 
-
-	#[test]
-	fn encoding_channel_reestablish_ffor_boundaries() {
-		let mut message = msgs::ChannelReestablish {
-			channel_id: ChannelId::from_bytes([1; 32]), next_local_commitment_number: 3,
-			next_remote_commitment_number: 4, your_last_per_commitment_secret: [2; 32],
-			my_current_per_commitment_point: PublicKey::from_secret_key(&Secp256k1::new(),
-				&SecretKey::from_slice(&[3; 32]).unwrap()),
-			next_funding: None, my_current_funding_locked: None, ffor_epoch: None,
-		};
-		let legacy = message.encode();
-		message.ffor_epoch = Some([7; 67]);
-		let bytes = message.encode();
-		assert_eq!(&bytes[..legacy.len()], &legacy);
-		assert_eq!(&bytes[legacy.len()..legacy.len() + 4], &[0xfd, 0xd6, 0xd9, 67]);
-		assert_eq!(msgs::ChannelReestablish::read_from_fixed_length_buffer(&mut bytes.as_slice()).unwrap(), message);
-		for length in [0u8, 66, 68] {
-			let mut malformed = legacy.clone(); malformed.extend_from_slice(&[0xfd, 0xd6, 0xd9, length]);
-			malformed.extend_from_slice(&vec![7; length as usize]);
-			assert!(msgs::ChannelReestablish::read_from_fixed_length_buffer(&mut malformed.as_slice()).is_err());
-		}
-		assert!(msgs::ChannelReestablish::read_from_fixed_length_buffer(&mut &bytes[..bytes.len() - 1]).is_err());
-		let mut duplicate = bytes.clone(); duplicate.extend_from_slice(&bytes[legacy.len()..]);
-		assert!(msgs::ChannelReestablish::read_from_fixed_length_buffer(&mut duplicate.as_slice()).is_err());
-	}
-
 	#[test]
 	fn encoding_channel_reestablish() {
 		let public_key = {
@@ -4448,7 +4420,6 @@ mod tests {
 		};
 
 		let cr = msgs::ChannelReestablish {
-			ffor_epoch: None,
 			channel_id: ChannelId::from_bytes([
 				4, 0, 0, 0, 0, 0, 0, 0, 5, 0, 0, 0, 0, 0, 0, 0, 6, 0, 0, 0, 0, 0, 0, 0, 7, 0, 0, 0,
 				0, 0, 0, 0,
@@ -4495,7 +4466,6 @@ mod tests {
 		};
 
 		let cr = msgs::ChannelReestablish {
-			ffor_epoch: None,
 			channel_id: ChannelId::from_bytes([
 				4, 0, 0, 0, 0, 0, 0, 0, 5, 0, 0, 0, 0, 0, 0, 0, 6, 0, 0, 0, 0, 0, 0, 0, 7, 0, 0, 0,
 				0, 0, 0, 0,
@@ -4555,7 +4525,6 @@ mod tests {
 		};
 
 		let cr = msgs::ChannelReestablish {
-			ffor_epoch: None,
 			channel_id: ChannelId::from_bytes([
 				4, 0, 0, 0, 0, 0, 0, 0, 5, 0, 0, 0, 0, 0, 0, 0, 6, 0, 0, 0, 0, 0, 0, 0, 7, 0, 0, 0,
 				0, 0, 0, 0,
@@ -5523,7 +5492,6 @@ mod tests {
 		let encoded_value = splice_ack.encode();
 		assert_eq!(encoded_value.as_hex().to_string(), "0202020202020202020202020202020202020202020202020202020202020202fffffffffffe1dc0031b84c5567b126440995d3ed5aaba0565d71e1834604819ff9c17f5e9d5dd078f0200");
 	}
-
 
 	#[test]
 	fn encoding_splice_lock_depth_extension() {

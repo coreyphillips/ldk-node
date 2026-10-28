@@ -1338,15 +1338,6 @@ impl Node {
 		))
 	}
 
-	/// Retrieve secret-free summaries of durably persisted Chicory offline reservations.
-	///
-	/// This operator view includes closed homes retained for replay protection. It never exposes
-	/// preimages or signed transcripts and does not authorize a settlement or custody release.
-	#[cfg(feature = "chicory")]
-	pub fn list_chicory_offline_epochs(&self) -> Vec<chicory::OfflineReceiveEpochStatus> {
-		self.channel_manager.list_ffor_epochs()
-	}
-
 	/// Coordinates a manual wallet operation with Chicory JIT funding.
 	///
 	/// Hosts must wrap channel opens, splices and Bitcoin sends in this method when

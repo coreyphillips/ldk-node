@@ -44,14 +44,15 @@ fn explicit_network_policy_and_unknown_config_fields() {
 	let temp = Temp::new();
 	let mut cfg = configuration(&temp.0);
 	cfg.validate().unwrap();
-	assert!(!cfg.chicory.enabled && !cfg.chicory.offline_enabled);
+	assert!(!cfg.chicory.enabled);
 	assert_eq!(cfg.chicory.max_client_funding_sats, 500_000);
-	cfg.chicory.offline_enabled = true;
-	assert!(cfg.validate().is_err());
 	cfg.chicory.enabled = true;
 	cfg.validate().unwrap();
 	cfg.network = "mainnet".into();
 	assert!(cfg.validate().is_err());
+	let mut value = serde_json::to_value(configuration(&temp.0)).unwrap();
+	value["chicory"]["offline_enabled"] = json!(true);
+	assert!(serde_json::from_value::<config::Config>(value).is_err());
 	let mut value = serde_json::to_value(configuration(&temp.0)).unwrap();
 	value["secret_debug"] = json!(true);
 	assert!(serde_json::from_value::<config::Config>(value).is_err());

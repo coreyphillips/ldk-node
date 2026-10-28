@@ -822,7 +822,9 @@ pub trait ChannelSigner {
 	/// reuse policy in [`ChannelTransactionParameters::reuse_funding_key_on_splice`].
 	/// Defaults to false. Returning true requires every funding-key signing path,
 	/// including on-chain claims, to honor the persisted per-channel policy.
-	fn supports_funding_key_reuse(&self) -> bool { false }
+	fn supports_funding_key_reuse(&self) -> bool {
+		false
+	}
 
 	/// Returns a new funding pubkey (i.e. our public which is used in a 2-of-2 with the
 	/// counterparty's key to to lock the funds on-chain) for a spliced channel.
@@ -994,19 +996,6 @@ pub trait NodeSigner {
 	/// An `Err` can be returned to signal that the signer is unavailable / cannot produce a valid
 	/// signature.
 	fn sign_message(&self, msg: &[u8]) -> Result<String, ()>;
-
-	/// Whether this signer supports the private FFOR settler protocol.
-	/// External signers must explicitly opt in before support can be advertised.
-	fn supports_ffor_settler(&self) -> bool { false }
-
-	/// Sign a canonical outbound FFOR settler message using the node identity.
-	/// The signer validates the message kind and structure and computes the
-	/// `ffor/msg` SHA256 domain internally. Unsupported signers return an error.
-	/// This method does not authorize channel state changes or preimage release.
-	fn sign_ffor_message(&self, _message_type: u16, _unsigned: &[u8]) -> Result<Signature, ()> {
-		Err(())
-	}
-
 }
 
 /// A trait that describes a wallet capable of creating a spending [`Transaction`] from a set of
@@ -1533,7 +1522,9 @@ impl ChannelSigner for InMemorySigner {
 		pubkeys
 	}
 
-	fn supports_funding_key_reuse(&self) -> bool { true }
+	fn supports_funding_key_reuse(&self) -> bool {
+		true
+	}
 
 	fn new_funding_pubkey(
 		&self, splice_parent_funding_txid: Txid, secp_ctx: &Secp256k1<secp256k1::All>,
@@ -2434,14 +2425,6 @@ impl NodeSigner for KeysManager {
 	fn sign_message(&self, msg: &[u8]) -> Result<String, ()> {
 		Ok(crate::util::message_signing::sign(msg, &self.node_secret))
 	}
-
-	fn supports_ffor_settler(&self) -> bool { true }
-
-	fn sign_ffor_message(&self, message_type: u16, unsigned: &[u8]) -> Result<Signature, ()> {
-		let digest = crate::ln::ffor::settler_signing_digest(message_type, unsigned).map_err(|_| ())?;
-		Ok(self.secp_ctx.sign_ecdsa(&hash_to_message!(&digest), &self.node_secret))
-	}
-
 }
 
 impl OutputSpender for KeysManager {
@@ -2611,13 +2594,6 @@ impl NodeSigner for PhantomKeysManager {
 	fn sign_message(&self, msg: &[u8]) -> Result<String, ()> {
 		self.inner.sign_message(msg)
 	}
-
-	fn supports_ffor_settler(&self) -> bool { self.inner.supports_ffor_settler() }
-
-	fn sign_ffor_message(&self, message_type: u16, unsigned: &[u8]) -> Result<Signature, ()> {
-		self.inner.sign_ffor_message(message_type, unsigned)
-	}
-
 }
 
 impl OutputSpender for PhantomKeysManager {
@@ -2743,30 +2719,6 @@ impl EntropySource for RandomBytes {
 #[test]
 pub fn dyn_sign() {
 	let _signer: Box<dyn EcdsaChannelSigner>;
-}
-
-#[test]
-fn ffor_signer_matches_appendix_d_node_signature() {
-	// This is the published synthetic Appendix D identity, not wallet material.
-	// Keep direct key access inside the signing module, including in this test.
-	let mut signer = KeysManager::new(&[51; 32], 1, 0, false);
-	signer.node_secret = SecretKey::from_slice(&Sha256::hash(b"ffor/S/node-key").to_byte_array()).unwrap();
-	signer.node_id = PublicKey::from_secret_key(&signer.secp_ctx, &signer.node_secret);
-	for wire in [include_bytes!("../ln/ffor/fixtures/d1-accept.bin").as_slice(),
-		include_bytes!("../ln/ffor/fixtures/d1-ack.bin").as_slice()] {
-		let typ = u16::from_be_bytes(wire[..2].try_into().unwrap());
-		let signature = signer.sign_ffor_message(typ, &wire[2..wire.len() - 64]).unwrap();
-		assert_eq!(signature.serialize_compact().as_slice(), &wire[wire.len() - 64..]);
-	}
-	let phantom = PhantomKeysManager::new(&[52; 32], 1, 0, &[53; 32], false);
-	assert!(phantom.supports_ffor_settler());
-	let wire = include_bytes!("../ln/ffor/fixtures/d1-ack.bin");
-	let signature = phantom.sign_ffor_message(55047, &wire[2..wire.len() - 64]).unwrap();
-	let digest = crate::ln::ffor::settler_signing_digest(55047, &wire[2..wire.len() - 64]).unwrap();
-	assert!(phantom.inner.secp_ctx.verify_ecdsa(&hash_to_message!(&digest), &signature,
-		&phantom.get_node_id(Recipient::Node).unwrap()).is_ok());
-	assert!(phantom.inner.secp_ctx.verify_ecdsa(&hash_to_message!(&digest), &signature,
-		&phantom.get_node_id(Recipient::PhantomNode).unwrap()).is_err());
 }
 
 #[cfg(ldk_bench)]

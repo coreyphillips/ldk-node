@@ -35,7 +35,6 @@ an operator-owned Bitcoin Core backend:
   },
   "chicory": {
     "enabled": false,
-    "offline_enabled": false,
     "flat_fee_sat": 100,
     "fee_ppm": 1000,
     "max_client_funding_sats": 500000,
@@ -47,11 +46,13 @@ an operator-owned Bitcoin Core backend:
 Other network values are `testnet`, `signet`, and `regtest`. Backend alternatives
 are `{"type":"electrum","url":"ssl://host:50002"}` and
 `{"type":"esplora","url":"https://host/api"}`. Do not include credentials in
-these URLs. Configuration fields are strict; unknown fields fail startup.
+these URLs. Configuration fields are strict; unknown fields fail startup. The former
+`offline_enabled` option and `offline_status` command have been removed. Remove
+that option from existing manager-generated configurations before starting this
+version; offline receiving is no longer supported.
 
-Provider and offline admission are independent opt-ins, with offline requiring
-the provider. Existing offline custody remains protected when new admission is
-disabled. The provider uses confirmed inputs, bounded funding allocation, a
+Provider funding requires an explicit opt-in. The provider uses confirmed inputs,
+bounded funding allocation, a
 six-confirmation inbound splice floor, and private stable funding keys for newly
 created compatible homes. See [the protocol documentation](../../docs/chicory-primary.md)
 for the state machine, recovery rules, backend fee policy, and qualification.
@@ -98,7 +99,6 @@ stay in the data directory. Closing stdin stops the node cleanly.
 | `splice_in` | `channel_id`, `counterparty_node_id`, `amount_sats` | `{accepted:true}` |
 | `splice_out` | same plus `address` | `{accepted:true}` |
 | `sync` | none | `{synced:true}` |
-| `offline_status` | none | Admission status and secret-free durable epoch summaries |
 | `events` | none | At most 2,048 durable public event records with sequence and timestamp |
 | `stop` | none | `{stopped:true}`, followed by process exit |
 
@@ -118,8 +118,7 @@ Events are persisted before acknowledging the native event queue. A crash betwee
 these writes can repeat an event, so the log is at least once. It is an activity
 view rather than an accounting authority. A failed history write stops the native
 node and emits `event_persistence_failed`. The manager must stop issuing commands
-and surface that fault. Offline summaries use durable custody state, not a pending
-in-memory protocol transition; they expose no preimages or signed vouchers.
+and surface that fault.
 
 ## Trust boundaries and validation
 
@@ -143,5 +142,5 @@ cargo test --locked --manifest-path tools/ldk-node-daemon/Cargo.toml
 Tests cover strict configuration, explicit network binding, duplicate-process
 exclusion, precision, bounded request frames, private file handling, genesis
 verification before key loading, event redaction, and failed event writes. The
-library separately tests manual/JIT exclusion and durable offline status. Fuzzing
+library separately tests manual/JIT exclusion. Fuzzing
 and funded interoperability procedures remain in the protocol documentation.

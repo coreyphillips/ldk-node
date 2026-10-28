@@ -1,11 +1,15 @@
 # Chicory primary compatibility
 
+FFOR offline receiving has been removed from this branch. Historical mixed
+qualification records below describe their original builds; any offline-receive
+results in them are excluded from the current implementation and test scope.
+
 This branch adds native Beignet protocol support so LDK Node can act as a Chicory
 primary on the tested paths. Funded tests cover ordinary payments, multipart JIT
 receiving and existing-home JIT splicing, deposits, Bitcoin sends and drain,
-confirmed direct funding, conflict rollback, peer backup recovery, and concurrent-v2
-offline receiving. The native iOS wallet, normal iOS application screens, and direct and forced
-public-relay Iroh transports also passed their recorded payment and offline fixtures.
+confirmed direct funding, conflict rollback, and peer backup recovery. The native
+iOS wallet, normal iOS application screens, and direct and forced public-relay
+Iroh transports have separate historical qualification records below.
 
 This remains experimental. The recorded scenarios establish behavior for the
 identified builds and transports, rather than universal equivalence or production
@@ -35,11 +39,6 @@ lets the event dispatcher distinguish an owned
 liquidity intercept from an unknown one. The native JIT path depends on these
 patches. A consuming application's top-level manifest must retain the path
 patches; Cargo does not inherit a dependency's patch section.
-
-The installed application is the contract. Some older descriptions in
-`FFOR-VALIDATION.md` describe automatic offline requests and provider-funded
-reservation channels. Current Chicory makes offline receiving an explicit
-choice and requires an existing eligible channel.
 
 ## Architecture and trust boundaries
 
@@ -93,11 +92,8 @@ write per second, and a global burst allowance of 64, refilling 16 writes per
 second. Failed storage attempts consume credit. Excess writes preserve the
 previous durable blob and return a bounded warning. Credits survive reconnect
 and reset on provider restart; retrieval does not consume write credit.
-The backup store admits at most 1,024 peer identities. Native offline custody
-retains at most 128 home identities globally and 4,096 archived voucher hashes
-or burned epoch identifiers per home. These records are not evicted to admit
-new work. Exhaustion refuses new admission; restarting does not reset the
-persisted custody history.
+The backup store admits at most 1,024 peer identities. These records are not
+evicted to admit new work; exhaustion refuses new admission.
 
 Threat model:
 
@@ -116,14 +112,13 @@ Threat model:
 - Peer backups are opaque, peer-scoped data. The provider must not decrypt them,
   return them to another identity, silently truncate them, or claim persistence
   when its storage write failed.
-- Third-party funding inputs can be double spent. FFOR participants can present
-  stale or conflicting voucher histories. These require their specified channel
-  and chain verification rules, not application-level balance adjustments.
+- Third-party funding inputs can be double spent. They require channel and chain
+  verification, not application-level balance adjustments.
 
 Keep ordinary transport encryption, signing, and channel accounting in LDK.
 Do not introduce a second wallet or make a Beignet process the hidden channel
 owner. Neither would establish native LDK Node parity. This audit does not
-establish a production security audit of the FFOR port.
+establish production security.
 
 ## Native port prerequisite matrix
 
@@ -142,9 +137,8 @@ are under `chicory/node_modules/@beignet/portable-engine/portable/` and
 | Bitcoin sends and send-max | `runtime.ts:1236` calls `spliceOut`. `portable/drain.cjs` coordinates an explicit full-wallet drain. Optional zero-reserve terms affect how much remains spendable. | Verify splice-out destinations and fees, reserve semantics, confirmed funding checks, failed broadcasts, cooperative close, and durable restart. A reverse swap is not the application's send path. |
 | Direct funding | `lfbw.cjs:399` enables ordinary and unpaired splicing. Beignet custom subtypes `16` through `22` carry offers, signing requests, witnesses, receipts, and relay. | Both an existing-home 5,000-sat payment and a fresh receiver's 15,000-sat payment passed with the unchanged installed portable engine. The tests verify receipts, exact chain inputs and outputs, matching usable native funding, and a subsequent 1,000-sat Lightning spend from each channel. The existing-home path uses the opt-in stable funding-key policy. |
 | Conflicted direct-funding splice | Beignet custom subtypes `64/65`, `src/lightning/message/splice-conflict.ts`; unpaired contributions wait for their configured lock depth and verified conflicts may revert to prior funding. | Implemented with authenticated chain proof, bounded workers, native monitor retirement and durable acknowledgments. The installed phone passed five/six-confirmation handling, both restarts and a subsequent payment from the restored original funding. The native archive retains recovery branches and refuses revoked holder broadcasts after deep reorgs. |
-| Offline receiving | `offline-receive.ts:296`, `:450`, and `:586`; subtypes `80/81` request terms and receipts. FFOR uses optional bits `441/443`, epoch activation, voucher reservations, receipt sync, and draining. | Implemented as an opt-in native concurrent-v2 settler with exact voucher accounting, commitment transcript binding, persistence gates, delegated upstream settlement, synchronization, and chain custody. Native lifecycle tests and installed-phone receipt recovery pass, including native iOS storage and process restarts. Historical issuer and witness variants are outside the installed phone contract. |
 | Peer-storage recovery | `runtime.ts:548` selects `peer-storage`. Beignet `src/lightning/message/peer-storage.ts` uses type `7` to store and type `9` to retrieve. Each contains a `u16` length and opaque bytes. Beignet pads its outgoing capsule to 65,531 bytes in `lightning-node.ts:6535`. | Stock LDK 0.2.7 rejects blobs above 1 KiB. This branch adds a channel-message wrapper that accepts bounded full-sized opaque blobs from established channel peers and returns the current durable blob to the same authenticated peer. Live restart retrieval, empty-phone recovery with the reference safety hold, and a real current-commitment recovery sweep passed. |
-| Iroh | Chicory `docs/IROH.md` and `portable/primary-uri.cjs`; same Lightning key, separate endpoint identity, optional same-key onion fallback. | An independent byte bridge passed direct Iroh and forced public-relay wallet tests, including all 11 baseline/offline checks. Endpoint identity, bounded cancellation and native BOLT 8 are tested. See the later qualification records for discovery, fallback and native iOS adapter results. |
+| Iroh | Chicory `docs/IROH.md` and `portable/primary-uri.cjs`; same Lightning key, separate endpoint identity, optional same-key onion fallback. | An independent byte bridge passed direct Iroh and forced public-relay wallet tests, with historical results recorded below. Endpoint identity, bounded cancellation and native BOLT 8 are tested. See the later qualification records for discovery, fallback and native iOS adapter results. |
 
 Current Chicory does not expose reverse or submarine swaps. The installed
 portable README explicitly states that providers are disabled and there is no
@@ -163,32 +157,6 @@ feature rejection at `:121204`. The generic `openChannel` method has a v1
 fallback, but this receiver path never calls it. Relay support plus a v1
 channel with a push therefore cannot complete an unchanged phone's
 direct-funding request.
-
-FFOR has its own odd message types in addition to the custom envelope:
-`55001`, `55003`, `55005`, `55023`, `55045`, `55047`, `55049`, `55051`,
-`55053`, `55075`, and `55077` for the receiver/settler protocol. Witness and
-issuer extensions use `55055` through `55073`. The authoritative definitions
-are Beignet `src/lightning/message/types.ts` and
-`docs/specs/ffor-offline-receive.md`; concurrent behavior is specified in
-`docs/specs/CONCURRENT-RECEIVE.md`.
-
-FFOR negotiation uses feature pairs `440/441` and `442/443`, matching Beignet
-commit `4f7b54df`. The former `560-563` assignments are neither advertised nor
-accepted as FFOR because they collide with Eclair funding features. Upgrade both
-peers before using offline receiving. Beignet's separate async receive service
-uses `444/445`; this native fork does not implement or advertise that service.
-
-The current phone requests one fixed-amount Variant D slot on an existing home,
-with admission deadline at the current height plus 144 and voucher expiry plus
-1,296 (`portable/offline-receive.ts:507`). The reference provider selects
-concurrent version 2 (`beignet/src/cli/ffor-receive.ts:236`), which preserves
-unpaid claims after retirement. Its standard commitments continue advancing
-while preserving voucher outputs. A baseline epoch requires the phone to have
-zero local channel balance, so implementing baseline alone changes ordinary
-funded-home behavior. Variant D does not require the unilateral fast-forward
-commitments of historical variants A and B. The existing concurrent specification
-has a stale draft status header; the installed engine and current reference
-tests are needed to pin version 2 behavior.
 
 Splicing uses STFU `2`, splice-init `80`, splice-ack `81`, splice-locked `77`,
 start-batch `127`, and interactive transaction messages `66` through `74` in
@@ -232,23 +200,17 @@ evidence. Use disposable regtest wallets and a separate mobile test identifier.
    unpaired sender lock depth, tampered witnesses, replay, disconnect, and a
    confirmed conflicting input spend. Assert a single correct funding spend
    and receipt, with no leaked signing material or false completion.
-7. **Offline receive:** establish an eligible funded home, prepare a concurrent
-   reservation, stop the phone process, and pay externally. Reopen twice and
-   verify one credited receipt and no balance inflation. Exercise partial
-   redemption, an unpaid voucher, expiry, unknown slots in DRAINING, ordinary
-   payments using remaining capacity, provider restart, and conflicting sync.
-   A disabled offline policy must refuse explicitly without reserving vouchers.
-8. **Recovery storage:** send the phone's real 65,531-byte padded capsule,
+7. **Recovery storage:** send the phone's real 65,531-byte padded capsule,
    restart the provider, reconnect, and compare retrieval byte-for-byte. Test
    durable write failure, another peer requesting retrieval, rate limits, and
    oversized messages. Restore into an isolated installation using explicit
    recovery opt-in and ensure the old process cannot resume unsafe signing.
-9. **Send-max and drain:** cover a primary-funded channel with and without a
+8. **Send-max and drain:** cover a primary-funded channel with and without a
    reserve waiver, a phone-funded channel, exact fee ceilings, subsequent
    receipts excluded from a frozen review, cooperative close plus loose-coin
    sweep, and restart with one complete Activity row. Later chain confirmation
    must not block fresh receives after a safely completed drain boundary.
-10. **Native mobile transport:** run the passing portable scenarios with the
+9. **Native mobile transport:** run the passing portable scenarios with the
     isolated Chicory native test entry using Hermes, native TCP, Keychain, and
     SQLCipher. Qualify Iroh independently if offered by the provider.
 
@@ -327,7 +289,7 @@ BEIGNET_SOURCE_DIR=/path/to/built/beignet node scripts/chicory-interop.cjs
 
 It verifies that the Docker chain is regtest before funding, creates a native
 provider and two disposable Beignet clients, checks blind relay delivery and
-explicit offline-service refusal, establishes a payer channel,
+establishes a payer channel,
 requests and authorizes a skim-fee invoice, restarts the provider, replays the
 authorization, and pays through the provider to a receiver that initially has
 no channel. Its assertions cover a 20,000-sat request with the example's
@@ -456,29 +418,6 @@ from creation onward. It is persisted with an old-reader rejection marker and
 applied consistently to native funding and commitment signatures. The passing
 fixture preserves the payer's strict verification and uses no address fallback.
 
-`CHICORY_TEST_OFFLINE=1` prepares a funded concurrent-v2 reservation, stops the
-phone, restarts the primary, pays externally, restarts the primary again, and
-reopens the phone twice to require one credit and one completed Activity row.
-Run it with `CHICORY_ENABLE_OFFLINE=1` to opt the example into native offline
-admission. All ten checks passed against the installed phone engine. The
-example's explicit `splice_in` administration command provides its required
-inbound headroom; offline quotes do not allocate those funds. This covers a
-single fixed-amount concurrent-v2 reservation and disconnected delegated
-settlement, not every crash point or onchain phone recovery scenario.
-
-`CHICORY_TEST_OFFLINE_CONCURRENT=1` additionally sends and receives ordinary
-Lightning payments while the voucher book is ACTIVE. `CHICORY_TEST_OFFLINE_UNPAID=1`
-instead explicitly closes an unpaid reservation, preserves DRAINING through
-both restarts, force-closes the actual commitment and confirms its exact voucher
-timeout before requiring a fresh usable home. `CHICORY_TEST_OFFLINE_AUTO_EXPIRE=1`
-selects the same unpaid lifecycle using the real 600-second invoice expiry and
-120-second grace period. It asserts the reservation remains ACTIVE during grace
-and waits for the normal runtime timer to close admission without an explicit
-close command. This takes more than twelve real minutes. Both unpaid modes
-require `CHICORY_TEST_OFFLINE=1` and `CHICORY_ENABLE_OFFLINE=1` and run separately
-from the paid-concurrent mode. Use a fresh disposable provider directory for
-each run; the fixture creates and removes these directories automatically.
-
 `CHICORY_TEST_SEND_MAX=bech32`, `bech32m`, or `p2wsh` adds an exact reviewed
 maximum payout to the selected destination type. It checks the old funding
 input, new usable home and actual output, then restarts both endpoints and
@@ -519,10 +458,8 @@ check remains in place; see [Beignet issue 1873](https://github.com/coreyphillip
   its provider startup with the Rust process while preserving phone code.
 - `scripts/regtest-channelize.cjs` covers deposit splicing, first channel
   funding, and a second phone's direct-funded payment.
-- `scripts/regtest-ffor.cjs`, `scripts/regtest-ffor-native.cjs`, and
-  `scripts/regtest-send-max.cjs` cover the corresponding acceptance scenarios.
-- Chicory `native-tests/OfflineReceive.tsx` provides a command-driven isolated
-  native entry. `native-tests/iroh-primary.cjs` provides a separate transport
+- `scripts/regtest-send-max.cjs` covers the corresponding acceptance scenario.
+- Chicory `native-tests/iroh-primary.cjs` provides a separate transport
   qualification helper whose provider startup also needs adaptation.
 
 The existing portable fixtures default to Docker container `bitcoin`, Core RPC
@@ -563,13 +500,10 @@ Later funded runs extended that record:
 | Installed portable initial deposit, 04:40:15 to 04:40:23 UTC | All 4 checks passed. A 30,000-sat deposit created one 29,475-sat phone-funded channel. It remained unusable before confirmation through primary restart, then completed a 1,000-sat spend and phone reopen with 28,475 sats. | [JSON](qualification/initial-deposit.json), `passed: true`. |
 | Installed portable empty-phone recovery, 04:47:15 to 04:47:44 UTC | All 8 checks passed. After the primary restarted, a new phone volume imported its peer-storage capsule, restored the original funding and exact 16,880-sat balance, and retained the reference permanent recency hold with zero available balance. | [JSON](qualification/recovery-held.json), `passed: true`. |
 | Installed portable recovery sweep, 04:50:35 to 04:51:10 UTC | All 9 checks passed. The empty phone imported its capsule and kept the safety hold. The primary broadcast its current commitment; the restored phone swept the exact 16,880-sat output into a 15,780-sat wallet coin, paying the measured 1,100-sat fee without signing stale channel state. | [JSON](qualification/recovery-sweep.json), `passed: true`. |
-| Installed portable offline receive, 05:10:07 to 05:10:26 UTC | All 10 checks passed. The unchanged phone activated one 5,000-sat concurrent-v2 voucher. With the phone stopped, a restarted native primary settled the external payer. After another primary restart the phone recovered the receipt, increased its balance from 16,880 to 21,880 sats, and preserved exactly one completed Activity row and a usable zero-HTLC home through a second reopen. | [JSON](qualification/offline.json), `passed: true`. |
 | Native existing-home multipart splice, 05:11:06 to 05:11:15 UTC | All 5 checks passed. Two genuine 15,000-sat shortfalls on the real home alias triggered one 40,000-to-90,000-sat splice. Native forwarding events and distinct receiver HTLC ids proved 14,870 plus 15,000 sats arrived, one 130-sat JIT fee and two 1-sat routing fees were earned, and both peers retained one usable home with matching funding. | [JSON](qualification/existing-home-mpp.json), `passed: true`. |
-| Installed portable concurrent offline receive, 05:13:31 to 05:13:51 UTC | All 11 checks passed. With an ACTIVE voucher book, the phone sent 1,000 sats and received 1,200 sats through ordinary Lightning before going offline. A restarted primary settled a 5,000-sat external payment; another primary restart and two phone reopens preserved exactly one credit, a 22,080-sat balance and one usable home with no remaining HTLC. | [JSON](qualification/offline-concurrent.json), `passed: true`. |
 | Installed phone conflict recovery, 05:45:22 to 05:46:49 UTC | All 10 checks passed. A disposable payer replaced only its own nonshared splice input. Five confirmations preserved the candidate through primary restart. Six restored matching usable original funding, and both endpoint restarts were followed by a successful 1,000-sat Lightning payment. | [JSON](qualification/conflict.json), `passed: true`. |
 | Native iOS wallet, 05:51:41 to 05:52:25 UTC | All 11 checks passed in Hermes using Chicory's native TCP, cryptography, Keychain and SQLCipher adapters. Real app restarts retained paid Activity and channel state. Ordinary payments with an active offline book, offline settlement across primary restarts and exactly one 5,000-sat recovered credit all passed. This uses an isolated test scene delegate, not the normal application screens. | [JSON](qualification/ios.json), `passed: true`; native binary SHA256 `31c5f546513e7a3d348e4c8dd52ddc98eb2783df514f4cd620e8245267188b7b`. |
-| Direct Iroh wallet, 05:54:24 to 05:55:00 UTC | All 11 installed-wallet checks passed through the separate byte bridge to native LDK, including runtime/primary restarts and offline receipt recovery. The fixture waits nine seconds with a stable home before offline setup to avoid the confirmed installed-client watchdog bug. Public relays and native iOS Iroh are not covered. | [JSON](qualification/iroh.json), `passed: true`; [watchdog issue 1872](https://github.com/coreyphillips/beignet/issues/1872). |
-| Unpaid offline lifecycle, 05:58:07 to 05:59:05 UTC | All 11 checks passed at this checkpoint. Explicit admission close retained an unpaid voucher in DRAINING through both restarts. The primary force-closed its actual current commitment, the exact 5,000-sat voucher resolved through a real timeout transaction with six confirmations, and another pair of restarts was followed by a fresh 9,890-sat JIT home. The unpaid invoice never acquired a completed Activity row. This tests explicit close, not the automatic wall-clock expiry trigger. | [JSON](qualification/offline-unpaid.json), `passed: true`; native binary SHA256 `617a88077fe5e3a0acd0ab2c2b0beecf36a11756c6be75e5e305b7578f38f668`. |
+| Direct Iroh wallet, 05:54:24 to 05:55:00 UTC | All 11 installed-wallet checks passed through the separate byte bridge to native LDK, including runtime/primary restarts and offline receipt recovery. That historical fixture waited nine seconds with a stable home before offline setup to avoid the confirmed installed-client watchdog bug. Public relays and native iOS Iroh are not covered. | [JSON](qualification/iroh.json), `passed: true`; [watchdog issue 1872](https://github.com/coreyphillips/beignet/issues/1872). |
 
 Later checkpoints were checked after the native retirement guards were complete:
 
@@ -585,27 +519,6 @@ Selected successful machine-readable records are retained in
 not an assertion that every later source revision reran every scenario. The
 records contain only public test identifiers, amounts, hashes and measured
 outcomes; temporary wallet directories and secret payment material are excluded.
-
-A longer automatic-expiry qualification exposed a separate monitor persistence
-boundary after these checkpoints. Once its final on-chain claim matured, the
-normal periodic snapshot policy could leave the authenticated resolution proof
-only in memory. A later FFOR journal delta was durable but could not replay over
-the older snapshot. The native incremental persister now writes the complete
-monitor whenever the journal contains a chain removal, preserving the original
-update ID and withholding completion until that full write succeeds. Native
-signed timeout and fulfillment regressions exercise the actual asynchronous
-persister and keep the independent proof check intact. Custom incremental
-persisters must honor the new `requires_full_monitor_persistence` contract.
-
-The corrected real-time rerun passed all 13 checks from 06:42:29 to 06:55:20 UTC.
-The unchanged installed wallet retained the voucher after its actual 600-second
-invoice expiry, closed admission automatically after the 120-second grace
-period, and preserved DRAINING through both endpoint restarts. The real
-5,000-sat voucher timeout reached six confirmations. Another primary restart
-succeeded, and a fresh JIT home received 9,890 sats without any completed
-Activity row for the unpaid invoice. The [public evidence](qualification/offline-auto-expire.json)
-records a 721,780 ms wall-clock wait and the native binary hash. No test clock
-or explicit admission-close command replaced the timer in this run.
 
 The baseline splice run mined immediately and therefore did not establish
 safe handling of unconfirmed peer contributions. A subsequent source audit
@@ -630,8 +543,8 @@ No phone package was patched for these runs. Activity completion and balances
 passed; accurate net Activity accounting remains the confirmed upstream issue
 described above.
 
-These results do not qualify every FFOR crash or onchain phone-recovery path,
-live crashes during every partial multipart collection or funding boundary,
+These results do not qualify every onchain phone-recovery path, live crashes
+during every partial multipart collection or funding boundary,
 complete coverage, an exhaustive fuzz campaign, or production security. The later
 transport and iOS records extend this historical scope. Subsequent changes to the
 native channel engine require rerunning
@@ -650,7 +563,7 @@ in the resolved dependency graph.
 
 The test feature changes persisted `PaymentPathFailed` event fields and disables
 some ordinary gossip freshness and rebroadcast checks. It does not introduce an
-alternate FFOR, direct-funding, confirmation, fee or persistence implementation.
+alternate direct-funding, confirmation, fee or persistence implementation.
 Nevertheless, the normal-feature runs use fresh provider state. Do not reuse a
 provider database across these feature sets based on the successful protocol
 fixtures alone. Private-channel qualification also does not cover public gossip
@@ -669,8 +582,6 @@ without changing the host firewall. This earlier check used the supplied
 
 | Normal host run after the persistence fix | Measured result | Evidence |
 | --- | --- | --- |
-| Explicit unpaid lifecycle, 06:56:14 to 06:57:04 UTC | All 11 checks passed. Actual voucher timeout, both post-timeout restarts, a fresh 9,890-sat JIT home and no unpaid credit. | [JSON](qualification/normal-offline-unpaid.json). |
-| Paid concurrent offline receive, 06:57:26 to 06:57:47 UTC | All 11 checks passed. Ordinary 1,000-sat send and 1,200-sat receive while ACTIVE, offline settlement across primary restarts, and exactly one 5,000-sat credit through two phone reopens. | [JSON](qualification/normal-offline-concurrent.json). |
 | Complete direct funding, 06:58:17 to 07:00:33 UTC | All 10 checks passed. Both existing-home and initial-channel deposits delivered exact amounts with verified receipts and matching usable native funding, followed by a successful 1,000-sat Lightning spend from each channel. | [JSON](qualification/normal-direct-funding.json). |
 
 ## Build and regression results
@@ -692,7 +603,6 @@ tools and fuzz corpora are excluded from the branch.
 | Standard Rust integration suite | 52 passed on the initial run; six startup/address/timing failures all passed on the lower-concurrency retry. This was not one clean uninterrupted suite run. |
 | Multi-address wallet suite and chain reorg property test | All 110 address tests passed in 2,422.40 seconds. The reorg test passed its five generated cases in 233.77 seconds. |
 | Iroh bridge tests with native addon and BOLT 8 | 11 passed, zero failed after the fatal accept-loop fix. |
-| Native FFOR libFuzzer campaign | 4,118,637 executions in 121 seconds, no finding. |
 | Custom wire libFuzzer campaign | 321,330 executions in 121 seconds, no finding. |
 | Root formatting and whitespace checks | `cargo fmt -p ldk-node --check` and `git diff --check` passed. Stable rustfmt reports the existing nightly-only configuration options. Full workspace formatting also reports native-fork style differences and is not a passing check. |
 | Root Clippy with `--no-deps` | Passed with warnings. |
@@ -725,7 +635,7 @@ splices, and connection timing:
   ownership or witness checks. The final witness is not known at this audit;
   senders remain responsible for the actual signed transaction fee.
 - The reconnect watchdog retries an incomplete channel reestablishment exchange.
-  A healthy home intentionally held by a splice or offline custody transition no
+  A healthy home intentionally held by a splice transition no
   longer triggers a disconnect merely because it cannot currently carry HTLCs.
   Retries remain bounded and stale callbacks cannot disconnect a new connection.
 
@@ -772,19 +682,17 @@ the native provider's fee or balance.
 [`tools/ldk-node-daemon`](../tools/ldk-node-daemon/README.md) runs the native library
 with normal dependency features and a private bounded JSONL administration pipe.
 It supports explicit networks and chain backends, exclusive private storage,
-backend genesis validation, durable public event history, and secret-free offline
-status. Manual opens, splices and Bitcoin sends coordinate with JIT funding through
+backend genesis validation and durable public event history. Manual opens, splices and Bitcoin sends coordinate with JIT funding through
 `Node::with_chicory_wallet_operation`. Event history is persisted before native
 acknowledgment; a persistence fault stops the node instead of silently consuming
-its events. The daemon's seven focused tests, the library funding exclusion test,
-and the native durable-epoch status regression pass. The all-target check with
-`chicory uniffi` and 13 doctests also pass. The [administration check record](qualification/native-daemon.json)
+its events. The historical daemon and library test results are recorded below; their
+removed offline-status coverage does not apply to this version. The [administration check record](qualification/native-daemon.json)
 retains counts, source revision, binary hash and installer refusal checks.
 
 The separate local `ldk-node-umbrel` checkout contains the authenticated dashboard,
 local image loader, Umbrel manifest and Docker Compose deployment. It uses this
 native daemon, supports AMD64 and ARM64, and defaults the creation form to Mainnet.
-Provider funding and offline admission require explicit configuration. The local
+Provider funding requires explicit configuration. The local
 package README contains the exact image checksums, installation, pairing, backup,
 and qualification instructions. No source, image or release is published.
 
@@ -799,14 +707,13 @@ disposable regtest funds.
 | --- | --- | --- |
 | Forced public Iroh relay with explicit address | All 11 installed-wallet baseline and concurrent offline checks passed. Endpoint UDP was blocked inside isolated containers, with before/after firewall counters and unprivileged endpoint processes. Provider restarts and two phone reopens retained exactly one offline credit. No artificial offline-setup delay. Original installed client. | [Wallet JSON](qualification/forced-relay-wallet.json), [transport evidence](../tools/chicory-iroh/relay/qualification.json). |
 | Public discovery with a bare Iroh endpoint URI | All 11 baseline and concurrent offline checks passed. No relay URL or direct address was supplied to the wallet. Direct UDP remained blocked, all endpoint containers and networks were removed, and the final 22,080-sat balance contained one offline credit. Combined local client, zero artificial delay. | [JSON](qualification/relay-discovery.json). |
-| Normal iOS application screens | Actual receive, send, background privacy cover, primary restart while backgrounded, reconnect and cold app restart passed. A 20,000-sat JIT payment credited 19,880 sats; sending 1,000 left 18,880. A later 5,000-sat offline payment while the app was terminated recovered once after two primary restarts, leaving 23,880 through another cold reopen. | [UI observations](qualification/ios-normal-ui.json), [controller results](qualification/ios-normal-ui-controller.json), [received screen](qualification/ios-normal-ui-received.png), [offline screen](qualification/ios-normal-ui-offline.png), [privacy screen](qualification/ios-privacy.png). |
+| Normal iOS application screens | Actual receive, send, background privacy cover, primary restart while backgrounded, reconnect and cold app restart passed. A 20,000-sat JIT payment credited 19,880 sats; sending 1,000 left 18,880. A later 5,000-sat offline payment while the app was terminated recovered once after two primary restarts, leaving 23,880 through another cold reopen. | [UI observations](qualification/ios-normal-ui.json), [controller results](qualification/ios-normal-ui-controller.json), [received screen](qualification/ios-normal-ui-received.png), [privacy screen](qualification/ios-privacy.png). |
 | Normal iOS cold/warm payment links | All four Bitcoin and Lightning URI delivery cases reached the correct 1,000-sat Send form with explicit review. This separate empty, disconnected wallet submitted no payment and retained zero Activity rows. It tests delivery and review boundaries, not a funded link payment. | [JSON](qualification/ios-payment-links.json). |
 | Portable same-key onion fallback | All 11 baseline and concurrent offline checks passed with the provider Iroh endpoint stopped. Five Iroh attempts established zero connections; the public Tor fallback delivered the full wallet flow, ending at 22,080 sats with one offline credit. Disposable Tor container and network removal were verified. | [JSON](qualification/onion-fallback.json). |
 | Native iOS Iroh through a forced public relay | All 11 baseline and concurrent offline checks passed with Chicory's production native Iroh, cryptography, Keychain and SQLCipher adapters. Provider-side container rules prevented direct UDP throughout four relay-only sessions; final cleanup was verified. No factory override in the phone and no artificial setup delay. | [JSON](qualification/ios-forced-relay.json). |
 | Native iOS same-key onion fallback | All 11 baseline and concurrent offline checks passed with the Iroh provider stopped. The production native Iroh and Tor adapters selected the persisted same-key onion fallback, retained exact payments through phone and primary restarts, and recovered one offline credit. Disposable Tor container and network removal were verified. | [JSON](qualification/ios-onion-fallback.json), [native app hashes](qualification/ios-native-builds.json). |
 | Native iOS direct funding with an Electrum primary | All 10 checks passed using the combined local client. An existing home received 5,000 sats and a separately signed fresh phone created a 15,000-sat v2 channel. Both receipts and exact funding outputs were verified; both receivers then completed a real 1,000-sat Lightning spend. | [JSON](qualification/ios-electrum-direct-funding.json). |
 | Packaged Linux AMD64 primary | All six funded baseline checks passed through authenticated dashboard HTTP and the packaged native daemon: exact 19,880-sat JIT receipt, restored phone state and outgoing Lightning payment. | [JSON](qualification/umbrel-amd64-funded.json). |
-| Packaged Linux ARM64 primary | All 11 concurrent offline checks passed through the dashboard and packaged native daemon, including ordinary payments while ACTIVE, payment with the phone stopped, primary restarts and two phone reopens with exactly one 5,000-sat recovered credit. | [JSON](qualification/umbrel-arm64-offline.json). |
 
 The packaged fixture's `primaryBinarySha256` identifies its small authenticated
 HTTP adapter, not the native executable. The dashboard package's image and

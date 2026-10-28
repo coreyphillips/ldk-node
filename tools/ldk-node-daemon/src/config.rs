@@ -7,7 +7,7 @@ use std::time::Duration;
 
 use electrum_client::ElectrumApi;
 use ldk_node::bitcoin::{blockdata::constants::genesis_block, Network};
-use ldk_node::chicory::{JitServiceConfig, OfflineReceiveConfig};
+use ldk_node::chicory::JitServiceConfig;
 use ldk_node::{Builder, Node};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -39,7 +39,6 @@ pub enum ChainSource {
 #[serde(default, deny_unknown_fields)]
 pub struct ChicoryPolicy {
 	pub enabled: bool,
-	pub offline_enabled: bool,
 	#[serde(default = "default_flat_fee")]
 	pub flat_fee_sat: u64,
 	#[serde(default = "default_ppm")]
@@ -53,7 +52,6 @@ impl Default for ChicoryPolicy {
 	fn default() -> Self {
 		Self {
 			enabled: false,
-			offline_enabled: false,
 			flat_fee_sat: default_flat_fee(),
 			fee_ppm: default_ppm(),
 			max_client_funding_sats: default_client_cap(),
@@ -150,9 +148,6 @@ impl Config {
 		if address.port() == 0 {
 			return Err("Listen port must be nonzero".into());
 		}
-		if self.chicory.offline_enabled && !self.chicory.enabled {
-			return Err("Offline admission requires the Chicory provider".into());
-		}
 		self.policy().validate().map_err(|_| "Invalid provider fees or funding limits")?;
 		match &self.chain_source {
 			ChainSource::Bitcoind { host, port, user, password } => {
@@ -199,10 +194,6 @@ impl Config {
 	pub fn policy(&self) -> JitServiceConfig {
 		JitServiceConfig {
 			enabled: self.chicory.enabled,
-			offline_receive: OfflineReceiveConfig {
-				enabled: self.chicory.offline_enabled,
-				..OfflineReceiveConfig::default()
-			},
 			relay_enabled: self.chicory.enabled,
 			allow_confirmed_v2: self.chicory.enabled,
 			allow_splice_jit: self.chicory.enabled,

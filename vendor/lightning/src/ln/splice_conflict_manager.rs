@@ -182,8 +182,10 @@ where
 		if input == funding_txo.into_bitcoin_outpoint()
 			|| input.is_null()
 			|| !conflict_transaction.input.iter().any(|entry| entry.previous_output == input)
-			|| conflict_transaction.input.iter().any(|entry|
-				entry.previous_output == funding_txo.into_bitcoin_outpoint())
+			|| conflict_transaction
+				.input
+				.iter()
+				.any(|entry| entry.previous_output == funding_txo.into_bitcoin_outpoint())
 		{
 			return Err(conflict_unavailable());
 		}

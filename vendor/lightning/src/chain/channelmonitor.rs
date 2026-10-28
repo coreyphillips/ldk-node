@@ -114,20 +114,6 @@ pub struct ChannelMonitorUpdate {
 }
 
 impl ChannelMonitorUpdate {
-	/// Whether persistence of this update must include the complete updated monitor.
-	///
-	/// Some updates depend on chain-authenticated state which is absent from the update itself.
-	/// Persisting only such an update could make restart replay fail against an older monitor.
-	/// Custom incremental persisters must persist the full monitor before reporting completion
-	/// whenever this returns true, retaining this update's ID for the completion callback.
-	pub fn requires_full_monitor_persistence(&self) -> bool {
-		self.updates.iter().any(|update| match update {
-			ChannelMonitorUpdateStep::FforJournal { journal } =>
-				journal.epoch.slots.iter().any(|slot| slot.chain_removal.is_some()),
-			_ => false,
-		})
-	}
-
 	pub(crate) fn internal_renegotiated_funding_data(
 		&self,
 	) -> impl Iterator<Item = (OutPoint, ScriptBuf)> + '_ {
@@ -204,24 +190,6 @@ pub enum MonitorEvent {
 	/// A monitor event containing an HTLCUpdate.
 	HTLCEvent(HTLCUpdate),
 
-	/// A reserved voucher output resolved on chain after the native confirmation
-	/// threshold. The manager must durably record this proof before releasing the
-	/// corresponding payment-completion update.
-	FforVoucherResolved {
-		/// The reserved epoch identity.
-		epoch_id: [u8; 32],
-		/// The one-based voucher slot.
-		slot: u16,
-		/// The confirmed commitment containing or excluding the voucher.
-		commitment_txid: Txid,
-		/// The voucher output, absent when it was excluded from the commitment.
-		output_index: Option<u32>,
-		/// The transaction irrevocably resolving that output.
-		resolving_txid: Txid,
-		/// Whether the authenticated resolution revealed the voucher preimage.
-		fulfilled: bool,
-	},
-
 	/// Indicates we broadcasted the channel's latest commitment transaction and thus closed the
 	/// channel. Holds information about the channel and why it was closed.
 	HolderForceClosedWithInfo {
@@ -265,14 +233,6 @@ impl_writeable_tlv_based_enum_upgradable_legacy!(MonitorEvent,
 		(0, funding_txo, required),
 		(2, monitor_update_id, required),
 		(4, channel_id, required),
-	},
-	(8, FforVoucherResolved) => {
-		(0, epoch_id, required),
-		(2, slot, required),
-		(4, commitment_txid, required),
-		(6, output_index, option),
-		(8, resolving_txid, required),
-		(10, fulfilled, required),
 	},
 	(5, HolderForceClosedWithInfo) => {
 		(0, reason, upgradable_required),
@@ -675,9 +635,11 @@ impl_writeable_tlv_based_enum_upgradable!(OnchainEvent,
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum ChannelMonitorUpdateStep {
-	/// Required custody journal update. Unknown readers must refuse it.
-	FforJournal { journal: crate::ln::ffor_monitor::FforJournal },
-	RetireConflictedFunding { record: crate::ln::splice_conflict::SpliceConflictRecord, candidate_transaction: Transaction, conflict_transaction: Transaction },
+	RetireConflictedFunding {
+		record: crate::ln::splice_conflict::SpliceConflictRecord,
+		candidate_transaction: Transaction,
+		conflict_transaction: Transaction,
+	},
 	LatestHolderCommitmentTXInfo {
 		commitment_tx: HolderCommitmentTransaction,
 		/// Note that LDK after 0.0.115 supports this only containing dust HTLCs (implying the
@@ -760,7 +722,6 @@ impl ChannelMonitorUpdateStep {
 	#[rustfmt::skip]
 	fn variant_name(&self) -> &'static str {
 		match self {
-			ChannelMonitorUpdateStep::FforJournal { .. } => "FforJournal",
 			ChannelMonitorUpdateStep::RetireConflictedFunding { .. } => "RetireConflictedFunding",
 			ChannelMonitorUpdateStep::LatestHolderCommitmentTXInfo { .. } => "LatestHolderCommitmentTXInfo",
 			ChannelMonitorUpdateStep::LatestHolderCommitment { .. } => "LatestHolderCommitment",
@@ -832,9 +793,6 @@ impl_writeable_tlv_based_enum_upgradable!(ChannelMonitorUpdateStep,
 		(0, record, required),
 		(2, candidate_transaction, required),
 		(4, conflict_transaction, required),
-	},
-	(14, FforJournal) => {
-		(0, journal, required),
 	},
 );
 
@@ -1314,8 +1272,6 @@ impl_writeable_tlv_based!(RetiredFundingRecovery, {
 
 #[derive(Clone, PartialEq)]
 pub(crate) struct ChannelMonitorImpl<Signer: EcdsaChannelSigner> {
-	ffor_journal: Option<crate::ln::ffor_monitor::FforJournal>,
-	ffor_chain_resolutions: Option<crate::ln::ffor_monitor::FforChainResolutions>,
 	retired_funding: Vec<RetiredFunding>,
 	retired_funding_recovery: Option<RetiredFundingRecovery>,
 	funding: FundingScope,
@@ -1874,8 +1830,6 @@ pub(crate) fn write_chanmon_internal<Signer: EcdsaChannelSigner, W: Writer>(
 		(34, channel_monitor.alternative_funding_confirmed, option),
 		(35, channel_monitor.is_manual_broadcast, required),
 		(37, channel_monitor.funding_seen_onchain, required),
-		(38, channel_monitor.ffor_journal, option),
-		(40, channel_monitor.ffor_chain_resolutions, option),
 		(42, channel_monitor.retired_funding, optional_vec),
 		(44, channel_monitor.retired_funding_recovery, option),
 	});
@@ -2064,8 +2018,6 @@ impl<Signer: EcdsaChannelSigner> ChannelMonitor<Signer> {
 			current_counterparty_commitment_number: 1 << 48,
 			current_holder_commitment_number,
 
-			ffor_journal: None,
-			ffor_chain_resolutions: None,
 			retired_funding: Vec::new(),
 			retired_funding_recovery: None,
 			payment_preimages: new_hash_map(),
@@ -2304,8 +2256,7 @@ impl<Signer: EcdsaChannelSigner> ChannelMonitor<Signer> {
 	/// updates have been durably persisted.
 	pub(super) fn get_and_clear_pending_non_htlc_fail_events(&self) -> Vec<MonitorEvent> {
 		self.inner.lock().unwrap().get_and_clear_pending_monitor_events_filtered(
-			|ev| !matches!(ev, MonitorEvent::FforVoucherResolved { .. })
-				&& !matches!(ev, MonitorEvent::HTLCEvent(upd) if upd.payment_preimage.is_none()),
+			|ev| !matches!(ev, MonitorEvent::HTLCEvent(upd) if upd.payment_preimage.is_none()),
 		)
 	}
 
@@ -2433,31 +2384,16 @@ impl<Signer: EcdsaChannelSigner> ChannelMonitor<Signer> {
 		self.inner.lock().unwrap().get_min_seen_secret()
 	}
 
-	pub(crate) fn get_splice_conflict_records(&self) -> Vec<crate::ln::splice_conflict::SpliceConflictRecord> {
-		self.inner.lock().unwrap().retired_funding.iter().map(|archive| archive.record.clone()).collect()
-	}
-
-	pub(crate) fn get_ffor_journal(&self) -> Option<crate::ln::ffor_monitor::FforJournal> {
-		self.inner.lock().unwrap().ffor_journal.clone()
-	}
-
-	/// Recover native voucher fulfills after a lost final-revocation completion.
-	/// A closed monitor waits for its typed chain proof instead of using this path.
-	pub(crate) fn get_ffor_redeemed_slots(&self) -> Vec<([u8; 32], u16)> {
-		let inner = self.inner.lock().unwrap();
-		if inner.lockdown_from_offchain || inner.no_further_updates_allowed() { return Vec::new(); }
-		let journal = match &inner.ffor_journal { Some(journal) => journal, None => return Vec::new() };
-		journal.epoch.slots.iter().filter_map(|slot| {
-			let source = SentHTLCId::FforVoucher { channel_id: inner.channel_id,
-				epoch_id: journal.epoch.epoch_id, slot: slot.entry.slot };
-			let fully_removed = inner.funding.current_counterparty_commitment_txid.and_then(|txid|
-				inner.funding.counterparty_claimable_outpoints.get(&txid)).is_some_and(|outputs|
-					!outputs.iter().any(|(htlc, _)| htlc.payment_hash.0 == slot.entry.payment_hash))
-				&& !inner.funding.current_holder_commitment_tx.nondust_htlcs().iter().any(|htlc| htlc.payment_hash.0 == slot.entry.payment_hash)
-				&& inner.commitment_secrets.get_min_seen_secret() == inner.current_counterparty_commitment_number + 1;
-			(fully_removed && inner.counterparty_fulfilled_htlcs.get(&source).map(|preimage| preimage.0) == Some(slot.preimage))
-				.then_some((journal.epoch.epoch_id, slot.entry.slot))
-		}).collect()
+	pub(crate) fn get_splice_conflict_records(
+		&self,
+	) -> Vec<crate::ln::splice_conflict::SpliceConflictRecord> {
+		self.inner
+			.lock()
+			.unwrap()
+			.retired_funding
+			.iter()
+			.map(|archive| archive.record.clone())
+			.collect()
 	}
 
 	pub(crate) fn get_cur_counterparty_commitment_number(&self) -> u64 {
@@ -2671,17 +2607,6 @@ impl<Signer: EcdsaChannelSigner> ChannelMonitor<Signer> {
 		)
 	}
 
-	#[cfg(test)]
-	pub(crate) fn ffor_test_holder_htlc_transactions(&self) -> Vec<Transaction> {
-		let mut inner = self.inner.lock().unwrap();
-		let txid = inner.funding.current_holder_commitment_tx.trust().txid();
-		let descriptors = inner.get_broadcasted_holder_htlc_descriptors(&inner.funding, &inner.funding.current_holder_commitment_tx);
-		descriptors.into_iter().map(|descriptor| {
-			let outpoint = bitcoin::OutPoint { txid, vout: descriptor.htlc.transaction_output_index.unwrap() };
-			HolderHTLCOutput::build(descriptor, 0).get_maybe_signed_htlc_tx(&mut inner.onchain_tx_handler, &outpoint).unwrap().0
-		}).collect()
-	}
-
 	/// Returns the set of txids that should be monitored for re-organization out of the chain.
 	#[rustfmt::skip]
 	pub fn get_relevant_txids(&self) -> Vec<(Txid, u32, Option<BlockHash>)> {
@@ -2810,10 +2735,8 @@ impl<Signer: EcdsaChannelSigner> ChannelMonitor<Signer> {
 	/// resulting in spuriously empty balance sets.
 	#[rustfmt::skip]
 	pub fn check_and_update_full_resolution_status<L: Logger>(&self, logger: &L) -> (bool, bool) {
-		// Custody and receipt replay remain recoverable after all Bitcoin outputs resolve.
-		// Automatic balance-based archival cannot discard a reserved voucher journal.
 		{ let inner = self.inner.lock().unwrap();
-			if inner.ffor_journal.is_some() || !inner.retired_funding.is_empty() { return (false, false); }
+			if !inner.retired_funding.is_empty() { return (false, false); }
 		}
 		let mut is_all_funds_claimed = self.get_claimable_balances().is_empty();
 		let current_height = self.current_best_block().height;
@@ -3042,7 +2965,7 @@ impl<Signer: EcdsaChannelSigner> ChannelMonitorImpl<Signer> {
 				let outbound_payment = match source {
 					None => panic!("Outbound HTLCs should have a source"),
 					Some(&HTLCSource::PreviousHopData(_)) => false,
-					Some(&HTLCSource::OutboundRoute { .. }) | Some(&HTLCSource::FforVoucher { .. }) => true,
+					Some(&HTLCSource::OutboundRoute { .. }) => true,
 				};
 				return Some(Balance::MaybeTimeoutClaimableHTLC {
 					amount_satoshis: htlc.amount_msat / 1000,
@@ -3254,7 +3177,7 @@ impl<Signer: EcdsaChannelSigner> ChannelMonitor<Signer> {
 					let outbound_payment = match source {
 						None => panic!("Outbound HTLCs should have a source"),
 						Some(HTLCSource::PreviousHopData(_)) => false,
-						Some(HTLCSource::OutboundRoute { .. }) | Some(HTLCSource::FforVoucher { .. }) => true,
+						Some(HTLCSource::OutboundRoute { .. }) => true,
 					};
 					if outbound_payment {
 						outbound_payment_htlc_rounded_msat += rounded_value_msat;
@@ -3370,7 +3293,8 @@ impl<Signer: EcdsaChannelSigner> ChannelMonitor<Signer> {
 		// remain attributable to the original branch. Retain those exact sources
 		// through manager restart until their outcome is durably acknowledged.
 		for funding in core::iter::once(&us.funding)
-			.chain(us.retired_funding_recovery.iter().map(|saved| &saved.funding)) {
+			.chain(us.retired_funding_recovery.iter().map(|saved| &saved.funding))
+		{
 			if let Some(ref txid) = funding.current_counterparty_commitment_txid {
 				walk_counterparty_commitment(funding, txid);
 			}
@@ -3390,13 +3314,24 @@ impl<Signer: EcdsaChannelSigner> ChannelMonitor<Signer> {
 		// An original-branch HTLC with no enforceable output on the retired branch
 		// fails when that funding spend matures, even before a commitment confirms.
 		if let Some(recovery) = &us.retired_funding_recovery {
-			if recovery.confirmation_height.checked_add(ANTI_REORG_DELAY - 1)
-				.is_some_and(|height| height <= us.best_block.height) {
-				if let Some(archived) = us.retired_funding.iter()
-					.find(|saved| saved.record.splice_txid == recovery.retired_txid) {
-					for (source, htlc) in ChannelMonitorImpl::<Signer>::absent_retired_branch_htlcs(&recovery.funding, archived) {
+			if recovery
+				.confirmation_height
+				.checked_add(ANTI_REORG_DELAY - 1)
+				.is_some_and(|height| height <= us.best_block.height)
+			{
+				if let Some(archived) = us
+					.retired_funding
+					.iter()
+					.find(|saved| saved.record.splice_txid == recovery.retired_txid)
+				{
+					for (source, htlc) in ChannelMonitorImpl::<Signer>::absent_retired_branch_htlcs(
+						&recovery.funding,
+						archived,
+					) {
 						let id = SentHTLCId::from_source(&source);
-						if !us.htlcs_resolved_to_user.contains(&id) && !us.counterparty_fulfilled_htlcs.contains_key(&id) {
+						if !us.htlcs_resolved_to_user.contains(&id)
+							&& !us.counterparty_fulfilled_htlcs.contains_key(&id)
+						{
 							res.insert(source, htlc.payment_hash);
 						}
 					}
@@ -3441,7 +3376,9 @@ impl<Signer: EcdsaChannelSigner> ChannelMonitor<Signer> {
 						};
 						let htlc_id = SentHTLCId::from_source(source);
 						if us.htlcs_resolved_to_user.contains(&htlc_id)
-							|| us.retired_funding_recovery.is_some() && us.counterparty_fulfilled_htlcs.contains_key(&htlc_id) {
+							|| us.retired_funding_recovery.is_some()
+								&& us.counterparty_fulfilled_htlcs.contains_key(&htlc_id)
+						{
 							continue;
 						}
 
@@ -3477,7 +3414,8 @@ impl<Signer: EcdsaChannelSigner> ChannelMonitor<Signer> {
 				// We walk the set of HTLCs in the unrevoked counterparty commitment transactions (see
 				// `fail_unbroadcast_htlcs` for a description of why).
 				for funding in core::iter::once(&us.funding)
-					.chain(us.retired_funding_recovery.iter().map(|saved| &saved.funding)) {
+					.chain(us.retired_funding_recovery.iter().map(|saved| &saved.funding))
+				{
 					if let Some(ref txid) = funding.current_counterparty_commitment_txid {
 						let htlcs = funding.counterparty_claimable_outpoints.get(txid);
 						walk_candidate_htlcs(htlcs.expect("Missing tx info for latest tx"));
@@ -3691,12 +3629,7 @@ impl<Signer: EcdsaChannelSigner> ChannelMonitorImpl<Signer> {
 								if !cur_claimables.iter()
 									.any(|(_, cur_source_opt)| cur_source_opt == source_opt)
 								{
-									// Voucher redemption is journaled after this revocation persists.
-									// Keep its bounded native proof across that completion boundary.
-									let reserved = matches!(&**source, HTLCSource::FforVoucher { channel_id, epoch_id, slot }
-										if *channel_id == self.channel_id && self.ffor_journal.as_ref().is_some_and(|journal|
-											journal.epoch.epoch_id == *epoch_id && journal.epoch.slots.iter().any(|saved| saved.entry.slot == *slot)));
-									if !reserved { self.counterparty_fulfilled_htlcs.remove(&SentHTLCId::from_source(source)); }
+									self.counterparty_fulfilled_htlcs.remove(&SentHTLCId::from_source(source));
 								}
 							}
 						}
@@ -4403,7 +4336,10 @@ impl<Signer: EcdsaChannelSigner> ChannelMonitorImpl<Signer> {
 		// The swap above places the previous `FundingScope` into `pending_funding`.
 		for funding in self.pending_funding.drain(..) {
 			let funding_txid = funding.funding_txid();
-			if !self.retired_funding.iter().any(|saved| saved.record.splice_txid == funding_txid || saved.parent_outpoint.txid == funding_txid) {
+			if !self.retired_funding.iter().any(|saved| {
+				saved.record.splice_txid == funding_txid
+					|| saved.parent_outpoint.txid == funding_txid
+			}) {
 				self.outputs_to_watch.remove(&funding_txid);
 			}
 			if no_further_updates_allowed && funding_txid != prev_funding_txid {
@@ -4455,7 +4391,6 @@ impl<Signer: EcdsaChannelSigner> ChannelMonitorImpl<Signer> {
 		if updates.update_id == LEGACY_CLOSED_CHANNEL_UPDATE_ID || self.lockdown_from_offchain {
 			assert_eq!(updates.updates.len(), 1);
 			match updates.updates[0] {
-				ChannelMonitorUpdateStep::FforJournal { .. } => {},
 				ChannelMonitorUpdateStep::ReleasePaymentComplete { .. } => {},
 				ChannelMonitorUpdateStep::ChannelForceClosed { .. } => {},
 				// We should have already seen a `ChannelForceClosed` update if we're trying to
@@ -4480,12 +4415,6 @@ impl<Signer: EcdsaChannelSigner> ChannelMonitorImpl<Signer> {
 				ChannelMonitorUpdateStep::RetireConflictedFunding { record, candidate_transaction, conflict_transaction } => {
 					if self.retire_conflicted_funding(record, candidate_transaction, conflict_transaction).is_err() {
 						log_error!(logger, "Refusing invalid splice conflict retirement");
-						ret = Err(());
-					}
-				},
-				ChannelMonitorUpdateStep::FforJournal { journal } => {
-					if self.apply_ffor_journal(journal).is_err() {
-						log_error!(logger, "Refusing invalid FFOR custody transition");
 						ret = Err(());
 					}
 				},
@@ -4598,15 +4527,6 @@ impl<Signer: EcdsaChannelSigner> ChannelMonitorImpl<Signer> {
 					}
 				},
 				ChannelMonitorUpdateStep::ReleasePaymentComplete { htlc } => {
-					if let SentHTLCId::FforVoucher { channel_id, epoch_id, slot } = htlc {
-						if *channel_id != self.channel_id || !self.ffor_journal.as_ref().is_some_and(|journal|
-							journal.epoch.epoch_id == *epoch_id && journal.epoch.slots.iter().any(|saved|
-								saved.entry.slot == *slot && saved.chain_removal.is_some())) {
-							log_error!(logger, "Refusing reserved voucher release before durable chain custody");
-							ret = Err(());
-							continue;
-						}
-					}
 					log_trace!(logger, "HTLC {htlc:?} permanently and fully resolved");
 					self.htlcs_resolved_to_user.insert(*htlc);
 				},
@@ -4640,7 +4560,6 @@ impl<Signer: EcdsaChannelSigner> ChannelMonitorImpl<Signer> {
 				// being told that the channel is closed, or being told a payment which was
 				// resolved on-chain has had its resolution communicated to the user. All other
 				// updates are generated while talking to our peer.
-				ChannelMonitorUpdateStep::FforJournal { .. } => {},
 				ChannelMonitorUpdateStep::PaymentPreimage { .. } => {},
 				ChannelMonitorUpdateStep::ChannelForceClosed { .. } => {},
 				ChannelMonitorUpdateStep::ReleasePaymentComplete { .. } => {},
@@ -4705,13 +4624,10 @@ impl<Signer: EcdsaChannelSigner> ChannelMonitorImpl<Signer> {
 			// unrevoked ones.
 			debug_assert!(!holder_commitment_htlcs!(self, CURRENT_WITH_SOURCES)
 				.any(|(_, s)| s == Some(source)));
-			let duplicate_event =
-				self.pending_monitor_events.iter().any(
-					|event| match event {
-						MonitorEvent::HTLCEvent(upd) => upd.source == *source,
-						_ => false,
-					},
-				);
+			let duplicate_event = self.pending_monitor_events.iter().any(|event| match event {
+				MonitorEvent::HTLCEvent(upd) => upd.source == *source,
+				_ => false,
+			});
 			if duplicate_event {
 				continue;
 			}
@@ -4767,17 +4683,6 @@ impl<Signer: EcdsaChannelSigner> ChannelMonitorImpl<Signer> {
 	fn get_and_clear_pending_monitor_events_filtered<F: FnMut(&MonitorEvent) -> bool>(
 		&mut self, mut predicate: F,
 	) -> Vec<MonitorEvent> {
-		if let Some(proofs) = &self.ffor_chain_resolutions {
-			for (slot, proof) in &proofs.entries {
-				let source = SentHTLCId::FforVoucher { channel_id: self.channel_id, epoch_id: proofs.epoch_id, slot: *slot };
-				if !self.htlcs_resolved_to_user.contains(&source) && !self.pending_monitor_events.iter().any(|event|
-					matches!(event, MonitorEvent::FforVoucherResolved { epoch_id, slot: id, .. } if *epoch_id == proofs.epoch_id && id == slot)) {
-					self.pending_monitor_events.push(MonitorEvent::FforVoucherResolved { epoch_id: proofs.epoch_id,
-						slot: *slot, commitment_txid: Txid::from_byte_array(proof.commitment_txid),
-						output_index: proof.output_index, resolving_txid: Txid::from_byte_array(proof.resolving_txid), fulfilled: proof.fulfilled });
-				}
-			}
-		}
 		let mut released = Vec::new();
 		let mut retained = Vec::new();
 		// Note: we can use Vec::extract_if here once MSRV reaches 1.87
@@ -4990,94 +4895,64 @@ impl<Signer: EcdsaChannelSigner> ChannelMonitorImpl<Signer> {
 		self.commitment_secrets.get_min_seen_secret()
 	}
 
-	/// Resolve only an exact native HTLC source from a known commitment output.
-	fn ffor_source_at_output(&self, txid: Txid, index: u32) -> Option<HTLCSource> {
-		let funding = get_confirmed_funding_scope!(self);
-		if let Some(outputs) = funding.counterparty_claimable_outpoints.get(&txid) {
-			if let Some(source) = outputs.iter().find_map(|(htlc, source)|
-				(htlc.transaction_output_index == Some(index)).then(|| source.as_deref()).flatten()) {
-				return Some(source.clone());
-			}
-		}
-		if funding.current_holder_commitment_tx.trust().txid() == txid {
-			return holder_commitment_htlcs!(self, CURRENT_WITH_SOURCES).find_map(|(htlc, source)|
-				(htlc.transaction_output_index == Some(index)).then(|| source.cloned()).flatten());
-		}
-		if funding.prev_holder_commitment_tx.as_ref().is_some_and(|tx| tx.trust().txid() == txid) {
-			return holder_commitment_htlcs!(self, PREV_WITH_SOURCES).unwrap().find_map(|(htlc, source)|
-				(htlc.transaction_output_index == Some(index)).then(|| source.cloned()).flatten());
-		}
-		None
-	}
-
-	/// Called exclusively for native onchain events which reached their anti-reorg
-	/// threshold. Neither the peer nor ChannelManager can insert a proof here.
-	fn record_ffor_chain_resolution(&mut self, entry: &OnchainEventEntry) {
-		use crate::ln::ffor::ChainRemoval;
-		let journal = match &self.ffor_journal { Some(journal) => journal, None => return };
-		let (source, commitment_txid, output_index, preimage) = match &entry.event {
-			OnchainEvent::HTLCUpdate { source, commitment_tx_output_idx: None, .. } =>
-				(source.clone(), entry.txid, None, None),
-			OnchainEvent::HTLCUpdate { source, commitment_tx_output_idx: Some(index), .. } => {
-				let transaction = match &entry.transaction { Some(tx) => tx, None => return };
-				let input = match transaction.input.iter().find(|input|
-					input.previous_output.vout == *index && self.ffor_source_at_output(input.previous_output.txid, *index).as_ref() == Some(source)) {
-					Some(input) => input, None => return,
-				};
-				(source.clone(), input.previous_output.txid, Some(*index), None)
-			},
-			OnchainEvent::HTLCSpendConfirmation { commitment_tx_output_idx, preimage, .. } => {
-				let transaction = match &entry.transaction { Some(tx) => tx, None => return };
-				let matched = transaction.input.iter().filter(|input| input.previous_output.vout == *commitment_tx_output_idx)
-					.find_map(|input| self.ffor_source_at_output(input.previous_output.txid, *commitment_tx_output_idx)
-						.map(|source| (source, input.previous_output.txid)));
-				let (source, txid) = match matched { Some(value) => value, None => return };
-				(source, txid, Some(*commitment_tx_output_idx), *preimage)
-			},
-			_ => return,
-		};
-		let (channel_id, epoch_id, slot_id) = match source {
-			HTLCSource::FforVoucher { channel_id, epoch_id, slot } => (channel_id, epoch_id, slot),
-			_ => return,
-		};
-		if channel_id != self.channel_id || epoch_id != journal.epoch.epoch_id { return; }
-		let slot = match journal.epoch.slots.iter().find(|slot| slot.entry.slot == slot_id) { Some(slot) => slot, None => return };
-		if let Some(preimage) = preimage {
-			if preimage.0 != slot.preimage || self.counterparty_fulfilled_htlcs.get(&SentHTLCId::FforVoucher {
-				channel_id, epoch_id, slot: slot_id }) != Some(&preimage) { return; }
-		}
-		let proof = ChainRemoval { commitment_txid: commitment_txid.to_byte_array(), output_index,
-			resolving_txid: entry.txid.to_byte_array(), fulfilled: preimage.is_some() };
-		let proofs = self.ffor_chain_resolutions.get_or_insert_with(||
-			crate::ln::ffor_monitor::FforChainResolutions { epoch_id, entries: Vec::new() });
-		if proofs.epoch_id != epoch_id || proofs.entries.iter().any(|(id, _)| *id == slot_id)
-			|| proofs.entries.len() >= crate::ln::ffor::MAX_SLOTS { return; }
-		proofs.entries.push((slot_id, proof));
-	}
-
 	/// Compare exact native sources, including both unrevoked remote views. A
 	/// later part sharing a payment hash with an old part is still a new source.
-	fn absent_retired_branch_htlcs(funding: &FundingScope, saved: &RetiredFunding) -> HashMap<HTLCSource, HTLCOutputInCommitment> {
+	fn absent_retired_branch_htlcs(
+		funding: &FundingScope, saved: &RetiredFunding,
+	) -> HashMap<HTLCSource, HTLCOutputInCommitment> {
 		let mut present = new_hash_set();
-		for (htlc, source) in holder_commitment_htlcs!(&saved.funding.current_holder_commitment_tx, &saved.current_holder_htlc_data) {
-			if htlc.transaction_output_index.is_some() { if let Some(source) = source { present.insert(source.clone()); } }
-		}
-		if let (Some(tx), Some(data)) = (&saved.funding.prev_holder_commitment_tx, &saved.prev_holder_htlc_data) {
-			for (htlc, source) in holder_commitment_htlcs!(tx, data) {
-				if htlc.transaction_output_index.is_some() { if let Some(source) = source { present.insert(source.clone()); } }
+		for (htlc, source) in holder_commitment_htlcs!(
+			&saved.funding.current_holder_commitment_tx,
+			&saved.current_holder_htlc_data
+		) {
+			if htlc.transaction_output_index.is_some() {
+				if let Some(source) = source {
+					present.insert(source.clone());
+				}
 			}
 		}
-		for txid in [saved.funding.current_counterparty_commitment_txid, saved.funding.prev_counterparty_commitment_txid].iter().flatten() {
+		if let (Some(tx), Some(data)) =
+			(&saved.funding.prev_holder_commitment_tx, &saved.prev_holder_htlc_data)
+		{
+			for (htlc, source) in holder_commitment_htlcs!(tx, data) {
+				if htlc.transaction_output_index.is_some() {
+					if let Some(source) = source {
+						present.insert(source.clone());
+					}
+				}
+			}
+		}
+		for txid in [
+			saved.funding.current_counterparty_commitment_txid,
+			saved.funding.prev_counterparty_commitment_txid,
+		]
+		.iter()
+		.flatten()
+		{
 			if let Some(outputs) = saved.funding.counterparty_claimable_outpoints.get(txid) {
 				for (htlc, source) in outputs {
-					if htlc.transaction_output_index.is_some() { if let Some(source) = source { present.insert((**source).clone()); } }
+					if htlc.transaction_output_index.is_some() {
+						if let Some(source) = source {
+							present.insert((**source).clone());
+						}
+					}
 				}
 			}
 		}
 		let mut outstanding = new_hash_map();
-		for txid in [funding.current_counterparty_commitment_txid, funding.prev_counterparty_commitment_txid].iter().flatten() {
+		for txid in [
+			funding.current_counterparty_commitment_txid,
+			funding.prev_counterparty_commitment_txid,
+		]
+		.iter()
+		.flatten()
+		{
 			if let Some(outputs) = funding.counterparty_claimable_outpoints.get(txid) {
-				for (htlc, source) in outputs { if let Some(source) = source { outstanding.insert((**source).clone(), htlc.clone()); } }
+				for (htlc, source) in outputs {
+					if let Some(source) = source {
+						outstanding.insert((**source).clone(), htlc.clone());
+					}
+				}
 			}
 		}
 		outstanding.retain(|source, _| !present.contains(source));
@@ -5085,24 +4960,47 @@ impl<Signer: EcdsaChannelSigner> ChannelMonitorImpl<Signer> {
 	}
 
 	fn activate_retired_funding(&mut self, txid: Txid, height: u32, block_hash: BlockHash) {
-		if self.retired_funding_recovery.is_some() { self.restore_retired_funding_branch(); }
-		let saved = self.retired_funding.iter().find(|saved| saved.record.splice_txid == txid).expect("Known retired branch").clone();
-		let recovery = RetiredFundingRecovery { retired_txid: txid, confirmation_height: height,
-			confirmation_hash: block_hash, funding: self.funding.clone(), pending_funding: self.pending_funding.clone(),
-			current_holder_htlc_data: self.current_holder_htlc_data.clone(), prev_holder_htlc_data: self.prev_holder_htlc_data.clone(),
+		if self.retired_funding_recovery.is_some() {
+			self.restore_retired_funding_branch();
+		}
+		let saved = self
+			.retired_funding
+			.iter()
+			.find(|saved| saved.record.splice_txid == txid)
+			.expect("Known retired branch")
+			.clone();
+		let recovery = RetiredFundingRecovery {
+			retired_txid: txid,
+			confirmation_height: height,
+			confirmation_hash: block_hash,
+			funding: self.funding.clone(),
+			pending_funding: self.pending_funding.clone(),
+			current_holder_htlc_data: self.current_holder_htlc_data.clone(),
+			prev_holder_htlc_data: self.prev_holder_htlc_data.clone(),
 			current_holder_commitment_number: self.current_holder_commitment_number,
 			current_counterparty_commitment_number: self.current_counterparty_commitment_number,
-			their_cur_per_commitment_points: self.their_cur_per_commitment_points };
+			their_cur_per_commitment_points: self.their_cur_per_commitment_points,
+		};
 		// Later HTLCs never had an enforceable output on this signed old branch.
 		// Resolve their upstream sources only after this funding spend reaches the
 		// native anti-reorg threshold, retaining every preimage already learned.
 		for (source, htlc) in Self::absent_retired_branch_htlcs(&self.funding, &saved) {
 			let sent_id = SentHTLCId::from_source(&source);
 			if !self.counterparty_fulfilled_htlcs.contains_key(&sent_id)
-				&& !self.htlcs_resolved_to_user.contains(&sent_id) {
-				self.onchain_events_awaiting_threshold_conf.push(OnchainEventEntry { txid, height, block_hash: Some(block_hash),
-					transaction: Some(saved.candidate_transaction.clone()), event: OnchainEvent::HTLCUpdate { source,
-						payment_hash: htlc.payment_hash, htlc_value_satoshis: Some(htlc.amount_msat / 1000), commitment_tx_output_idx: None } });
+				&& !self.htlcs_resolved_to_user.contains(&sent_id)
+			{
+				self.onchain_events_awaiting_threshold_conf.push(OnchainEventEntry {
+					txid,
+					height,
+					block_hash: Some(block_hash),
+					transaction: Some(saved.candidate_transaction.clone()),
+					event: OnchainEvent::HTLCUpdate {
+						source,
+						payment_hash: htlc.payment_hash,
+						htlc_value_satoshis: Some(htlc.amount_msat / 1000),
+						commitment_tx_output_idx: None,
+					},
+				});
 			}
 		}
 		self.retired_funding_recovery = Some(recovery);
@@ -5118,14 +5016,23 @@ impl<Signer: EcdsaChannelSigner> ChannelMonitorImpl<Signer> {
 		self.funding_spend_seen = false;
 		self.lockdown_from_offchain = true;
 		self.funding_seen_onchain = true;
-		self.onchain_tx_handler.update_after_renegotiated_funding_locked(self.funding.channel_parameters.clone(),
-			self.funding.current_holder_commitment_tx.clone(), self.funding.prev_holder_commitment_tx.clone());
-		self.pending_monitor_events.push(MonitorEvent::HolderForceClosedWithInfo { reason: ClosureReason::CommitmentTxConfirmed,
-			outpoint: self.funding.funding_outpoint(), channel_id: self.channel_id });
+		self.onchain_tx_handler.update_after_renegotiated_funding_locked(
+			self.funding.channel_parameters.clone(),
+			self.funding.current_holder_commitment_tx.clone(),
+			self.funding.prev_holder_commitment_tx.clone(),
+		);
+		self.pending_monitor_events.push(MonitorEvent::HolderForceClosedWithInfo {
+			reason: ClosureReason::CommitmentTxConfirmed,
+			outpoint: self.funding.funding_outpoint(),
+			channel_id: self.channel_id,
+		});
 	}
 
 	fn restore_retired_funding_branch(&mut self) {
-		let saved = match self.retired_funding_recovery.take() { Some(saved) => saved, None => return };
+		let saved = match self.retired_funding_recovery.take() {
+			Some(saved) => saved,
+			None => return,
+		};
 		self.funding = saved.funding;
 		self.pending_funding = saved.pending_funding;
 		self.current_holder_htlc_data = saved.current_holder_htlc_data;
@@ -5137,134 +5044,63 @@ impl<Signer: EcdsaChannelSigner> ChannelMonitorImpl<Signer> {
 		self.funding_spend_confirmed = None;
 		self.funding_spend_seen = false;
 		self.lockdown_from_offchain = true;
-		self.onchain_tx_handler.update_after_renegotiated_funding_locked(self.funding.channel_parameters.clone(),
-			self.funding.current_holder_commitment_tx.clone(), self.funding.prev_holder_commitment_tx.clone());
+		self.onchain_tx_handler.update_after_renegotiated_funding_locked(
+			self.funding.channel_parameters.clone(),
+			self.funding.current_holder_commitment_tx.clone(),
+			self.funding.prev_holder_commitment_tx.clone(),
+		);
 	}
 
-	fn retire_conflicted_funding(&mut self, record: &crate::ln::splice_conflict::SpliceConflictRecord,
-		candidate_transaction: &Transaction, conflict_transaction: &Transaction) -> Result<(), ()> {
-		if self.no_further_updates_allowed() || self.alternative_funding_confirmed.is_some()
-			|| record.channel_id != self.channel_id || record.counterparty_node_id != self.counterparty_node_id
+	fn retire_conflicted_funding(
+		&mut self, record: &crate::ln::splice_conflict::SpliceConflictRecord,
+		candidate_transaction: &Transaction, conflict_transaction: &Transaction,
+	) -> Result<(), ()> {
+		if self.no_further_updates_allowed()
+			|| self.alternative_funding_confirmed.is_some()
+			|| record.channel_id != self.channel_id
+			|| record.counterparty_node_id != self.counterparty_node_id
 			|| record.update_id != self.latest_update_id + 1
 			|| self.retired_funding.len() >= crate::ln::splice_conflict::MAX_RETIRED_SPLICES
 			|| self.retired_funding.iter().any(|old| old.record.splice_txid == record.splice_txid)
-			|| self.pending_funding.len() != 1 { return Err(()); }
-		record.validate(candidate_transaction, conflict_transaction, self.funding.funding_outpoint().into_bitcoin_outpoint())?;
+			|| self.pending_funding.len() != 1
+		{
+			return Err(());
+		}
+		record.validate(
+			candidate_transaction,
+			conflict_transaction,
+			self.funding.funding_outpoint().into_bitcoin_outpoint(),
+		)?;
 		let candidate = &self.pending_funding[0];
 		if candidate.funding_txid() != record.splice_txid
-			|| candidate_transaction.output.get(candidate.funding_outpoint().index as usize)
+			|| candidate_transaction
+				.output
+				.get(candidate.funding_outpoint().index as usize)
 				.map(|output| (&output.script_pubkey, output.value.to_sat()))
-				!= Some((&candidate.channel_parameters.make_funding_redeemscript().to_p2wsh(), candidate.channel_parameters.channel_value_satoshis)) {
+				!= Some((
+					&candidate.channel_parameters.make_funding_redeemscript().to_p2wsh(),
+					candidate.channel_parameters.channel_value_satoshis,
+				)) {
 			return Err(());
 		}
 		let funding = self.pending_funding.remove(0);
-		let prev_holder_htlc_data = if funding.prev_holder_commitment_tx.is_some() { self.prev_holder_htlc_data.clone() } else { None };
-		self.retired_funding.push(RetiredFunding { record: record.clone(), candidate_transaction: candidate_transaction.clone(),
-			parent_outpoint: self.funding.funding_outpoint(), parent_script: self.funding.channel_parameters.make_funding_redeemscript().to_p2wsh(),
-			funding, current_holder_htlc_data: self.current_holder_htlc_data.clone(), prev_holder_htlc_data,
+		let prev_holder_htlc_data = if funding.prev_holder_commitment_tx.is_some() {
+			self.prev_holder_htlc_data.clone()
+		} else {
+			None
+		};
+		self.retired_funding.push(RetiredFunding {
+			record: record.clone(),
+			candidate_transaction: candidate_transaction.clone(),
+			parent_outpoint: self.funding.funding_outpoint(),
+			parent_script: self.funding.channel_parameters.make_funding_redeemscript().to_p2wsh(),
+			funding,
+			current_holder_htlc_data: self.current_holder_htlc_data.clone(),
+			prev_holder_htlc_data,
 			current_holder_commitment_number: self.current_holder_commitment_number,
 			current_counterparty_commitment_number: self.current_counterparty_commitment_number,
-			their_cur_per_commitment_points: self.their_cur_per_commitment_points });
-		Ok(())
-	}
-
-	fn apply_ffor_journal(&mut self, journal: &crate::ln::ffor_monitor::FforJournal) -> Result<(), ()> {
-		use crate::ln::ffor::{Phase, SlotState};
-		journal.validate_transition(self.ffor_journal.as_ref()).map_err(|_| ())?;
-		if self.ffor_journal.as_ref().map_or(true, |old| old.epoch.epoch_id != journal.epoch.epoch_id) && (!self.pending_funding.is_empty()
-			|| !self.funding.channel_type_features().supports_anchors_zero_fee_htlc_tx()
-			|| !self.funding.current_holder_commitment_tx.nondust_htlcs().is_empty()
-			|| !self.current_holder_htlc_data.dust_htlcs.is_empty()
-			|| self.funding.current_counterparty_commitment_txid.and_then(|txid|
-				self.funding.counterparty_claimable_outpoints.get(&txid)).map_or(true, |outputs| !outputs.is_empty())) {
-			return Err(());
-		}
-		if journal.epoch.channel_id != self.channel_id.0
-			|| journal.epoch.remote_node != self.counterparty_node_id { return Err(()); }
-		if self.lockdown_from_offchain || self.no_further_updates_allowed() {
-			let old = self.ffor_journal.as_ref().ok_or(())?;
-			if old.epoch.epoch_id != journal.epoch.epoch_id
-				|| (old.epoch.phase != journal.epoch.phase
-					&& !(matches!(old.epoch.phase, Phase::Negotiating | Phase::VouchersCommitted)
-						&& journal.epoch.phase == Phase::Aborted)
-					&& !(old.epoch.phase == Phase::Draining && journal.epoch.phase == Phase::Closed))
-				|| old.epoch.slots.iter().zip(&journal.epoch.slots).any(|(old, next)|
-					old.state == SlotState::Unused && next.state != SlotState::Unused) { return Err(()); }
-		}
-		let must_check_snapshot = self.ffor_journal.as_ref().map_or(true, |old|
-			old.activation_snapshot.is_none() || old.epoch.phase != Phase::Active && journal.epoch.phase == Phase::Active);
-		if let Some(snapshot) = &journal.activation_snapshot {
-			if must_check_snapshot { self.validate_ffor_snapshot(snapshot, journal)?; }
-		}
-		if let Some(old) = &self.ffor_journal {
-			if old.epoch.epoch_id == journal.epoch.epoch_id {
-				for (before, after) in old.epoch.slots.iter().zip(&journal.epoch.slots) {
-					if let Some(proof) = &after.chain_removal {
-						if !self.ffor_chain_resolutions.as_ref().is_some_and(|proofs|
-							proofs.epoch_id == journal.epoch.epoch_id && proofs.entries.iter().any(|(id, saved)| *id == after.entry.slot && saved == proof)) {
-							return Err(());
-						}
-					}
-					if !before.redeemed && after.redeemed
-						&& self.counterparty_fulfilled_htlcs.get(&SentHTLCId::FforVoucher {
-							channel_id: self.channel_id, epoch_id: journal.epoch.epoch_id, slot: after.entry.slot,
-						}).map(|preimage| preimage.0) != Some(after.preimage) {
-						return Err(());
-					}
-					if before.removal.is_none() {
-						if let Some(removal) = &after.removal {
-							let remote_txid = self.funding.current_counterparty_commitment_txid.ok_or(())?;
-							let remote = self.funding.counterparty_claimable_outpoints.get(&remote_txid).ok_or(())?;
-							if self.funding.current_holder_commitment_tx.nondust_htlcs().iter().any(|h| h.payment_hash.0 == after.entry.payment_hash)
-								|| remote.iter().any(|(h, _)| h.payment_hash.0 == after.entry.payment_hash)
-								|| INITIAL_COMMITMENT_NUMBER.checked_sub(self.current_holder_commitment_number) != Some(removal.local_commitment)
-								|| INITIAL_COMMITMENT_NUMBER.checked_sub(self.current_counterparty_commitment_number) != Some(removal.remote_commitment)
-								|| self.commitment_secrets.get_min_seen_secret() != self.current_counterparty_commitment_number + 1 {
-								return Err(());
-							}
-						}
-					}
-				}
-			}
-		}
-		if self.ffor_journal.as_ref().is_some_and(|old| old.epoch.epoch_id != journal.epoch.epoch_id) {
-			self.ffor_chain_resolutions = None;
-			self.counterparty_fulfilled_htlcs.retain(|source, _| !matches!(source, SentHTLCId::FforVoucher { .. }));
-		}
-		self.ffor_journal = Some(journal.clone());
-		Ok(())
-	}
-
-	fn validate_ffor_snapshot(&self, snapshot: &crate::ln::ffor_monitor::CommitmentSnapshot,
-		journal: &crate::ln::ffor_monitor::FforJournal) -> Result<(), ()> {
-		if !self.pending_funding.is_empty() || snapshot.funding_txo != self.funding.funding_outpoint()
-			|| snapshot.settler_txid != self.funding.current_holder_commitment_tx.trust().txid()
-			|| Some(snapshot.receiver_txid) != self.funding.current_counterparty_commitment_txid
-			|| INITIAL_COMMITMENT_NUMBER.checked_sub(self.current_holder_commitment_number) != Some(snapshot.settler_number)
-			|| INITIAL_COMMITMENT_NUMBER.checked_sub(self.current_counterparty_commitment_number) != Some(snapshot.receiver_number)
-			|| self.commitment_secrets.get_min_seen_secret() != self.current_counterparty_commitment_number + 1 {
-			return Err(());
-		}
-		let holder = self.funding.current_holder_commitment_tx.nondust_htlcs();
-		let remote = self.funding.counterparty_claimable_outpoints.get(&snapshot.receiver_txid).ok_or(())?;
-		if holder.len() != journal.epoch.slots.len() || remote.len() != holder.len()
-			|| !self.current_holder_htlc_data.dust_htlcs.is_empty() { return Err(()); }
-		for output in &snapshot.outputs {
-			let entry = &output.entry;
-			let matches = |htlc: &HTLCOutputInCommitment, offered: bool, index: u32|
-				htlc.offered == offered && htlc.payment_hash.0 == entry.payment_hash
-					&& htlc.amount_msat == entry.amount_msat && htlc.cltv_expiry == entry.expiry
-					&& htlc.transaction_output_index == Some(index);
-			if !holder.iter().any(|htlc| matches(htlc, true, output.settler_output_index))
-				|| !remote.iter().any(|(htlc, source)| matches(htlc, false, output.receiver_output_index)
-					&& source.as_deref() == Some(&HTLCSource::FforVoucher { channel_id: self.channel_id,
-						epoch_id: journal.epoch.epoch_id, slot: entry.slot })) {
-				return Err(());
-			}
-			let tx = self.funding.current_holder_commitment_tx.trust();
-			if tx.built_transaction().transaction.output.get(output.settler_output_index as usize)
-				.map(|out| out.value.to_sat()) != Some(entry.amount_msat / 1000) { return Err(()); }
-		}
+			their_cur_per_commitment_points: self.their_cur_per_commitment_points,
+		});
 		Ok(())
 	}
 
@@ -6310,7 +6146,6 @@ impl<Signer: EcdsaChannelSigner> ChannelMonitorImpl<Signer> {
 
 		// Produce actionable events from on-chain events having reached their threshold.
 		for entry in onchain_events_reaching_threshold_conf {
-			self.record_ffor_chain_resolution(&entry);
 			match entry.event {
 				OnchainEvent::HTLCUpdate { source, payment_hash, htlc_value_satoshis, commitment_tx_output_idx } => {
 					// Check for duplicate HTLC resolutions.
@@ -7275,8 +7110,6 @@ impl<'a, 'b, ES: EntropySource, SP: SignerProvider> ReadableArgs<(&'a ES, &'b SP
 		let mut alternative_funding_confirmed = None;
 		let mut is_manual_broadcast = RequiredWrapper(None);
 		let mut funding_seen_onchain = RequiredWrapper(None);
-		let mut ffor_journal: Option<crate::ln::ffor_monitor::FforJournal> = None;
-		let mut ffor_chain_resolutions: Option<crate::ln::ffor_monitor::FforChainResolutions> = None;
 		let mut retired_funding: Option<Vec<RetiredFunding>> = None;
 		let mut retired_funding_recovery: Option<RetiredFundingRecovery> = None;
 		read_tlv_fields!(reader, {
@@ -7301,8 +7134,6 @@ impl<'a, 'b, ES: EntropySource, SP: SignerProvider> ReadableArgs<(&'a ES, &'b SP
 			(34, alternative_funding_confirmed, option),
 			(35, is_manual_broadcast, (default_value, false)),
 			(37, funding_seen_onchain, (default_value, true)),
-			(38, ffor_journal, option),
-			(40, ffor_chain_resolutions, option),
 			(42, retired_funding, optional_vec),
 			(44, retired_funding_recovery, option),
 		});
@@ -7366,33 +7197,6 @@ impl<'a, 'b, ES: EntropySource, SP: SignerProvider> ReadableArgs<(&'a ES, &'b SP
 				return Err(DecodeError::InvalidValue);
 			}
 		}
-		if let Some(journal) = &ffor_journal {
-			if journal.epoch.channel_id != channel_id.0
-				|| Some(journal.epoch.remote_node) != counterparty_node_id
-				|| journal.activation_snapshot.as_ref().is_some_and(|snapshot|
-					Some(snapshot.funding_txo) != channel_parameters.funding_outpoint
-						&& !retired_funding_recovery.as_ref().is_some_and(|recovery|
-							Some(snapshot.funding_txo) == recovery.funding.channel_parameters.funding_outpoint)) {
-				return Err(DecodeError::InvalidValue);
-			}
-		}
-		if let Some(proofs) = &ffor_chain_resolutions {
-			let journal = ffor_journal.as_ref().ok_or(DecodeError::InvalidValue)?;
-			if proofs.epoch_id != journal.epoch.epoch_id || proofs.entries.iter().any(|(id, _)|
-				!journal.epoch.slots.iter().any(|slot| slot.entry.slot == *id)) {
-				return Err(DecodeError::InvalidValue);
-			}
-		}
-		if let Some(journal) = &ffor_journal {
-			for slot in &journal.epoch.slots {
-				if let Some(proof) = &slot.chain_removal {
-					if !ffor_chain_resolutions.as_ref().is_some_and(|proofs|
-						proofs.entries.iter().any(|(id, saved)| *id == slot.entry.slot && saved == proof)) {
-						return Err(DecodeError::InvalidValue);
-					}
-				}
-			}
-		}
 
 		if let Some(archive) = &retired_funding {
 			if archive.len() > crate::ln::splice_conflict::MAX_RETIRED_SPLICES
@@ -7404,8 +7208,6 @@ impl<'a, 'b, ES: EntropySource, SP: SignerProvider> ReadableArgs<(&'a ES, &'b SP
 				return Err(DecodeError::InvalidValue);
 			}
 		}
-
-
 
 		let (current_holder_commitment_tx, current_holder_htlc_data) = {
 			let holder_commitment_tx = onchain_tx_handler.current_holder_commitment_tx();
@@ -7503,8 +7305,6 @@ impl<'a, 'b, ES: EntropySource, SP: SignerProvider> ReadableArgs<(&'a ES, &'b SP
 			current_counterparty_commitment_number,
 			current_holder_commitment_number,
 
-			ffor_journal,
-			ffor_chain_resolutions,
 			retired_funding: retired_funding.unwrap_or_default(),
 			retired_funding_recovery,
 			payment_preimages,
@@ -7618,383 +7418,353 @@ mod tests {
 
 	use std::str::FromStr;
 
-	fn do_test_retired_splice_monitor_archive(advance_commitments: bool, activate_ffor: bool) {
+	fn do_test_retired_splice_monitor_archive(advance_commitments: bool) {
 		use crate::events::bump_transaction::sync::WalletSourceSync;
-		use crate::ln::msgs::{BaseMessageHandler, MessageSendEvent};
+		use crate::get_event_msg;
 		use crate::ln::funding::{FundingTxInput, SpliceContribution};
 		use crate::ln::msgs::{self, ChannelMessageHandler};
+		use crate::ln::msgs::{BaseMessageHandler, MessageSendEvent};
 		use crate::ln::splicing_tests::splice_channel;
-		use crate::get_event_msg;
 		let chanmon_cfgs = create_chanmon_cfgs(2);
 		let node_cfgs = create_node_cfgs(2, &chanmon_cfgs);
 		let mut config = test_default_anchors_channel_config();
 		config.channel_handshake_config.announce_for_forwarding = false;
-		let node_chanmgrs = create_node_chanmgrs(2, &node_cfgs, &[Some(config.clone()), Some(config)]);
-		if activate_ffor { for manager in &node_chanmgrs {
-			manager.set_ffor_policy(crate::ln::channelmanager::FforPolicy { enabled: true, ..Default::default() }).unwrap();
-		} }
+		let node_chanmgrs =
+			create_node_chanmgrs(2, &node_cfgs, &[Some(config.clone()), Some(config)]);
 		let nodes = create_network(2, &node_cfgs, &node_chanmgrs);
-		let original_transaction = create_chan_between_nodes_with_value_init(&nodes[0], &nodes[1], 100_000, 10_000_000);
-		for node in &nodes { confirm_transaction(node, &original_transaction); }
-		let id0 = nodes[0].node.get_our_node_id(); let id1 = nodes[1].node.get_our_node_id();
+		let original_transaction =
+			create_chan_between_nodes_with_value_init(&nodes[0], &nodes[1], 100_000, 10_000_000);
+		for node in &nodes {
+			confirm_transaction(node, &original_transaction);
+		}
+		let id0 = nodes[0].node.get_our_node_id();
+		let id1 = nodes[1].node.get_our_node_id();
 		let ready0 = get_event_msg!(nodes[0], MessageSendEvent::SendChannelReady, id1);
 		let ready1 = get_event_msg!(nodes[1], MessageSendEvent::SendChannelReady, id0);
-		nodes[0].node.handle_channel_ready(id1, &ready1); expect_channel_ready_event(&nodes[0], &id1);
-		nodes[1].node.handle_channel_ready(id0, &ready0); expect_channel_ready_event(&nodes[1], &id0);
+		nodes[0].node.handle_channel_ready(id1, &ready1);
+		expect_channel_ready_event(&nodes[0], &id1);
+		nodes[1].node.handle_channel_ready(id0, &ready0);
+		expect_channel_ready_event(&nodes[1], &id0);
 		let update0 = get_event_msg!(nodes[0], MessageSendEvent::SendChannelUpdate, id1);
 		let update1 = get_event_msg!(nodes[1], MessageSendEvent::SendChannelUpdate, id0);
-		nodes[0].node.handle_channel_update(id1, &update1); nodes[1].node.handle_channel_update(id0, &update0);
+		nodes[0].node.handle_channel_update(id1, &update1);
+		nodes[1].node.handle_channel_update(id0, &update0);
 		let channel = nodes[0].node.list_channels()[0].channel_id;
 		let original = nodes[0].node.list_channels()[0].funding_txo.unwrap();
 		let input_transaction = provide_anchor_utxo_reserves(&nodes, 1, Amount::from_sat(40_000));
-		let candidate = splice_channel(&nodes[1], &nodes[0], channel, SpliceContribution::SpliceIn {
-			value: Amount::from_sat(20_000), inputs: vec![FundingTxInput::new_p2wpkh(input_transaction.clone(), 1).unwrap()],
-			change_script: Some(nodes[1].wallet_source.get_change_script().unwrap()),
-		});
+		let candidate = splice_channel(
+			&nodes[1],
+			&nodes[0],
+			channel,
+			SpliceContribution::SpliceIn {
+				value: Amount::from_sat(20_000),
+				inputs: vec![FundingTxInput::new_p2wpkh(input_transaction.clone(), 1).unwrap()],
+				change_script: Some(nodes[1].wallet_source.get_change_script().unwrap()),
+			},
+		);
 		// Save the peer's actual signed candidate commitment before either side
 		// retires it or advances commitment numbers on the surviving funding.
-		let (_, peer_copy) = <(BlockHash, ChannelMonitor<_>)>::read(&mut io::Cursor::new(get_monitor!(nodes[1], channel).encode()),
-			(&nodes[1].keys_manager.backing, &nodes[1].keys_manager.backing)).unwrap();
+		let (_, peer_copy) = <(BlockHash, ChannelMonitor<_>)>::read(
+			&mut io::Cursor::new(get_monitor!(nodes[1], channel).encode()),
+			(&nodes[1].keys_manager.backing, &nodes[1].keys_manager.backing),
+		)
+		.unwrap();
 		{
 			let mut inner = peer_copy.inner.lock().unwrap();
 			inner.funding = inner.pending_funding[0].clone();
 			let funding = inner.funding.clone();
-			inner.onchain_tx_handler.update_after_renegotiated_funding_locked(funding.channel_parameters,
-				funding.current_holder_commitment_tx, funding.prev_holder_commitment_tx);
+			inner.onchain_tx_handler.update_after_renegotiated_funding_locked(
+				funding.channel_parameters,
+				funding.current_holder_commitment_tx,
+				funding.prev_holder_commitment_tx,
+			);
 		}
-		let peer_commitment = peer_copy.unsafe_get_latest_holder_commitment_txn(&nodes[1].logger).remove(0);
+		let peer_commitment =
+			peer_copy.unsafe_get_latest_holder_commitment_txn(&nodes[1].logger).remove(0);
 		check_spends!(&peer_commitment, candidate);
-		let index = candidate.input.iter().position(|input| input.previous_output != original.into_bitcoin_outpoint()).unwrap() as u16;
+		let index = candidate
+			.input
+			.iter()
+			.position(|input| input.previous_output != original.into_bitcoin_outpoint())
+			.unwrap() as u16;
 		let mut conflict = candidate.clone();
 		conflict.input = vec![candidate.input[index as usize].clone()];
 		conflict.output.truncate(1);
 		conflict.output[0].value = Amount::from_sat(1_000);
 		let conflict = nodes[1].wallet_source.sign_tx(conflict).unwrap();
 		let stale_snapshot = get_monitor!(nodes[0], channel).encode();
-		conflict.verify(|outpoint| input_transaction.output.get(outpoint.vout as usize).cloned()).unwrap();
-		for node in &nodes { mine_transaction(node, &conflict); }
+		conflict
+			.verify(|outpoint| input_transaction.output.get(outpoint.vout as usize).cloned())
+			.unwrap();
+		for node in &nodes {
+			mine_transaction(node, &conflict);
+		}
 		let height = nodes[0].best_block_info().1;
 		let block_hash = nodes[0].best_block_hash();
-		for node in &nodes { connect_blocks(node, 5); }
+		for node in &nodes {
+			connect_blocks(node, 5);
+		}
 		for (node, peer) in [(&nodes[0], &nodes[1]), (&nodes[1], &nodes[0])] {
 			let peer_id = peer.node.get_our_node_id();
 			node.node.handle_stfu(peer_id, &msgs::Stfu { channel_id: channel, initiator: true });
 			assert!(!get_event_msg!(node, MessageSendEvent::SendStfu, peer_id).initiator);
-			let snapshot = node.node.splice_conflict_candidate(&channel, &peer_id, candidate.compute_txid()).unwrap();
-			node.node.revert_conflicted_splice(&channel, &peer_id, candidate.compute_txid(), conflict.clone(), index,
-				height, block_hash, snapshot.best_block).unwrap();
+			let snapshot = node
+				.node
+				.splice_conflict_candidate(&channel, &peer_id, candidate.compute_txid())
+				.unwrap();
+			node.node
+				.revert_conflicted_splice(
+					&channel,
+					&peer_id,
+					candidate.compute_txid(),
+					conflict.clone(),
+					index,
+					height,
+					block_hash,
+					snapshot.best_block,
+				)
+				.unwrap();
 			check_added_monitors!(node, 1);
 			assert_eq!(node.node.get_and_clear_pending_splice_conflict_responses().len(), 1);
 		}
 		// Incremental monitor updates are replayed over snapshots whose chain tip
 		// may predate the verified conflict. The native admission already bound
 		// the proof to the current paired manager and monitor chain state.
-		let (_, stale) = <(BlockHash, ChannelMonitor<_>)>::read(&mut io::Cursor::new(stale_snapshot),
-			(&nodes[0].keys_manager.backing, &nodes[0].keys_manager.backing)).unwrap();
+		let (_, stale) = <(BlockHash, ChannelMonitor<_>)>::read(
+			&mut io::Cursor::new(stale_snapshot),
+			(&nodes[0].keys_manager.backing, &nodes[0].keys_manager.backing),
+		)
+		.unwrap();
 		let record = get_monitor!(nodes[0], channel).get_splice_conflict_records().remove(0);
 		assert!(stale.inner.lock().unwrap().best_block.height < record.verified_tip.height);
-		stale.update_monitor(&super::ChannelMonitorUpdate { update_id: record.update_id, channel_id: Some(channel),
-			updates: vec![ChannelMonitorUpdateStep::RetireConflictedFunding { record,
-				candidate_transaction: candidate.clone(), conflict_transaction: conflict.clone() }] },
-			&nodes[0].tx_broadcaster, &nodes[0].fee_estimator, &nodes[0].logger).unwrap();
-		assert_eq!(stale.get_splice_conflict_records(), get_monitor!(nodes[0], channel).get_splice_conflict_records());
-		if advance_commitments { let _ = send_payment(&nodes[0], &[&nodes[1]], 100_000); }
-		if activate_ffor { crate::ln::channelmanager::ffor_manager::tests::activate_native_book(&nodes[0], &nodes[1], channel, &[2_000_000]); }
-		if advance_commitments && !activate_ffor { let _ = route_payment(&nodes[0], &[&nodes[1]], 2_000_000); }
-		let (_, monitor) = <(BlockHash, ChannelMonitor<_>)>::read(&mut io::Cursor::new(get_monitor!(nodes[0], channel).encode()),
-			(&nodes[0].keys_manager.backing, &nodes[0].keys_manager.backing)).unwrap();
+		stale
+			.update_monitor(
+				&super::ChannelMonitorUpdate {
+					update_id: record.update_id,
+					channel_id: Some(channel),
+					updates: vec![ChannelMonitorUpdateStep::RetireConflictedFunding {
+						record,
+						candidate_transaction: candidate.clone(),
+						conflict_transaction: conflict.clone(),
+					}],
+				},
+				&nodes[0].tx_broadcaster,
+				&nodes[0].fee_estimator,
+				&nodes[0].logger,
+			)
+			.unwrap();
+		assert_eq!(
+			stale.get_splice_conflict_records(),
+			get_monitor!(nodes[0], channel).get_splice_conflict_records()
+		);
+		if advance_commitments {
+			let _ = send_payment(&nodes[0], &[&nodes[1]], 100_000);
+		}
+		if advance_commitments {
+			let _ = route_payment(&nodes[0], &[&nodes[1]], 2_000_000);
+		}
+		let (_, monitor) = <(BlockHash, ChannelMonitor<_>)>::read(
+			&mut io::Cursor::new(get_monitor!(nodes[0], channel).encode()),
+			(&nodes[0].keys_manager.backing, &nodes[0].keys_manager.backing),
+		)
+		.unwrap();
 		assert_eq!(monitor.get_splice_conflict_records().len(), 1);
 		let outstanding = monitor.get_all_current_outbound_htlcs();
-		assert_eq!(outstanding.len(), usize::from(advance_commitments || activate_ffor));
+		assert_eq!(outstanding.len(), usize::from(advance_commitments));
 		assert!(monitor.inner.lock().unwrap().pending_funding.is_empty());
 		let broadcaster = TestBroadcaster::with_blocks(nodes[0].tx_broadcaster.blocks.clone());
 		let fork = create_dummy_header(block_hash, 40);
-		monitor.best_block_updated(&fork, height - 1, &broadcaster, nodes[0].fee_estimator, &nodes[0].logger);
+		monitor.best_block_updated(
+			&fork,
+			height - 1,
+			&broadcaster,
+			nodes[0].fee_estimator,
+			&nodes[0].logger,
+		);
 		let branch = create_dummy_header(fork.block_hash(), 41);
-		monitor.transactions_confirmed(&branch, &[(0, &candidate)], height, &broadcaster, nodes[0].fee_estimator, &nodes[0].logger);
-		monitor.best_block_updated(&branch, height, &broadcaster, nodes[0].fee_estimator, &nodes[0].logger);
+		monitor.transactions_confirmed(
+			&branch,
+			&[(0, &candidate)],
+			height,
+			&broadcaster,
+			nodes[0].fee_estimator,
+			&nodes[0].logger,
+		);
+		monitor.best_block_updated(
+			&branch,
+			height,
+			&broadcaster,
+			nodes[0].fee_estimator,
+			&nodes[0].logger,
+		);
 		let mut broadcasts = broadcaster.txn_broadcasted.lock().unwrap().split_off(0);
-		broadcasts.extend(monitor.inner.lock().unwrap().get_repeated_events().into_iter().filter_map(|event| match event {
-			crate::events::Event::BumpTransaction(crate::events::bump_transaction::BumpTransactionEvent::ChannelClose { commitment_tx, .. }) => Some(commitment_tx), _ => None,
-		}));
+		broadcasts.extend(
+			monitor.inner.lock().unwrap().get_repeated_events().into_iter().filter_map(|event| {
+				match event {
+					crate::events::Event::BumpTransaction(
+						crate::events::bump_transaction::BumpTransactionEvent::ChannelClose {
+							commitment_tx,
+							..
+						},
+					) => Some(commitment_tx),
+					_ => None,
+				}
+			}),
+		);
 		if advance_commitments {
 			assert!(!broadcasts.iter().any(|tx| tx.input.iter().any(|input| input.previous_output.txid == candidate.compute_txid())),
 				"Never broadcast a retired holder commitment after its revocation secret was released");
 		} else {
-			let close = broadcasts.iter().find(|tx| tx.input.iter().any(|input| input.previous_output.txid == candidate.compute_txid())).unwrap();
+			let close = broadcasts
+				.iter()
+				.find(|tx| {
+					tx.input
+						.iter()
+						.any(|input| input.previous_output.txid == candidate.compute_txid())
+				})
+				.unwrap();
 			check_spends!(close, candidate);
 		}
 		assert_eq!(monitor.inner.lock().unwrap().funding.funding_txid(), candidate.compute_txid());
 		assert!(monitor.inner.lock().unwrap().lockdown_from_offchain);
-		let (_, restored) = <(BlockHash, ChannelMonitor<_>)>::read(&mut io::Cursor::new(monitor.encode()),
-			(&nodes[0].keys_manager.backing, &nodes[0].keys_manager.backing)).unwrap();
+		let (_, restored) = <(BlockHash, ChannelMonitor<_>)>::read(
+			&mut io::Cursor::new(monitor.encode()),
+			(&nodes[0].keys_manager.backing, &nodes[0].keys_manager.backing),
+		)
+		.unwrap();
 		assert_eq!(restored.inner.lock().unwrap().funding.funding_txid(), candidate.compute_txid());
 		assert_eq!(restored.get_splice_conflict_records(), monitor.get_splice_conflict_records());
-		assert_eq!(restored.get_ffor_journal(), monitor.get_ffor_journal());
-		if activate_ffor { assert!(restored.get_ffor_journal().is_some()); }
 		assert_eq!(restored.get_all_current_outbound_htlcs().len(), outstanding.len());
 		assert!(restored.get_onchain_failed_outbound_htlcs().is_empty());
-		let (_, mature) = <(BlockHash, ChannelMonitor<_>)>::read(&mut io::Cursor::new(restored.encode()),
-			(&nodes[0].keys_manager.backing, &nodes[0].keys_manager.backing)).unwrap();
-		mature.best_block_updated(&branch, height + super::ANTI_REORG_DELAY - 2, &broadcaster, nodes[0].fee_estimator, &nodes[0].logger);
+		let (_, mature) = <(BlockHash, ChannelMonitor<_>)>::read(
+			&mut io::Cursor::new(restored.encode()),
+			(&nodes[0].keys_manager.backing, &nodes[0].keys_manager.backing),
+		)
+		.unwrap();
+		mature.best_block_updated(
+			&branch,
+			height + super::ANTI_REORG_DELAY - 2,
+			&broadcaster,
+			nodes[0].fee_estimator,
+			&nodes[0].logger,
+		);
 		assert!(mature.get_onchain_failed_outbound_htlcs().is_empty());
-		mature.best_block_updated(&branch, height + super::ANTI_REORG_DELAY - 1, &broadcaster, nodes[0].fee_estimator, &nodes[0].logger);
+		mature.best_block_updated(
+			&branch,
+			height + super::ANTI_REORG_DELAY - 1,
+			&broadcaster,
+			nodes[0].fee_estimator,
+			&nodes[0].logger,
+		);
 		let failed = mature.get_onchain_failed_outbound_htlcs();
 		assert_eq!(failed.len(), outstanding.len());
-		for (source, (htlc, _)) in &outstanding { assert_eq!(failed.get(source), Some(&htlc.payment_hash)); }
-		let (_, mature_restart) = <(BlockHash, ChannelMonitor<_>)>::read(&mut io::Cursor::new(mature.encode()),
-			(&nodes[0].keys_manager.backing, &nodes[0].keys_manager.backing)).unwrap();
+		for (source, (htlc, _)) in &outstanding {
+			assert_eq!(failed.get(source), Some(&htlc.payment_hash));
+		}
+		let (_, mature_restart) = <(BlockHash, ChannelMonitor<_>)>::read(
+			&mut io::Cursor::new(mature.encode()),
+			(&nodes[0].keys_manager.backing, &nodes[0].keys_manager.backing),
+		)
+		.unwrap();
 		assert_eq!(mature_restart.get_onchain_failed_outbound_htlcs(), failed);
 		// Unbound recovery metadata must fail closed at the serialization boundary.
-		mature_restart.inner.lock().unwrap().retired_funding_recovery.as_mut().unwrap().retired_txid = original.txid;
-		assert!(<(BlockHash, ChannelMonitor<_>)>::read(&mut io::Cursor::new(mature_restart.encode()),
-			(&nodes[0].keys_manager.backing, &nodes[0].keys_manager.backing)).is_err());
+		mature_restart
+			.inner
+			.lock()
+			.unwrap()
+			.retired_funding_recovery
+			.as_mut()
+			.unwrap()
+			.retired_txid = original.txid;
+		assert!(<(BlockHash, ChannelMonitor<_>)>::read(
+			&mut io::Cursor::new(mature_restart.encode()),
+			(&nodes[0].keys_manager.backing, &nodes[0].keys_manager.backing)
+		)
+		.is_err());
 		broadcaster.txn_broadcasted.lock().unwrap().clear();
 		if advance_commitments {
 			// The peer's saved branch was revoked by the real postrollback payment.
 			// Its confirmation must still produce a correctly signed justice spend.
 			let header = create_dummy_header(branch.block_hash(), 42);
-			restored.transactions_confirmed(&header, &[(0, &peer_commitment)], height + 1,
-				&broadcaster, nodes[0].fee_estimator, &nodes[0].logger);
-			restored.best_block_updated(&header, height + 1, &broadcaster, nodes[0].fee_estimator, &nodes[0].logger);
+			restored.transactions_confirmed(
+				&header,
+				&[(0, &peer_commitment)],
+				height + 1,
+				&broadcaster,
+				nodes[0].fee_estimator,
+				&nodes[0].logger,
+			);
+			restored.best_block_updated(
+				&header,
+				height + 1,
+				&broadcaster,
+				nodes[0].fee_estimator,
+				&nodes[0].logger,
+			);
 			let broadcasts = broadcaster.txn_broadcasted.lock().unwrap().split_off(0);
-			let justice = broadcasts.iter().find(|tx| tx.input.iter().any(|input| input.previous_output.txid == peer_commitment.compute_txid())).unwrap();
+			let justice = broadcasts
+				.iter()
+				.find(|tx| {
+					tx.input
+						.iter()
+						.any(|input| input.previous_output.txid == peer_commitment.compute_txid())
+				})
+				.unwrap();
 			check_spends!(justice, peer_commitment);
 		}
 		// A second reorganization retains the latest original commitment, never
 		// the stale original commitment that existed when retirement was saved.
-		restored.transaction_unconfirmed(&candidate.compute_txid(), &broadcaster, nodes[0].fee_estimator, &nodes[0].logger);
+		restored.transaction_unconfirmed(
+			&candidate.compute_txid(),
+			&broadcaster,
+			nodes[0].fee_estimator,
+			&nodes[0].logger,
+		);
 		assert_eq!(restored.inner.lock().unwrap().funding.funding_outpoint(), original);
 		assert!(restored.inner.lock().unwrap().lockdown_from_offchain);
 		let mut broadcasts = broadcaster.txn_broadcasted.lock().unwrap().split_off(0);
-		broadcasts.extend(restored.inner.lock().unwrap().get_repeated_events().into_iter().filter_map(|event| match event {
-			crate::events::Event::BumpTransaction(crate::events::bump_transaction::BumpTransactionEvent::ChannelClose { commitment_tx, .. }) => Some(commitment_tx), _ => None,
-		}));
-		let close = broadcasts.iter().find(|tx| tx.input.iter().any(|input| input.previous_output == original.into_bitcoin_outpoint())).unwrap();
+		broadcasts.extend(
+			restored.inner.lock().unwrap().get_repeated_events().into_iter().filter_map(|event| {
+				match event {
+					crate::events::Event::BumpTransaction(
+						crate::events::bump_transaction::BumpTransactionEvent::ChannelClose {
+							commitment_tx,
+							..
+						},
+					) => Some(commitment_tx),
+					_ => None,
+				}
+			}),
+		);
+		let close = broadcasts
+			.iter()
+			.find(|tx| {
+				tx.input
+					.iter()
+					.any(|input| input.previous_output == original.into_bitcoin_outpoint())
+			})
+			.unwrap();
 		check_spends!(close, original_transaction);
-		let (_, final_restore) = <(BlockHash, ChannelMonitor<_>)>::read(&mut io::Cursor::new(restored.encode()),
-			(&nodes[0].keys_manager.backing, &nodes[0].keys_manager.backing)).unwrap();
+		let (_, final_restore) = <(BlockHash, ChannelMonitor<_>)>::read(
+			&mut io::Cursor::new(restored.encode()),
+			(&nodes[0].keys_manager.backing, &nodes[0].keys_manager.backing),
+		)
+		.unwrap();
 		assert_eq!(final_restore.inner.lock().unwrap().funding.funding_outpoint(), original);
 		assert_eq!(final_restore.get_splice_conflict_records().len(), 1);
-		assert_eq!(final_restore.check_and_update_full_resolution_status(&*nodes[0].logger), (false, false));
+		assert_eq!(
+			final_restore.check_and_update_full_resolution_status(&*nodes[0].logger),
+			(false, false)
+		);
 	}
 
 	#[test]
-	fn test_retired_splice_monitor_archive_reorg() { do_test_retired_splice_monitor_archive(false, false); }
-	#[test]
-	fn test_retired_splice_monitor_archive_revoked_branch() { do_test_retired_splice_monitor_archive(true, false); }
-
-	#[test]
-	fn test_retired_splice_monitor_archive_ffor_restart() { do_test_retired_splice_monitor_archive(true, true); }
-
-	fn do_test_ffor_native_chain_resolution(fulfilled: bool) {
-		use crate::chain::channelmonitor::{ChannelMonitorUpdate, MonitorEvent};
-		use crate::chain::chainmonitor::Persist;
-		use crate::ln::channelmanager::{FforPolicy, SentHTLCId};
-		use crate::ln::channelmanager::ffor_manager::tests::activate_native_book;
-		use crate::ln::ffor;
-		use crate::chain::package::HolderHTLCOutput;
-		use crate::util::native_async::FutureQueue;
-		use crate::util::persist::{MonitorUpdatingPersister, MonitorUpdatingPersisterAsync};
-		use crate::util::test_utils::{TestKeysInterface, TestStore};
-		use crate::util::wakers::Notifier;
-		let chanmon_cfgs = create_chanmon_cfgs(2);
-		let node_cfgs = create_node_cfgs(2, &chanmon_cfgs);
-		let mut config = test_default_anchors_channel_config();
-		config.channel_handshake_config.announce_for_forwarding = false;
-		let node_chanmgrs = create_node_chanmgrs(2, &node_cfgs, &[Some(config.clone()), Some(config)]);
-		for manager in &node_chanmgrs { manager.set_ffor_policy(FforPolicy { enabled: true, ..Default::default() }).unwrap(); }
-		let nodes = create_network(2, &node_cfgs, &node_chanmgrs);
-		for node in &nodes { connect_blocks(node, 100); }
-		let (funding, channel) = open_zero_conf_channel_with_value(&nodes[0], &nodes[1], None, 100_000, 20_000_000);
-		let journal = activate_native_book(&nodes[0], &nodes[1], channel, &[2_000_000, 2_000_000]);
-		let (_, monitor) = <(BlockHash, ChannelMonitor<_>)>::read(
-			&mut io::Cursor::new(get_monitor!(nodes[0], channel).encode()),
-			(&nodes[0].keys_manager.backing, &nodes[0].keys_manager.backing)).unwrap();
-		let source_node = if fulfilled { &nodes[1] } else { &nodes[0] };
-		let (_, source_monitor) = <(BlockHash, ChannelMonitor<_>)>::read(
-			&mut io::Cursor::new(get_monitor!(source_node, channel).encode()),
-			(&source_node.keys_manager.backing, &source_node.keys_manager.backing)).unwrap();
-		if fulfilled {
-			let update = ChannelMonitorUpdate { update_id: source_monitor.get_latest_update_id() + 1,
-				channel_id: Some(channel), updates: journal.epoch.slots.iter().map(|slot|
-					ChannelMonitorUpdateStep::PaymentPreimage { payment_preimage: PaymentPreimage(slot.preimage), payment_info: None }).collect() };
-			source_monitor.update_monitor(&update, &source_node.tx_broadcaster, &source_node.fee_estimator, &source_node.logger).unwrap();
-		}
-		let commitment = source_monitor.unsafe_get_latest_holder_commitment_txn(&source_node.logger).remove(0);
-		check_spends!(&commitment, funding);
-		let spends = {
-			let mut inner = source_monitor.inner.lock().unwrap();
-			let descriptors = inner.get_broadcasted_holder_htlc_descriptors(&inner.funding, &inner.funding.current_holder_commitment_tx);
-			assert_eq!(descriptors.len(), 2);
-			descriptors.into_iter().map(|descriptor| {
-				let outpoint = bitcoin::OutPoint { txid: commitment.compute_txid(), vout: descriptor.htlc.transaction_output_index.unwrap() };
-				HolderHTLCOutput::build(descriptor, 0).get_maybe_signed_htlc_tx(&mut inner.onchain_tx_handler, &outpoint).unwrap().0
-			}).collect::<Vec<_>>()
-		};
-		// Native anchor templates have zero fee. A miner may include them directly;
-		// verify consensus signatures without imposing relay minimums.
-		for spend in &spends { spend.verify(|outpoint| {
-			assert_eq!(outpoint.txid, commitment.compute_txid());
-			commitment.output.get(outpoint.vout as usize).cloned()
-		}).unwrap(); }
-		let conf_height = if fulfilled { nodes[0].best_block_info().1 + 1 } else { journal.epoch.slots[0].entry.expiry + 1 };
-		let header = create_dummy_header(nodes[0].best_block_info().0, 0);
-		monitor.transactions_confirmed(&header, &[(0, &commitment)], conf_height,
-			nodes[0].tx_broadcaster, nodes[0].fee_estimator, &nodes[0].logger);
-		monitor.best_block_updated(&header, conf_height, nodes[0].tx_broadcaster, nodes[0].fee_estimator, &nodes[0].logger);
-		let header = create_dummy_header(header.block_hash(), 1);
-		let spend_height = conf_height + 1;
-		monitor.transactions_confirmed(&header, &[(0, &spends[0]), (1, &spends[1])], spend_height,
-			nodes[0].tx_broadcaster, nodes[0].fee_estimator, &nodes[0].logger);
-		monitor.best_block_updated(&header, spend_height + super::ANTI_REORG_DELAY - 2,
-			nodes[0].tx_broadcaster, nodes[0].fee_estimator, &nodes[0].logger);
-		assert!(!monitor.get_and_clear_pending_monitor_events().iter().any(|event| matches!(event, MonitorEvent::FforVoucherResolved { .. })));
-		assert!(monitor.inner.lock().unwrap().ffor_chain_resolutions.is_none());
-		// Chain synchronization may retain this pre-threshold snapshot after its final
-		// pending claim matures. An isolated later journal cannot replay its chain proof.
-		let store = Arc::new(TestStore::new(false));
-		let persister = MonitorUpdatingPersister::new(&*store, nodes[0].logger, 1000,
-			&nodes[0].keys_manager.backing, &nodes[0].keys_manager.backing,
-			nodes[0].tx_broadcaster, nodes[0].fee_estimator);
-		let monitor_name = monitor.persistence_key();
-		assert_eq!(persister.persist_new_channel(monitor_name, &monitor), crate::chain::ChannelMonitorUpdateStatus::Completed);
-		let futures = Arc::new(FutureQueue::new());
-		let async_keys = Arc::new(TestKeysInterface::new(&[0; 32], Network::Testnet));
-		let async_persister = MonitorUpdatingPersisterAsync::new(Arc::clone(&store), Arc::clone(&futures),
-			Arc::new(TestLogger::new()), 1000, Arc::clone(&async_keys), Arc::clone(&async_keys),
-			Arc::new(TestBroadcaster::new(Network::Testnet)), Arc::new(TestFeeEstimator::new(253)));
-		let notifier = Arc::new(Notifier::new());
-		// Restart while resolution is still below the native confirmation threshold.
-		let (_, restored) = <(BlockHash, ChannelMonitor<_>)>::read(&mut io::Cursor::new(monitor.encode()),
-			(&nodes[0].keys_manager.backing, &nodes[0].keys_manager.backing)).unwrap();
-		restored.best_block_updated(&header, spend_height + super::ANTI_REORG_DELAY - 1,
-			nodes[0].tx_broadcaster, nodes[0].fee_estimator, &nodes[0].logger);
-		assert!(!restored.get_and_clear_pending_non_htlc_fail_events().iter().any(|event| matches!(event, MonitorEvent::FforVoucherResolved { .. })),
-			"Chain proofs must wait for chain monitor persistence");
-		let events = restored.get_and_clear_pending_monitor_events().into_iter().filter(|event| matches!(event, MonitorEvent::FforVoucherResolved { .. })).collect::<Vec<_>>();
-		assert_eq!(events.len(), 2);
-		let (_, recovered) = <(BlockHash, ChannelMonitor<_>)>::read(&mut io::Cursor::new(restored.encode()),
-			(&nodes[0].keys_manager.backing, &nodes[0].keys_manager.backing)).unwrap();
-		assert_eq!(recovered.get_and_clear_pending_monitor_events().iter().filter(|event| matches!(event, MonitorEvent::FforVoucherResolved { .. })).count(), 2,
-			"Proofs replay after loss of the manager callback");
-		for event in events {
-			let (epoch_id, slot, proof) = match event {
-				MonitorEvent::FforVoucherResolved { epoch_id, slot, commitment_txid, output_index, resolving_txid, fulfilled: outcome } => {
-					assert_eq!(commitment_txid, commitment.compute_txid()); assert_eq!(outcome, fulfilled);
-					assert!(spends.iter().any(|tx| tx.compute_txid() == resolving_txid));
-					(epoch_id, slot, ffor::ChainRemoval { commitment_txid: commitment_txid.to_byte_array(), output_index,
-						resolving_txid: resolving_txid.to_byte_array(), fulfilled: outcome })
-				}, _ => unreachable!(),
-			};
-			let source = SentHTLCId::FforVoucher { channel_id: channel, epoch_id, slot };
-			let release = ChannelMonitorUpdate { update_id: recovered.get_latest_update_id() + 1, channel_id: Some(channel),
-				updates: vec![ChannelMonitorUpdateStep::ReleasePaymentComplete { htlc: source }] };
-			let (_, invalid_release) = <(BlockHash, ChannelMonitor<_>)>::read(&mut io::Cursor::new(recovered.encode()),
-				(&nodes[0].keys_manager.backing, &nodes[0].keys_manager.backing)).unwrap();
-			assert!(invalid_release.update_monitor(&release, &nodes[0].tx_broadcaster, &nodes[0].fee_estimator, &nodes[0].logger).is_err());
-			let previous = recovered.get_ffor_journal().unwrap();
-			let next = ffor::prepare_chain_resolution(&previous, slot, proof).unwrap();
-			let update = ChannelMonitorUpdate { update_id: recovered.get_latest_update_id() + 1, channel_id: Some(channel),
-				updates: vec![ChannelMonitorUpdateStep::FforJournal { journal: next.journal.clone() }] };
-			assert!(update.requires_full_monitor_persistence());
-			let (_, stale) = persister.read_channel_monitor_with_updates(&monitor_name.to_string()).unwrap();
-			let persisted_update_id = stale.get_latest_update_id();
-			if stale.inner.lock().unwrap().ffor_chain_resolutions.is_none() {
-				assert!(stale.update_monitor(&update, &nodes[0].tx_broadcaster, &nodes[0].fee_estimator, &nodes[0].logger).is_err(),
-					"A journal must never authenticate its own chain-removal claim on replay");
-			}
-			recovered.update_monitor(&update, &nodes[0].tx_broadcaster, &nodes[0].fee_estimator, &nodes[0].logger).unwrap();
-			let (_, async_monitor) = <(BlockHash, ChannelMonitor<_>)>::read(&mut io::Cursor::new(recovered.encode()),
-				(&*async_keys, &*async_keys)).unwrap();
-			async_persister.spawn_async_update_channel(monitor_name, Some(&update), &async_monitor, Arc::clone(&notifier));
-			futures.poll_futures();
-			assert!(async_persister.get_and_clear_completed_updates().is_empty(),
-				"The native completion ID must wait for the full monitor write");
-			assert_eq!(store.list_pending_async_writes("monitors", "", &monitor_name.to_string()).len(), 1);
-			assert!(store.list_pending_async_writes("monitor_updates", &monitor_name.to_string(), &update.update_id.to_string()).is_empty());
-			assert_eq!(persister.read_channel_monitor_with_updates(&monitor_name.to_string()).unwrap().1.get_latest_update_id(), persisted_update_id);
-			store.complete_all_async_writes();
-			futures.poll_futures();
-			assert_eq!(async_persister.get_and_clear_completed_updates(), vec![(channel, update.update_id)]);
-			let (_, durable) = persister.read_channel_monitor_with_updates(&monitor_name.to_string()).unwrap();
-			assert_eq!(durable.get_ffor_journal(), recovered.get_ffor_journal());
-			assert_eq!(durable.inner.lock().unwrap().ffor_chain_resolutions, recovered.inner.lock().unwrap().ffor_chain_resolutions);
-			assert!(recovered.get_and_clear_pending_monitor_events().iter().any(|event|
-				matches!(event, MonitorEvent::FforVoucherResolved { slot: id, .. } if *id == slot)),
-				"Persisted journal alone does not acknowledge native payment completion");
-			let release = ChannelMonitorUpdate { update_id: recovered.get_latest_update_id() + 1, channel_id: Some(channel),
-				updates: vec![ChannelMonitorUpdateStep::ReleasePaymentComplete { htlc: source }] };
-			recovered.update_monitor(&release, &nodes[0].tx_broadcaster, &nodes[0].fee_estimator, &nodes[0].logger).unwrap();
-			assert!(!release.requires_full_monitor_persistence());
-			assert_eq!(persister.update_persisted_channel(monitor_name, Some(&release), &recovered), crate::chain::ChannelMonitorUpdateStatus::Completed);
-		}
-		assert!(!recovered.get_and_clear_pending_monitor_events().iter().any(|event| matches!(event, MonitorEvent::FforVoucherResolved { .. })));
-		assert_eq!(recovered.check_and_update_full_resolution_status(&*nodes[0].logger), (false, false));
-		let (_, final_restore) = <(BlockHash, ChannelMonitor<_>)>::read(&mut io::Cursor::new(recovered.encode()),
-			(&nodes[0].keys_manager.backing, &nodes[0].keys_manager.backing)).unwrap();
-		assert_eq!(final_restore.get_ffor_journal(), recovered.get_ffor_journal());
-		assert!(!final_restore.get_and_clear_pending_monitor_events().iter().any(|event| matches!(event, MonitorEvent::FforVoucherResolved { .. })));
-		let (_, persisted_restore) = persister.read_channel_monitor_with_updates(&monitor_name.to_string()).unwrap();
-		assert_eq!(persisted_restore.get_ffor_journal(), recovered.get_ffor_journal());
-		assert!(!persisted_restore.get_and_clear_pending_monitor_events().iter().any(|event| matches!(event, MonitorEvent::FforVoucherResolved { .. })));
+	fn test_retired_splice_monitor_archive_reorg() {
+		do_test_retired_splice_monitor_archive(false);
 	}
-
 	#[test]
-	fn test_ffor_native_chain_timeout_recovery() { do_test_ffor_native_chain_resolution(false); }
-	#[test]
-	fn test_ffor_native_chain_fulfill_recovery() { do_test_ffor_native_chain_resolution(true); }
-
-	#[test]
-	fn test_ffor_monitor_journal_durable_recovery_and_force_close() {
-		use crate::ln::ffor::{self, Kind, SignedMessage};
-		use crate::ln::ffor_monitor::FforJournal;
-		use crate::chain::channelmonitor::ChannelMonitorUpdate;
-		use bitcoin::secp256k1::Message;
-		let chanmon_cfgs = create_chanmon_cfgs(2);
-		let node_cfgs = create_node_cfgs(2, &chanmon_cfgs);
-		let mut config = test_default_channel_config();
-		config.channel_handshake_config.negotiate_anchors_zero_fee_htlc_tx = true;
-		config.manually_accept_inbound_channels = true;
-		let node_chanmgrs = create_node_chanmgrs(2, &node_cfgs, &[Some(config.clone()), Some(config)]);
-		let nodes = create_network(2, &node_cfgs, &node_chanmgrs);
-		let id = create_announced_chan_between_nodes(&nodes, 0, 1).2;
-		let mut epoch = ffor::tests::epoch();
-		epoch.channel_id = id.0;
-		epoch.local_node = nodes[0].node.get_our_node_id();
-		epoch.remote_node = nodes[1].node.get_our_node_id();
-		let mut init = epoch.messages[0].unsigned().to_vec();
-		init[..32].copy_from_slice(&id.0);
-		let signature = Secp256k1::new().sign_ecdsa(&Message::from_digest(ffor::message_digest(Kind::Init, &init)),
-			&crate::sign::KeysManager::new(&nodes[1].node_seed, 0, 0, true).get_node_secret_key());
-		epoch.messages = vec![SignedMessage::from_parts(Kind::Init, &init, signature.serialize_compact()).unwrap()];
-		let journal = FforJournal::prepare(None, 1, epoch, None).unwrap();
-		let (_, monitor) = <(BlockHash, ChannelMonitor<_>)>::read(
-			&mut io::Cursor::new(&get_monitor!(nodes[0], id).encode()),
-			(&nodes[0].keys_manager.backing, &nodes[0].keys_manager.backing)).unwrap();
-		let first_update = monitor.get_latest_update_id() + 1;
-		let update = ChannelMonitorUpdate { update_id: first_update, channel_id: Some(id),
-			updates: vec![ChannelMonitorUpdateStep::FforJournal { journal: journal.clone() }] };
-		monitor.update_monitor(&update, &nodes[0].tx_broadcaster, &nodes[0].fee_estimator, &nodes[0].logger).unwrap();
-		assert_eq!(monitor.get_ffor_journal(), Some(journal.clone()));
-		let encoded = monitor.encode();
-		let (_, restored) = <(BlockHash, ChannelMonitor<_>)>::read(&mut io::Cursor::new(&encoded),
-			(&nodes[0].keys_manager.backing, &nodes[0].keys_manager.backing)).unwrap();
-		assert_eq!(restored.get_ffor_journal(), Some(journal.clone()));
-		assert_eq!(restored.get_latest_update_id(), first_update);
-		let close = ChannelMonitorUpdate { update_id: first_update + 1, channel_id: Some(id),
-			updates: vec![ChannelMonitorUpdateStep::ChannelForceClosed { should_broadcast: false, counterparty_failed_htlcs: Vec::new() }] };
-		restored.update_monitor(&close, &nodes[0].tx_broadcaster, &nodes[0].fee_estimator, &nodes[0].logger).unwrap();
-		assert_eq!(restored.get_ffor_journal(), Some(journal.clone()), "Closing cannot discard secret custody");
-		let mut held = journal.epoch.clone(); held.capability_hold = true;
-		let next = FforJournal::prepare(Some(&journal), 2, held, None).unwrap();
-		let update = ChannelMonitorUpdate { update_id: first_update + 2, channel_id: Some(id),
-			updates: vec![ChannelMonitorUpdateStep::FforJournal { journal: next.clone() }] };
-		restored.update_monitor(&update, &nodes[0].tx_broadcaster, &nodes[0].fee_estimator, &nodes[0].logger).unwrap();
-		let (_, closed_restore) = <(BlockHash, ChannelMonitor<_>)>::read(&mut io::Cursor::new(&restored.encode()),
-			(&nodes[0].keys_manager.backing, &nodes[0].keys_manager.backing)).unwrap();
-		assert_eq!(closed_restore.get_ffor_journal(), Some(next));
-		assert!(nodes[0].tx_broadcaster.txn_broadcasted.lock().unwrap().is_empty());
+	fn test_retired_splice_monitor_archive_revoked_branch() {
+		do_test_retired_splice_monitor_archive(true);
 	}
 
 	#[rustfmt::skip]

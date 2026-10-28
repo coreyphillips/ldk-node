@@ -821,14 +821,14 @@ fn test_rejects_both_anchor_types_channel_type() {
 	assert!(res.is_err());
 }
 
-
 #[test]
 fn test_funding_key_reuse_creation_policy() {
 	use crate::util::test_channel_signer::SignerOp;
 	let test_est = TestFeeEstimator::new(15000);
 	let fee_estimator = LowerBoundedFeeEstimator::new(&test_est);
 	let logger = TestLogger::new();
-	let peer = PublicKey::from_secret_key(&Secp256k1::new(), &SecretKey::from_slice(&[7; 32]).unwrap());
+	let peer =
+		PublicKey::from_secret_key(&Secp256k1::new(), &SecretKey::from_slice(&[7; 32]).unwrap());
 	for flags in 0..8 {
 		let keys = TestKeysInterface::new(&[flags + 1; 32], Network::Testnet);
 		let mut config = UserConfig::default();
@@ -839,8 +839,19 @@ fn test_funding_key_reuse_creation_policy() {
 		}
 		let features = channelmanager::provided_init_features(&config);
 		let result = OutboundV1Channel::<&TestKeysInterface>::new(
-			&fee_estimator, &&keys, &&keys, peer, &features, 1_000_000, 0,
-			42, &config, 0, 42, None, &logger,
+			&fee_estimator,
+			&&keys,
+			&&keys,
+			peer,
+			&features,
+			1_000_000,
+			0,
+			42,
+			&config,
+			0,
+			42,
+			None,
+			&logger,
 		);
 		let expected = flags & 1 == 0 || flags & 2 == 0 && flags & 4 != 0;
 		assert_eq!(result.is_ok(), expected, "configuration {flags}");
@@ -849,23 +860,48 @@ fn test_funding_key_reuse_creation_policy() {
 		let mut sender_config = config.clone();
 		sender_config.channel_handshake_config.reuse_funding_key_on_splice = false;
 		let mut sender = OutboundV1Channel::<&TestKeysInterface>::new(
-			&fee_estimator, &&sender_keys, &&sender_keys, peer, &features, 1_000_000, 0,
-			42, &sender_config, 0, 42, None, &logger,
-		).unwrap();
-		let open = sender.get_open_channel(ChainHash::using_genesis_block(Network::Testnet), &&logger).unwrap();
+			&fee_estimator,
+			&&sender_keys,
+			&&sender_keys,
+			peer,
+			&features,
+			1_000_000,
+			0,
+			42,
+			&sender_config,
+			0,
+			42,
+			None,
+			&logger,
+		)
+		.unwrap();
+		let open = sender
+			.get_open_channel(ChainHash::using_genesis_block(Network::Testnet), &&logger)
+			.unwrap();
 		if flags & 4 == 0 {
 			keys.next_signer_disabled_ops.lock().unwrap().insert(SignerOp::FundingKeyReuse);
 		}
 		let inbound = InboundV1Channel::<&TestKeysInterface>::new(
-			&fee_estimator, &&keys, &&keys, peer,
-			&channelmanager::provided_channel_type_features(&config), &features,
-			&open, 7, &config, 0, &&logger, false,
+			&fee_estimator,
+			&&keys,
+			&&keys,
+			peer,
+			&channelmanager::provided_channel_type_features(&config),
+			&features,
+			&open,
+			7,
+			&config,
+			0,
+			&&logger,
+			false,
 		);
 		let inbound_expected = flags & 1 == 0 || flags & 2 != 0 || flags & 4 != 0;
 		assert_eq!(inbound.is_ok(), inbound_expected, "inbound configuration {flags}");
 		if let Ok(inbound) = inbound {
-			assert_eq!(inbound.funding.channel_transaction_parameters.reuse_funding_key_on_splice,
-				flags & 1 != 0 && flags & 2 == 0);
+			assert_eq!(
+				inbound.funding.channel_transaction_parameters.reuse_funding_key_on_splice,
+				flags & 1 != 0 && flags & 2 == 0
+			);
 		}
 	}
 }

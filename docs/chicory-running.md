@@ -44,12 +44,6 @@ The patches are required for channel behavior and persisted safety state, not
 only custom message parsing. Do not replace them with unmodified registry crates
 when opening this branch's database. Keep the application lockfile and the local
 source revision together.
-The built-in incremental persister saves a full monitor for chain-derived offline
-custody updates. A host supplying its own native `Persist` implementation must
-honor `ChannelMonitorUpdate::requires_full_monitor_persistence` and keep the
-original update ID for completion. Persisting just that journal delta omits
-independent chain evidence needed at restart.
-
 ## Configure a node through the public builder
 
 This Rust program uses the standard software signer and persistent node store.
@@ -64,7 +58,7 @@ use std::error::Error;
 use std::io::{self, BufRead};
 use std::path::Path;
 use ldk_node::bitcoin::Network;
-use ldk_node::chicory::{JitServiceConfig, OfflineReceiveConfig};
+use ldk_node::chicory::JitServiceConfig;
 use ldk_node::Builder;
 
 fn main() -> Result<(), Box<dyn Error>> {
@@ -103,14 +97,6 @@ fn main() -> Result<(), Box<dyn Error>> {
         fee_ppm: 1000,
         max_client_funding_sats: 500_000,
         max_total_fronted_sats: 2_000_000,
-        offline_receive: OfflineReceiveConfig {
-            enabled: std::env::var("LDK_ENABLE_OFFLINE").as_deref() == Ok("1"),
-            max_slots: 16,
-            max_budget_msat: 100_000_000,
-            max_epoch_blocks: 2016,
-            fee_base_msat: 0,
-            fee_ppm: 0,
-        },
         ..JitServiceConfig::default()
     })?;
     let node = builder.build()?;
@@ -144,15 +130,11 @@ fn main() -> Result<(), Box<dyn Error>> {
 The capital and fee numbers above are explicit examples. JIT funding spends the
 native wallet. The lifetime allocation ceiling is charged before funding and
 retained conservatively across failures and restarts; it is not a daily limit.
-Mining fees and the wallet's required reserves are additional. The provider does
-not fund an offline reservation merely because a phone requested one.
+Mining fees and the wallet's required reserves are additional.
 A host that also calls manual funding APIs must wrap channel opens, splices and
 Bitcoin sends with `Node::with_chicory_wallet_operation`. The native daemon does
-this automatically; unwrapped host calls remain outside the funding lease. Offline
-custody has non-evicting lifetime limits of 128 home identities globally and
-4,096 archived voucher hashes or burned epoch identifiers per home. The opaque
-backup store admits 1,024 peers. Exhaustion refuses new admissions; restarting
-is not a way to clear persisted custody or safe replay protection.
+this automatically; unwrapped host calls remain outside the funding lease. The
+opaque backup store admits 1,024 peers. Exhaustion refuses new admissions.
 
 `relay_enabled` handles sealed direct-funding protocol messages, independently of
 the optional Iroh network relay. Confirmed v2 acceptance and stable funding keys
@@ -212,23 +194,10 @@ subsequent Lightning spends; see [the evidence](qualification/ios-electrum-direc
    before relying on that pairing. JIT fees reduce the amount credited to the
    home; use the compatibility record for the current Activity display caveat.
 
-Offline receiving is a separate opt-in via `LDK_ENABLE_OFFLINE=1`. The installed
-phone needs an existing compatible home and sufficient provider outbound balance
-for its voucher reservation and headroom. Add local liquidity through the normal
-`Node::splice_in` API when needed. The phone must complete its signed reservation
-while online before an offline invoice is usable. Keep the primary running and
-connected to the Lightning network while the phone is offline. Disabling new
-offline admissions later does not erase existing settlement obligations.
-Closing admission to an unpaid concurrent-v2 reservation leaves it in DRAINING.
-The reserved voucher still blocks splicing and cooperative close on that home.
-Clearing unpaid custody can require a native force-close and the actual voucher
-timeout transaction reaching six confirmations; it is not an immediate return
-to an ordinary usable home. The funded unpaid-lifecycle test covers this path.
-
 The small console host above is for local operation. A long-running application
 should process its event queue continuously, record application outcomes before
 `event_handled`, expose authenticated administration, and stop the node on orderly
-shutdown. Do not log secret-bearing payment payloads or offline receipts. Preserve
+shutdown. Do not log secret-bearing payment payloads. Preserve
 the full store, channel monitors, native seed, and journals across restart; the
 phone's encrypted peer backup is not a replacement for the provider's own state.
 
@@ -246,19 +215,6 @@ the bridge. Forced public-relay, discovery, fallback and native iOS checks have
 separate evidence. Use the current verification record for their exact
 installed-phone evidence rather than assuming transport success proves payments.
 
-The installed portable runtime has a separate reconnect-watchdog limitation.
-Eight seconds after a primary connection, a temporary FFOR setup hold can be
-mistaken for failed reestablishment and cause a forced reconnect, even after
-successful payments. Direct Iroh baseline wallet checks passed, but the first
-offline test hit this watchdog. A qualification fixture can wait for the initial
-watchdog to finish while the restored channel is stable and usable before
-starting offline setup. This scheduling workaround leaves the installed engine
-unchanged and is not a production fix. See the bridge documentation for the
-owning source and the measured scope, and
-[Beignet issue 1872](https://github.com/coreyphillips/beignet/issues/1872) for the
-integration report.
-
-
 ## Dashboard daemon
 
 For persistent administration use the [native daemon](../tools/ldk-node-daemon/README.md)
@@ -266,6 +222,6 @@ and the separate local `ldk-node-umbrel` checkout. The daemon accepts Mainnet,
 Testnet, Signet or Regtest with a matching Core, Electrum or Esplora backend. Its
 private JSONL pipe is intended for an authenticated manager, not direct network
 exposure. The dashboard supplies operator authentication, payment review, peer
-and channel controls, pairing QR codes, durable events, and offline custody status.
+and channel controls, pairing QR codes, and durable events.
 Use the package's local image loading instructions for AMD64 or ARM64. There is
 no published registry image or public app-store URL for this local build.

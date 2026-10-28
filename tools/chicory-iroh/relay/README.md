@@ -1,5 +1,9 @@
 # Forced public relay qualification
 
+FFOR offline receiving has been removed from this branch. Historical mixed
+qualification records below describe their original builds; any offline-receive
+results in them are excluded from the current implementation and test scope.
+
 This local test adapter runs only the Iroh endpoint in a disposable Docker
 network namespace. The installed Chicory portable engine, wallet-core, and
 BOLT8 implementation remain unchanged on the host. Native LDK owns the channel
@@ -65,16 +69,13 @@ The funded installed-wallet fixture uses the same isolation factory:
 ```sh
 CHICORY_PRIMARY_BIN=/absolute/path/to/chicory-primary-local \
 IROH_BINDING_PATH=/absolute/path/to/node_modules/@number0/iroh \
-CHICORY_ENABLE_OFFLINE=1 CHICORY_TEST_OFFLINE=1 \
-CHICORY_TEST_OFFLINE_CONCURRENT=1 \
 CHICORY_TEST_IROH=1 CHICORY_TEST_IROH_RELAY=1 \
 BEIGNET_EVIDENCE_FILE=/tmp/chicory-relay-wallet.json \
 node scripts/chicory-portable-interop.cjs
 ```
 
 Set `CHICORY_TEST_IROH_DISCOVERY=1` to omit the relay query from the primary URI
-and use default endpoint discovery. Neither relay mode inserts the historical
-nine-second offline setup delay. Coordinate this funded fixture with all other
+and use default endpoint discovery. Coordinate this funded fixture with all other
 users of its regtest chain. Its default Core RPC and Electrum settings refer to
 the repository's local Docker fixture; use the documented environment variables
 in the script to select another regtest instance.
@@ -129,8 +130,6 @@ CHICORY_TEST_TOR_FALLBACK=1 node --test tools/chicory-iroh/tor.test.cjs
 
 CHICORY_PRIMARY_BIN=/absolute/path/to/chicory-primary-local \
 IROH_BINDING_PATH=/absolute/path/to/node_modules/@number0/iroh \
-CHICORY_ENABLE_OFFLINE=1 CHICORY_TEST_OFFLINE=1 \
-CHICORY_TEST_OFFLINE_CONCURRENT=1 \
 CHICORY_TEST_IROH=1 CHICORY_TEST_IROH_FALLBACK=1 \
 BEIGNET_EVIDENCE_FILE=/tmp/chicory-onion-fallback-wallet.json \
 node scripts/chicory-portable-interop.cjs
@@ -143,7 +142,7 @@ The Tor image pins Tor 0.4.9.14 and the same Node Alpine base digest.
 
 The installed wallet passed all eleven funded checks over forced public relay
 transport with its original installed engine and no artificial offline setup
-delay. The test covers pairing, 19,880-sat net JIT receipt, wallet restart,
+delay. That historical test covered pairing, 19,880-sat net JIT receipt, wallet restart,
 outgoing payment, an active concurrent offline reservation, ordinary payments
 while that reservation exists, a 5,000-sat external payment while the phone is
 stopped, provider restarts, and two phone reopens with exactly one recovered

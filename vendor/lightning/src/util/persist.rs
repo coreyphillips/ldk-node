@@ -1216,7 +1216,6 @@ where
 		let mut res_c = None;
 		if let Some(update) = update {
 			let persist_update = update.update_id != LEGACY_CLOSED_CHANNEL_UPDATE_ID
-				&& !update.requires_full_monitor_persistence()
 				&& self.maximum_pending_updates != 0
 				&& update.update_id % self.maximum_pending_updates != 0;
 			if persist_update {

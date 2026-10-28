@@ -5447,7 +5447,6 @@ fn max_out_mpp_path() {
 	nodes[0].node.get_and_clear_pending_msg_events();
 }
 
-
 #[test]
 fn test_real_channel_liquidity_shortfall_interception() {
 	for mode in 0..3 {
@@ -5457,25 +5456,47 @@ fn test_real_channel_liquidity_shortfall_interception() {
 		config.channel_handshake_config.max_inbound_htlc_value_in_flight_percent_of_channel = 100;
 		let mut primary_config = config.clone();
 		primary_config.intercept_liquidity_shortfalls = mode != 0;
-		let node_chanmgrs = create_node_chanmgrs(3, &node_cfgs, &[Some(config.clone()), Some(primary_config), Some(config)]);
+		let node_chanmgrs = create_node_chanmgrs(
+			3,
+			&node_cfgs,
+			&[Some(config.clone()), Some(primary_config), Some(config)],
+		);
 		let nodes = create_network(3, &node_cfgs, &node_chanmgrs);
 		create_announced_chan_between_nodes(&nodes, 0, 1);
-		let (_, _, home_id, _) = create_announced_chan_between_nodes_with_value(&nodes, 1, 2, 1_000_000, 980_000_000);
+		let (_, _, home_id, _) =
+			create_announced_chan_between_nodes_with_value(&nodes, 1, 2, 1_000_000, 980_000_000);
 		// Opening the second hop advances its participants. Catch the payer up
 		// to the same actual block history before constructing a common expiry
 		// chain, including under the strict full-block connection modes.
 		let payer_height = nodes[0].best_block_info().1;
-		let later_blocks = nodes[1].blocks.lock().unwrap().iter()
-			.filter(|(_, height)| *height > payer_height).map(|(block, _)| block.clone()).collect::<Vec<_>>();
-		for block in later_blocks { connect_block(&nodes[0], &block); }
+		let later_blocks = nodes[1]
+			.blocks
+			.lock()
+			.unwrap()
+			.iter()
+			.filter(|(_, height)| *height > payer_height)
+			.map(|(block, _)| block.clone())
+			.collect::<Vec<_>>();
+		for block in later_blocks {
+			connect_block(&nodes[0], &block);
+		}
 		assert_eq!(nodes[0].best_block_info(), nodes[1].best_block_info());
 		let amount = 30_000_000;
-		let (route, hash, preimage, secret) = get_route_and_payment_hash!(nodes[0], nodes[2], amount);
+		let (route, hash, preimage, secret) =
+			get_route_and_payment_hash!(nodes[0], nodes[2], amount);
 		let real_scid = route.paths[0].hops[1].short_channel_id;
 		let node_a = nodes[0].node.get_our_node_id();
 		let node_b = nodes[1].node.get_our_node_id();
 		let node_c = nodes[2].node.get_our_node_id();
-		nodes[0].node.send_payment_with_route(route, hash, RecipientOnionFields::secret_only(secret), PaymentId(hash.0)).unwrap();
+		nodes[0]
+			.node
+			.send_payment_with_route(
+				route,
+				hash,
+				RecipientOnionFields::secret_only(secret),
+				PaymentId(hash.0),
+			)
+			.unwrap();
 		check_added_monitors(&nodes[0], 1);
 		let payment = SendEvent::from_node(&nodes[0]);
 		nodes[1].node.handle_update_add_htlc(node_a, &payment.msgs[0]);
@@ -5495,7 +5516,13 @@ fn test_real_channel_liquidity_shortfall_interception() {
 		}
 		assert_eq!(events.len(), 1);
 		let intercept_id = match events[0] {
-			Event::HTLCIntercepted { intercept_id, payment_hash, requested_next_hop_scid, expected_outbound_amount_msat, .. } => {
+			Event::HTLCIntercepted {
+				intercept_id,
+				payment_hash,
+				requested_next_hop_scid,
+				expected_outbound_amount_msat,
+				..
+			} => {
 				assert_eq!(payment_hash, hash);
 				assert_eq!(requested_next_hop_scid, real_scid);
 				assert_eq!(expected_outbound_amount_msat, amount);
@@ -5511,15 +5538,25 @@ fn test_real_channel_liquidity_shortfall_interception() {
 				connect_block(&nodes[0], &block);
 				connect_block(&nodes[1], &block);
 			}
-			let fail_type = HTLCHandlingFailureType::InvalidForward { requested_forward_scid: real_scid };
+			let fail_type =
+				HTLCHandlingFailureType::InvalidForward { requested_forward_scid: real_scid };
 			expect_and_process_pending_htlcs_and_htlc_handling_failed(&nodes[1], &[fail_type]);
 			check_added_monitors(&nodes[1], 1);
 			let failed = get_htlc_update_msgs!(nodes[1], node_a);
 			assert_eq!(failed.update_fail_htlcs.len(), 1);
 			nodes[0].node.handle_update_fail_htlc(node_b, &failed.update_fail_htlcs[0]);
 			commitment_signed_dance!(nodes[0], nodes[1], failed.commitment_signed, false);
-			expect_payment_failed!(nodes[0], hash, false, LocalHTLCFailureReason::TemporaryNodeFailure, []);
-			assert!(nodes[1].node.forward_intercepted_htlc(intercept_id, &home_id, node_c, amount).is_err());
+			expect_payment_failed!(
+				nodes[0],
+				hash,
+				false,
+				LocalHTLCFailureReason::TemporaryNodeFailure,
+				[]
+			);
+			assert!(nodes[1]
+				.node
+				.forward_intercepted_htlc(intercept_id, &home_id, node_c, amount)
+				.is_err());
 		} else {
 			// Restoring capacity through a normal payment makes the same preserved
 			// onion forwardable, without creating a second receiver channel.

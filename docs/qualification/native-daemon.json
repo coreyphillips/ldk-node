@@ -1,4 +1,5 @@
 {
+  "qualificationScope": {"recordKind": "historical", "currentBranchExclusions": ["FFOR offline receiving, admission, settlement and offline status were removed on 2026-10-28."], "resultMeaning": "All original results and counts describe the recorded build; they are not current-branch test status."},
   "scope": "native-administration-additions",
   "source_revision": "35b49a99bdff7edbe3c97dd5a605edf6e878ead4",
   "checks": [

@@ -13,10 +13,6 @@ members = ["."]
 [dependencies]
 libfuzzer-sys = "0.4"
 ldk-node = { path = "..", features = ["chicory"] }
-lightning = { path = "../vendor/lightning", optional = true }
-
-[features]
-native-ffor-fuzz = ["dep:lightning"]
 
 [patch.crates-io]
 lightning = { path = "../vendor/lightning" }
@@ -28,14 +24,6 @@ path = "wire_boundary.rs"
 [[bin]]
 name = "chicory_wire"
 path = "fuzz_targets/chicory_wire.rs"
-test = false
-doc = false
-bench = false
-
-[[bin]]
-name = "chicory_ffor"
-path = "fuzz_targets/chicory_ffor.rs"
-required-features = ["native-ffor-fuzz"]
 test = false
 doc = false
 bench = false

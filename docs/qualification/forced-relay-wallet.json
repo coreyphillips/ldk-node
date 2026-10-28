@@ -1,4 +1,5 @@
 {
+  "qualificationScope": {"recordKind": "historical", "currentBranchExclusions": ["FFOR offline receiving, admission, settlement and offline status were removed on 2026-10-28."], "resultMeaning": "All original results and counts describe the recorded build; they are not current-branch test status."},
   "scope": "installed-chicory-portable-forced-public-relay",
   "checks": [
     {

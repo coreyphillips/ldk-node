@@ -80,6 +80,8 @@
 
 ## Synonym Fork Additions
 
+- Remove the experimental Beignet FFOR protocol, offline-receive APIs, and voucher custody implementation from the local Chicory branch. Existing FFOR custody stores are unsupported; retain the previous binary and storage for recovery.
+
 - Added native Beignet v3 `bgnq` payment requests and payments with confirmed external-input channel opens and splices, bounded authenticated transport, durable witness recovery and wallet coin reservations. Exposed request creation, validation, revocation and payment activity through UniFFI for compatible Android clients. See [direct funding](docs/direct-funding.md).
 
 - Accept incoming payments up to the full channel value, instead of 10% of it, on nodes that cannot announce channels (no node alias or listening addresses), for channels opened after the update.

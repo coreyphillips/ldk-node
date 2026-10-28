@@ -1,5 +1,9 @@
 # Optional Iroh transport for native LDK Node
 
+FFOR offline receiving has been removed from this branch. Historical mixed
+qualification records below describe their original builds; any offline-receive
+results in them are excluded from the current implementation and test scope.
+
 This local tool forwards one ordered QUIC stream using ALPN `beignet/bolt8/1`
 to an explicitly configured loopback TCP listener. Native LDK performs BOLT8
 authentication and owns all Lightning keys, channels, payments, and persistence.
@@ -32,12 +36,12 @@ accept/refusal cleanup, nonzero CLI failure exit, and shutdown. A separate nativ
 BOLT8 test passed the authenticated handshake and decrypted native `init` over
 the same direct bridge. These checks do not qualify phone payments or relays.
 
-The installed portable wallet also passed six baseline checks over the direct
-bridge, including JIT receipt, wallet restart, and an outgoing payment. Its
-subsequent offline setup exposed a portable-runtime watchdog bug: eight seconds
-after connecting, the wallet tests current HTLC admission rather than whether
-reestablishment completed. A legitimate FFOR setup hold can therefore force a
-reconnect on an already working channel. See the installed
+At the historical checkpoint, the installed portable wallet passed six baseline
+checks over the direct bridge, including JIT receipt, wallet restart, and an
+outgoing payment. The removed offline fixture then exposed a portable-runtime
+watchdog bug: eight seconds after connecting, that wallet tested current HTLC
+admission instead of whether reestablishment had completed. A temporary setup
+hold forced a reconnect on an already working channel. See that version's
 [`portable/runtime.ts` watchdog](https://github.com/coreyphillips/beignet-portable-engine/blob/67bc9cf0ba3e55fa1e1d7ad73e360bb04321a62c/portable/runtime.ts#L644).
 The integration report is tracked in
 [Beignet issue 1872](https://github.com/coreyphillips/beignet/issues/1872).
@@ -47,14 +51,14 @@ the final bridge failure-handling fix, the same eleven checks passed again:
 ordinary payments with an active reservation, settlement while the phone was
 stopped, primary restarts, and exactly one recovered 5,000-sat credit through two
 phone reopens. The evidence is retained in
-[`final-iroh.json`](../../docs/qualification/final-iroh.json). The wait is a test
-scheduling workaround; it does not fix the installed wallet. Those historical
+[`final-iroh.json`](../../docs/qualification/final-iroh.json). The wait was a test
+scheduling workaround; it did not fix that installed wallet. Those historical
 results establish only the direct portable path.
 
 The local portable-engine patch now limits that watchdog to an incomplete
-reestablishment exchange and cancels stale connection generations. The current
-fixture no longer inserts a delay before offline setup. Its historical evidence
-still records the original workaround accurately.
+reestablishment exchange and cancels stale connection generations. The historical evidence
+records the original workaround accurately; the current fixture omits the removed
+offline-receive scenarios.
 
 A later bounded check reached the public relay with discovery disabled and no
 supplied direct addresses, using a fresh unfunded normal-feature native host.
@@ -68,7 +72,7 @@ This test used read-only Electrum access at `mint.local:60401`, moved no funds,
 and closed both endpoints and the native host afterward. That exploratory test
 did not establish continuous relay-only traffic.
 
-A subsequent isolated-container test now forces public relay transport by
+A subsequent isolated-container test forced public relay transport by
 blocking endpoint UDP in its own network namespace. Ordered bytes with both
 explicit relay addressing and default discovery, plus authenticated native
 BOLT8, passed with exact firewall and process-privilege evidence. A disposable

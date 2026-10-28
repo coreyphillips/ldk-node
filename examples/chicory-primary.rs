@@ -11,7 +11,7 @@ use std::str::FromStr;
 use std::sync::Arc;
 
 use ldk_node::bitcoin::Network;
-use ldk_node::chicory::{JitServiceConfig, OfflineReceiveConfig};
+use ldk_node::chicory::JitServiceConfig;
 use ldk_node::lightning_invoice::{Bolt11Invoice, Bolt11InvoiceDescription, Description};
 use ldk_node::payment::ConfirmationStatus;
 use ldk_node::{Builder, Event, Node};
@@ -218,10 +218,6 @@ fn main() -> Result<(), Box<dyn Error>> {
 	} else if std::env::var("LFBW_DISABLE_PROVIDER").as_deref() != Ok("1") {
 		builder.set_chicory_service(JitServiceConfig {
 			enabled: true,
-			offline_receive: OfflineReceiveConfig {
-				enabled: std::env::var("CHICORY_ENABLE_OFFLINE").as_deref() == Ok("1"),
-				..OfflineReceiveConfig::default()
-			},
 			relay_enabled: true,
 			allow_confirmed_v2: true,
 			allow_splice_jit: true,

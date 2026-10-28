@@ -2,7 +2,7 @@
 'use strict';
 
 // Funded regtest qualification of the native JIT subset. This does not qualify
-// direct funding, FFOR settlement, restored-wallet recovery, Iroh, or full parity.
+// direct funding, restored-wallet recovery, Iroh, or full parity.
 // Build first: cargo build --features chicory --example chicory-primary
 // Run: BEIGNET_SOURCE_DIR=/path/to/built/beignet node scripts/chicory-interop.cjs
 const assert = require('node:assert/strict');
@@ -302,16 +302,6 @@ async function main() {
     assert.equal(forwarded.subtype, 16);
     assert.deepEqual(forwarded.payload, relayPayload);
     pass('native relay preserves opaque bytes and stamps authenticated sender');
-
-    const offlineId = randomBytes(16).toString('hex');
-    const offline = await customExchange(receiver, providerKey, 81,
-      bytes => JSON.parse(bytes.toString('utf8')), () => receiver.getNode().sendCustomMessage(
-        providerKey, 80, Buffer.from(JSON.stringify({ id: offlineId, op: 'quote' }))));
-    assert.equal(offline.id, offlineId);
-    assert.equal(offline.ok, false);
-    assert.equal(typeof offline.error, 'string');
-    assert.ok(offline.error.length > 0 && offline.error.length <= 500);
-    pass('unsupported offline receive returns a correlated explicit refusal');
 
     const payerAddress = await payer.getNewAddress();
     assert.match(payerAddress, /^bcrt1/);

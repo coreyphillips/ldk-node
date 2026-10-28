@@ -27,32 +27,6 @@ use crate::primary_wire as wire;
 pub(crate) enum NodeCustomMessage {
 	Liquidity(RawLSPSMessage),
 	Beignet(wire::Envelope),
-	#[cfg(feature = "chicory")]
-	Ffor(FforFrame),
-}
-
-/// Transport framing only. The native engine validates signatures, channel
-/// identity and durable state before any protocol transition.
-#[cfg(feature = "chicory")]
-pub(crate) struct FforFrame {
-	message_type: u16,
-	payload: Vec<u8>,
-}
-
-#[cfg(feature = "chicory")]
-impl std::fmt::Debug for FforFrame {
-	fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-		formatter
-			.debug_struct("FforFrame")
-			.field("message_type", &self.message_type)
-			.field("payload_len", &self.payload.len())
-			.finish()
-	}
-}
-
-#[cfg(feature = "chicory")]
-fn is_ffor_message_type(message_type: u16) -> bool {
-	matches!(message_type, 55001 | 55003 | 55045 | 55047 | 55049 | 55051 | 55053 | 55075 | 55077)
 }
 
 impl Writeable for NodeCustomMessage {
@@ -68,18 +42,6 @@ impl Writeable for NodeCustomMessage {
 				})?;
 				writer.write_all(&bytes)
 			},
-			#[cfg(feature = "chicory")]
-			Self::Ffor(message) => {
-				if !is_ffor_message_type(message.message_type)
-					|| !(128..=65_533).contains(&message.payload.len())
-				{
-					return Err(lightning::io::Error::new(
-						lightning::io::ErrorKind::InvalidInput,
-						"invalid FFOR frame",
-					));
-				}
-				writer.write_all(&message.payload)
-			},
 		}
 	}
 }
@@ -89,8 +51,6 @@ impl Type for NodeCustomMessage {
 		match self {
 			Self::Liquidity(message) => message.type_id(),
 			Self::Beignet(_) => wire::CUSTOM_MESSAGE_TYPE,
-			#[cfg(feature = "chicory")]
-			Self::Ffor(message) => message.message_type,
 		}
 	}
 }
@@ -169,16 +129,6 @@ where
 	fn read<RD: LengthLimitedRead>(
 		&self, message_type: u16, buffer: &mut RD,
 	) -> Result<Option<Self::CustomMessage>, lightning::ln::msgs::DecodeError> {
-		#[cfg(feature = "chicory")]
-		if is_ffor_message_type(message_type) && self.chicory_service.is_some() {
-			let length = buffer.remaining_bytes();
-			if !(128..=65_533).contains(&length) {
-				return Ok(None);
-			}
-			let mut payload = vec![0; length as usize];
-			buffer.read_exact(&mut payload)?;
-			return Ok(Some(NodeCustomMessage::Ffor(FforFrame { message_type, payload })));
-		}
 		if message_type == wire::CUSTOM_MESSAGE_TYPE && self.has_beignet_handler() {
 			// BOLT 8 already limits frames. Keep the bound here as well for callers
 			// that invoke the reader directly, before allocating from untrusted input.
@@ -227,16 +177,6 @@ where
 					service.handle_message(sender_node_id, message);
 				}
 			},
-			#[cfg(feature = "chicory")]
-			NodeCustomMessage::Ffor(message) => {
-				if let Some(service) = &self.chicory_service {
-					service.handle_ffor_message(
-						sender_node_id,
-						message.message_type,
-						&message.payload,
-					);
-				}
-			},
 		}
 		Ok(())
 	}
@@ -281,20 +221,6 @@ where
 						.into_iter()
 						.map(|(peer, message)| (peer, NodeCustomMessage::Beignet(message))),
 				);
-				// Native dequeue advances completion-gated actions. Preserve its
-				// order: accept/activation frames precede the native channel updates
-				// that the next peer-manager event loop may collect.
-				messages.extend(service.get_and_clear_pending_ffor_messages().into_iter().map(
-					|message| {
-						(
-							message.peer,
-							NodeCustomMessage::Ffor(FforFrame {
-								message_type: message.message_type,
-								payload: message.payload,
-							}),
-						)
-					},
-				));
 			}
 			messages
 		};
@@ -309,7 +235,7 @@ where
 	}
 
 	fn provided_init_features(&self, peer: PublicKey) -> InitFeatures {
-		// Native ChannelManager owns channel feature negotiation, including FFOR.
+		// Native ChannelManager owns channel feature negotiation.
 		// This application handler contributes only independent LSPS features.
 		self.liquidity_source
 			.as_ref()
@@ -344,43 +270,19 @@ where
 	}
 }
 
-#[cfg(all(test, feature = "chicory"))]
-mod ffor_frame_tests {
-	use super::*;
-
-	#[test]
-	fn ffor_frames_preserve_body_without_a_second_message_prefix() {
-		for message_type in [55001, 55003, 55045, 55047, 55049, 55051, 55053, 55075, 55077] {
-			for length in [128, 65_533] {
-				let message =
-					NodeCustomMessage::Ffor(FforFrame { message_type, payload: vec![7; length] });
-				assert_eq!(message.type_id(), message_type);
-				assert_eq!(message.encode(), vec![7; length]);
-			}
-		}
-		for (message_type, length) in [(55001, 127), (55001, 65_534), (55005, 128)] {
-			let message =
-				NodeCustomMessage::Ffor(FforFrame { message_type, payload: vec![7; length] });
-			assert!(message.write(&mut Vec::new()).is_err());
-		}
-	}
-
-	#[test]
-	fn custom_message_diagnostics_do_not_reveal_ffor_receipts() {
-		let first =
-			NodeCustomMessage::Ffor(FforFrame { message_type: 55077, payload: vec![17; 160] });
-		let second =
-			NodeCustomMessage::Ffor(FforFrame { message_type: 55077, payload: vec![241; 160] });
-		assert_eq!(format!("{first:?}"), format!("{second:?}"));
-	}
-}
-
-#[cfg(all(test, not(feature = "chicory")))]
+#[cfg(test)]
 mod compatibility_review_tests {
 	use super::*;
 	use bitcoin::secp256k1::{Secp256k1, SecretKey};
 	use lightning::util::logger::Record;
 	use lightning_liquidity::lsps0::ser::LSPS_MESSAGE_TYPE_ID;
+
+	#[cfg(feature = "chicory")]
+	use crate::builder::NodeBuilder;
+	#[cfg(feature = "chicory")]
+	use crate::chicory::JitServiceConfig;
+	#[cfg(feature = "chicory")]
+	use crate::io::test_utils::InMemoryStore;
 
 	struct SilentLogger;
 	impl Logger for SilentLogger {
@@ -412,6 +314,28 @@ mod compatibility_review_tests {
 				key,
 			)
 			.unwrap();
+	}
+
+	#[cfg(feature = "chicory")]
+	#[test]
+	fn active_chicory_service_ignores_removed_offline_message_types() {
+		let mut builder = NodeBuilder::new();
+		builder.set_entropy_seed_bytes([53; 64]);
+		builder.set_log_facade_logger();
+		builder.set_chicory_service(JitServiceConfig::default()).unwrap();
+		let node = builder.build_with_store(Arc::new(InMemoryStore::new())).unwrap();
+		let handler = NodeCustomMessageHandler::<Arc<SilentLogger>>::new_ignoring()
+			.with_chicory(node.chicory_service.clone());
+		assert!(handler.has_beignet_handler());
+		for message_type in [55001, 55003, 55045, 55047, 55049, 55051, 55053, 55075, 55077] {
+			for length in [128, 65_533] {
+				let bytes = vec![7; length];
+				let mut input = bytes.as_slice();
+				assert!(handler.read(message_type, &mut input).unwrap().is_none());
+				assert_eq!(input, bytes.as_slice());
+			}
+		}
+		assert!(handler.get_and_clear_pending_msg().is_empty());
 	}
 
 	#[test]

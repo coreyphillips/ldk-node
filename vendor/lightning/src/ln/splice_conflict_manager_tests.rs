@@ -336,7 +336,8 @@ fn do_splice_conflict(restart: bool, terminal_reorg_back: Option<bool>) {
 		let (_, monitor) = <(BlockHash, crate::chain::channelmonitor::ChannelMonitor<_>)>::read(
 			&mut io::Cursor::new(get_monitor!(nodes[0], channel).encode()),
 			(nodes[0].keys_manager, nodes[0].keys_manager),
-		).unwrap();
+		)
+		.unwrap();
 		assert!(!monitor.is_retired_funding_terminal());
 		let broadcaster = crate::util::test_utils::TestBroadcaster::with_blocks(
 			nodes[0].tx_broadcaster.blocks.clone(),
@@ -344,16 +345,36 @@ fn do_splice_conflict(restart: bool, terminal_reorg_back: Option<bool>) {
 		// Only the monitor observes a replacement branch. The saved manager is
 		// from before this onchain event, with identical monitor update IDs.
 		let fork = create_dummy_header(confirmation_hash, 71);
-		monitor.best_block_updated(&fork, confirmation_height - 1, &broadcaster,
-			nodes[0].fee_estimator, &nodes[0].logger);
+		monitor.best_block_updated(
+			&fork,
+			confirmation_height - 1,
+			&broadcaster,
+			nodes[0].fee_estimator,
+			&nodes[0].logger,
+		);
 		let branch = create_dummy_header(fork.block_hash(), 72);
-		monitor.transactions_confirmed(&branch, &[(0, &candidate)], confirmation_height,
-			&broadcaster, nodes[0].fee_estimator, &nodes[0].logger);
-		monitor.best_block_updated(&branch, confirmation_height, &broadcaster,
-			nodes[0].fee_estimator, &nodes[0].logger);
+		monitor.transactions_confirmed(
+			&branch,
+			&[(0, &candidate)],
+			confirmation_height,
+			&broadcaster,
+			nodes[0].fee_estimator,
+			&nodes[0].logger,
+		);
+		monitor.best_block_updated(
+			&branch,
+			confirmation_height,
+			&broadcaster,
+			nodes[0].fee_estimator,
+			&nodes[0].logger,
+		);
 		if reorg_back {
-			monitor.transaction_unconfirmed(&candidate.compute_txid(), &broadcaster,
-				nodes[0].fee_estimator, &nodes[0].logger);
+			monitor.transaction_unconfirmed(
+				&candidate.compute_txid(),
+				&broadcaster,
+				nodes[0].fee_estimator,
+				&nodes[0].logger,
+			);
 			assert_eq!(monitor.get_funding_txo(), original);
 		}
 		assert!(monitor.is_retired_funding_terminal());
@@ -363,15 +384,34 @@ fn do_splice_conflict(restart: bool, terminal_reorg_back: Option<bool>) {
 			let peers = nodes[0].node.per_peer_state.read().unwrap();
 			let peer_state = peers[&peer].lock().unwrap();
 			let channel = peer_state.channel_by_id[&channel].as_funded().unwrap();
-			assert_eq!(channel.context.get_latest_monitor_update_id(), monitor.get_latest_update_id());
-			assert!(channel.get_cur_holder_commitment_transaction_number() <= monitor.get_cur_holder_commitment_number());
-			assert!(channel.get_cur_counterparty_commitment_transaction_number() <= monitor.get_cur_counterparty_commitment_number());
-			assert!(channel.get_revoked_counterparty_commitment_transaction_number() <= monitor.get_min_seen_secret());
+			assert_eq!(
+				channel.context.get_latest_monitor_update_id(),
+				monitor.get_latest_update_id()
+			);
+			assert!(
+				channel.get_cur_holder_commitment_transaction_number()
+					<= monitor.get_cur_holder_commitment_number()
+			);
+			assert!(
+				channel.get_cur_counterparty_commitment_transaction_number()
+					<= monitor.get_cur_counterparty_commitment_number()
+			);
+			assert!(
+				channel.get_revoked_counterparty_commitment_transaction_number()
+					<= monitor.get_min_seen_secret()
+			);
 		}
 		let encoded = monitor.encode();
 		nodes[0].tx_broadcaster.txn_broadcasted.lock().unwrap().clear();
-		reload_node!(nodes[0], config, &manager, &[&encoded], terminal_persister,
-			terminal_chain_monitor, terminal_manager);
+		reload_node!(
+			nodes[0],
+			config,
+			&manager,
+			&[&encoded],
+			terminal_persister,
+			terminal_chain_monitor,
+			terminal_manager
+		);
 		assert!(nodes[0].node.list_channels().is_empty());
 		let events = nodes[0].node.get_and_clear_pending_events();
 		assert!(events.iter().any(|event| matches!(event, Event::ChannelClosed {
@@ -379,8 +419,14 @@ fn do_splice_conflict(restart: bool, terminal_reorg_back: Option<bool>) {
 		} if *channel_id == channel)));
 		check_added_monitors!(nodes[0], 1);
 		assert!(get_monitor!(nodes[0], channel).is_retired_funding_terminal());
-		assert!(!nodes[0].tx_broadcaster.txn_broadcasted.lock().unwrap().iter().any(|transaction|
-			transaction.input.iter().any(|input| input.previous_output.txid == candidate.compute_txid())),
-			"Restart must never broadcast the revoked archived holder commitment");
+		assert!(
+			!nodes[0].tx_broadcaster.txn_broadcasted.lock().unwrap().iter().any(|transaction| {
+				transaction
+					.input
+					.iter()
+					.any(|input| input.previous_output.txid == candidate.compute_txid())
+			}),
+			"Restart must never broadcast the revoked archived holder commitment"
+		);
 	}
 }

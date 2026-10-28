@@ -53,7 +53,7 @@ use crate::types::payment::{PaymentHash, PaymentSecret};
 use crate::types::string::UntrustedString;
 use crate::util::config::{ChannelConfigUpdate, MaxDustHTLCExposure, UserConfig};
 use crate::util::errors::APIError;
-use crate::util::ser::{ReadableArgs, Writeable};
+use crate::util::ser::{Readable, ReadableArgs, Writeable};
 use crate::util::test_channel_signer::TestChannelSigner;
 use crate::util::test_utils::{self, WatchtowerPersister};
 
@@ -75,6 +75,103 @@ use core::iter::repeat;
 use lightning_macros::xtest;
 
 use crate::ln::functional_test_utils::*;
+
+#[test]
+fn removed_ffor_features_are_not_advertised() {
+	let chanmon_cfgs = create_chanmon_cfgs(2);
+	let node_cfgs = create_node_cfgs(2, &chanmon_cfgs);
+	let mut config = test_default_channel_config();
+	config.accept_inbound_channels_v2 = true;
+	config.intercept_liquidity_shortfalls = true;
+	let node_chanmgrs = create_node_chanmgrs(2, &node_cfgs, &[None, Some(config)]);
+	let nodes = create_network(2, &node_cfgs, &node_chanmgrs);
+	for node in &nodes {
+		for features in [
+			node.node.init_features(),
+			node.node.provided_init_features(node.node.get_our_node_id()),
+		] {
+			for bit in [440, 441, 442, 443] {
+				assert_eq!(
+					features.le_flags().get(bit / 8).copied().unwrap_or(0) & (1 << (bit % 8)),
+					0
+				);
+			}
+		}
+	}
+}
+
+#[test]
+fn removed_ffor_monitor_custody_is_rejected() {
+	let chanmon_cfgs = create_chanmon_cfgs(2);
+	let node_cfgs = create_node_cfgs(2, &chanmon_cfgs);
+	let node_chanmgrs = create_node_chanmgrs(2, &node_cfgs, &[None, None]);
+	let nodes = create_network(2, &node_cfgs, &node_chanmgrs);
+	let channel = create_announced_chan_between_nodes(&nodes, 0, 1).2;
+	let monitor = get_monitor!(nodes[0], channel);
+	let bytes = monitor.encode();
+	let signer = &nodes[0].keys_manager.backing;
+	assert!(<(BlockHash, channelmonitor::ChannelMonitor<_>)>::read(
+		&mut &bytes[..],
+		(signer, signer)
+	)
+	.is_ok());
+
+	// Locate the monitor's final length-prefixed TLV stream. Validate its complete
+	// shape so an accidental match inside a transaction cannot satisfy this test.
+	let candidates: Vec<_> = (0..bytes.len())
+		.filter_map(|start| {
+			let mut reader = &bytes[start..];
+			let length = crate::util::ser::BigSize::read(&mut reader).ok()?.0 as usize;
+			if length != reader.len() {
+				return None;
+			}
+			let payload_start = bytes.len() - reader.len();
+			let mut fields = Vec::new();
+			while !reader.is_empty() {
+				let kind = crate::util::ser::BigSize::read(&mut reader).ok()?.0;
+				let length = crate::util::ser::BigSize::read(&mut reader).ok()?.0 as usize;
+				if length > reader.len() || fields.last().is_some_and(|previous| *previous >= kind)
+				{
+					return None;
+				}
+				fields.push(kind);
+				reader = &reader[length..];
+			}
+			if fields.first() != Some(&3)
+				|| fields.last() != Some(&37)
+				|| ![5, 7, 9, 19, 25, 27, 31, 33, 35].iter().all(|kind| fields.contains(kind))
+			{
+				return None;
+			}
+			Some((start, payload_start))
+		})
+		.collect();
+	assert_eq!(candidates.len(), 1);
+	let (start, payload_start) = candidates[0];
+	for kind in [38u8, 39, 40] {
+		let mut modified = bytes[..start].to_vec();
+		crate::util::ser::BigSize((bytes.len() - payload_start + 2) as u64)
+			.write(&mut modified)
+			.unwrap();
+		modified.extend_from_slice(&bytes[payload_start..]);
+		modified.extend_from_slice(&[kind, 0]);
+		let result = <(BlockHash, channelmonitor::ChannelMonitor<_>)>::read(
+			&mut &modified[..],
+			(signer, signer),
+		);
+		if kind == 39 {
+			// Unknown optional metadata remains compatible.
+			assert!(result.is_ok());
+		} else {
+			// The former journal (38) and chain proofs (40) must fail closed.
+			assert!(matches!(result, Err(msgs::DecodeError::UnknownRequiredFeature)));
+		}
+	}
+	assert!(matches!(
+		crate::ln::channelmanager::HTLCSource::read(&mut &[2u8, 0][..]),
+		Err(msgs::DecodeError::UnknownRequiredFeature)
+	));
+}
 
 #[xtest(feature = "_externalize_tests")]
 pub fn fake_network_test() {
@@ -592,7 +689,14 @@ fn test_preimage_claim_reconfirmed_before_event_handled() {
 	// A sees B's commitment transaction confirm.
 	mine_transaction(&nodes[0], &node_1_txn[0]);
 	check_closed_broadcast(&nodes[0], 1, true);
-	check_closed_event(&nodes[0], 1, ClosureReason::CommitmentTxConfirmed, false, &[node_b_id], 100_000);
+	check_closed_event(
+		&nodes[0],
+		1,
+		ClosureReason::CommitmentTxConfirmed,
+		false,
+		&[node_b_id],
+		100_000,
+	);
 	check_added_monitors(&nodes[0], 1);
 
 	// A sees the HTLC-Success confirm, which queues a claim event for the `ChannelManager`. Before
@@ -888,7 +992,7 @@ pub fn test_justice_tx_htlc_timeout() {
 		revoked_local_txn[1].input[0].witness.last().unwrap().len(),
 		OFFERED_HTLC_SCRIPT_WEIGHT
 	); // HTLC-Timeout
-   // Revoke the old state
+	// Revoke the old state
 	claim_payment(&nodes[0], &[&nodes[1]], payment_preimage_3);
 
 	{
@@ -6093,7 +6197,7 @@ pub fn test_announce_disable_channels() {
 		match e {
 			MessageSendEvent::BroadcastChannelUpdate { ref msg } => {
 				assert_eq!(msg.contents.channel_flags & (1 << 1), 1 << 1); // The "channel disabled" bit should be set
-														   // Check that each channel gets updated exactly once
+															   // Check that each channel gets updated exactly once
 				if chans_disabled
 					.insert(msg.contents.short_channel_id, msg.contents.timestamp)
 					.is_some()

@@ -1,5 +1,9 @@
 # Native iOS qualification
 
+FFOR offline receiving has been removed from this branch. Historical mixed
+qualification records below describe their original builds; any offline-receive
+results in them are excluded from the current implementation and test scope.
+
 The simulator fixture runs Chicory's installed wallet engine and wallet-core in
 Hermes with its real native TCP, cryptography, Keychain and SQLCipher adapters.
 Only a separately signed `com.chicory.primaryqualification` app is installed.
@@ -57,8 +61,6 @@ as the portable test, and funds only newly created test wallets.
 ```sh
 CHICORY_TEST_IOS=1 CHICORY_IOS_DEVICE_ID=YOUR_SIMULATOR_UDID \
 CHICORY_IOS_BUNDLE_ID=com.chicory.primaryqualification.run1 \
-CHICORY_ENABLE_OFFLINE=1 CHICORY_TEST_OFFLINE=1 \
-CHICORY_TEST_OFFLINE_CONCURRENT=1 \
 BEIGNET_EVIDENCE_FILE=/tmp/chicory-ios-evidence.json \
   node scripts/chicory-portable-interop.cjs
 ```
@@ -74,8 +76,7 @@ xcrun simctl launch YOUR_SIMULATOR_UDID com.chicory.primaryqualification.run1
 
 The controller performs real app termination and relaunch at each phone restart
 boundary. It waits for the replacement process before sending another command.
-It also restarts the native primary around offline settlement. The fixture
-supports baseline and offline scenarios, native Iroh, and direct funding.
+The fixture supports baseline scenarios, native Iroh, and direct funding.
 Other portable flags are refused so that an unsupported path cannot
 accidentally run on the host.
 
@@ -125,8 +126,7 @@ restarts the primary. The phone uses its ordinary screens throughout.
 
 The controller permits at most 100,000 sats of test payments, at most 50,000
 sats per invoice, and one 100,000-sat capacity extension on the phone's existing
-home. The extension allows the UI offline-receive policy's 50,000-sat inbound
-headroom requirement to be met. It refuses the payer channel. Its authenticated
+home. It refuses the payer channel. Its authenticated
 loopback API expires after 45 minutes and serializes funding and payment
 requests. A deliberate controller restart retains the primary state and
 creates a fresh test payer; no payer phrase is stored for recovery.
@@ -153,8 +153,7 @@ Public observations are retained in
 [`ios-normal-ui.json`](qualification/ios-normal-ui.json), with controller
 operations in [`ios-normal-ui-controller.json`](qualification/ios-normal-ui-controller.json).
 Selected screenshots show the [JIT receive](qualification/ios-normal-ui-received.png),
-[offline receive](qualification/ios-normal-ui-offline.png), and
-[privacy cover](qualification/ios-privacy.png). Additional original screenshots
+and [privacy cover](qualification/ios-privacy.png). Additional original screenshots
 remain under `/tmp/chicory-ios-ui-*.png`. These are test artifacts, not files
 required by the runtime. Background
 coverage means actual simulator background/foreground and cold process loss;

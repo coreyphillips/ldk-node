@@ -3,7 +3,7 @@
 
 // Funded regtest against the exact portable engine and wallet-core installed in
 // Chicory. Native iOS and direct Iroh need their explicit test flags. Optional
-// offline and direct-funding assertions also require CHICORY_TEST_* flags.
+// direct-funding assertions also require CHICORY_TEST_* flags.
 // Build first: cargo build --features chicory --example chicory-primary
 // Run: node scripts/chicory-portable-interop.cjs
 const assert = require('node:assert/strict');
@@ -395,15 +395,6 @@ async function main() {
   if (relayIroh || discoveryIroh) assert.equal(process.env.CHICORY_TEST_IROH, '1', 'Relay qualification requires Iroh');
   if (discoveryIroh) assert.ok(relayIroh, 'Discovery qualification requires public relays');
   if (relayIroh) assert.notEqual(process.env.CHICORY_TEST_IOS, '1', 'Container relay isolation applies to the Node endpoint only');
-  const autoExpireOffline = process.env.CHICORY_TEST_OFFLINE_AUTO_EXPIRE === '1';
-  const unpaidOffline = process.env.CHICORY_TEST_OFFLINE_UNPAID === '1' || autoExpireOffline;
-  if (unpaidOffline) {
-    assert.equal(process.env.CHICORY_TEST_OFFLINE, '1', 'Unpaid reservation qualification requires the offline fixture');
-    for (const flag of ['IOS', 'IROH', 'OFFLINE_CONCURRENT', 'RECOVERY', 'RECOVERY_SWEEP',
-      'INITIAL_DEPOSIT', 'JIT_SPLICE', 'SPLICES', 'DIRECT_FUNDING', 'CONFLICT', 'SEND_MAX', 'DRAIN']) {
-      assert.ok(!process.env['CHICORY_TEST_' + flag], 'Run unpaid reservation retirement as a separate portable fixture');
-    }
-  }
   assert.ok(Number.isSafeInteger(timeoutMs) && timeoutMs >= 30000 && timeoutMs <= 600000);
   assert.ok(fs.existsSync(binary), 'Build the chicory-primary Rust example first');
   evidence.primaryBinarySha256 = fingerprint(binary);
@@ -442,7 +433,7 @@ async function main() {
     if (process.env.CHICORY_TEST_IOS === '1') {
       for (const flag of ['INITIAL_DEPOSIT', 'RECOVERY', 'RECOVERY_SWEEP', 'JIT_SPLICE',
         'SPLICES', 'CONFLICT', 'SEND_MAX', 'DRAIN']) {
-        assert.ok(!process.env['CHICORY_TEST_' + flag], 'Native simulator fixture supports baseline, direct funding and offline cases only');
+        assert.ok(!process.env['CHICORY_TEST_' + flag], 'Native simulator fixture supports baseline and direct funding cases only');
       }
       iosHarness = await require('./chicory-ios-harness.cjs').createIosHarness();
       ({ createPortableRuntime, EmbeddedWalletClient } = iosHarness);
@@ -456,7 +447,7 @@ async function main() {
     if (process.env.CHICORY_TEST_IROH === '1') {
       for (const flag of ['INITIAL_DEPOSIT', 'RECOVERY', 'RECOVERY_SWEEP', 'JIT_SPLICE',
         'SPLICES', 'DIRECT_FUNDING', 'CONFLICT', 'SEND_MAX', 'DRAIN']) {
-        assert.ok(!process.env['CHICORY_TEST_' + flag], 'Iroh fixture supports baseline and offline cases only');
+        assert.ok(!process.env['CHICORY_TEST_' + flag], 'Iroh fixture supports baseline cases only');
       }
       if (process.env.CHICORY_TEST_IOS === '1' && !fallbackIroh) {
         if (providerRelayIroh) {
@@ -971,326 +962,6 @@ async function main() {
       });
     }
 
-    if (process.env.CHICORY_TEST_OFFLINE === '1') {
-      // Current Chicory requires an existing home with 50,000 sats beyond the
-      // fixed voucher amount. Fund that capacity explicitly through the native
-      // wallet. This is fixture setup, not an automatic offline funding policy.
-      btc('-generate', '6');
-      await primary.request('sync');
-      await client.refreshWallet();
-      const phoneNodeId = (await rpc('/info')).nodeId;
-      const nativeBefore = (await primary.request('channels')).find(channel => channel.counterpartyNodeId === phoneNodeId);
-      assert.ok(nativeBefore?.isUsable);
-      await primary.request('splice_in', { channelId: nativeBefore.channelId, amountSats: 100000 });
-      let minedAt = Date.now();
-      await wait('native home has offline reservation capacity', async () => {
-        if (Date.now() - minedAt >= 3000) { btc('-generate', '1'); minedAt = Date.now(); }
-        await primary.request('sync');
-        await client.refreshWallet();
-        const home = (await rpc('/channels')).find(channel => channel.peerPubkey === providerKey);
-        const native = (await primary.request('channels')).find(channel => channel.counterpartyNodeId === phoneNodeId);
-        return home?.htlcUsable && home.htlcCount === 0 && home.remoteBalanceSats > 55000 &&
-          native?.isUsable && home.fundingTxid === native.fundingTxid &&
-          native.valueSats === nativeBefore.valueSats + 100000;
-      });
-      if (irohBridge || process.env.CHICORY_TEST_IOS === '1') evidence.irohOfflineSetupDelayMs = 0;
-      let before = (await client.snapshot()).balance.totalSats;
-      const amountSats = 5000;
-      const quote = await client.quoteReceive({ amountSats, mode: 'offline', description: 'Installed Chicory offline receive' });
-      assert.equal(quote.mode, 'offline');
-      assert.equal(quote.concurrentVersion, 2);
-      assert.equal(quote.feeSats, 0);
-      assert.equal(quote.netSats, amountSats);
-      const receive = await client.receive(quote);
-      assert.equal(receive.offlineReceive, true);
-      assert.match(receive.bolt11, /^lnbcrt/);
-      const epochs = await rpc('/ffor/epochs');
-      const home = (await rpc('/channels')).find(channel => channel.peerPubkey === providerKey && channel.htlcUsable);
-      const epoch = epochs.find(item => item.state === 'ACTIVE' && item.role === 'R' &&
-        item.peerNodeId === providerKey && item.channelId === home?.channelId &&
-        item.slots.some(slot => slot.paymentHash === receive.paymentHash));
-      assert.ok(epoch, 'The invoice must have an activated native reservation');
-      assert.equal(epoch.concurrentVersion, 2);
-      assert.equal(epoch.slots.length, 1);
-      assert.equal(epoch.slots[0].amountMsat, String(amountSats * 1000));
-      assert.equal(epoch.capabilityHold, false);
-      assert.equal(epoch.activationMismatch, false);
-      pass('installed wallet prepares an active concurrent-v2 offline reservation', {
-        channelId: epoch.channelId, epochId: epoch.epochId, amountSats,
-        paymentHash: receive.paymentHash,
-      });
-
-      if (unpaidOffline) {
-        // Reserved v2 vouchers cannot be failed offchain when an unpaid book
-        // closes. Stop admission through the real API, then prove the pending
-        // voucher and the absence of a credit survive both process restarts.
-        const pauseId = 'unpaid-retirement-' + randomBytes(12).toString('hex');
-        assert.equal((await rpc('/channelize/pause', 'POST', { paused: true, requestId: pauseId })).paused, true);
-        const noUnpaidCredit = async () => {
-          const snapshot = await client.snapshot();
-          assert.equal(snapshot.activity.filter(row => row.paymentHash === receive.paymentHash &&
-            row.status === 'completed').length, 0, 'An unpaid voucher must not create a completed receive');
-          return snapshot;
-        };
-        if (autoExpireOffline) {
-          // The installed runtime polls its coordinator every two seconds and
-          // closes admission at invoice expiry plus a two-minute grace period.
-          // Use the actual signed invoice time and real wall clock. This mode
-          // never calls the explicit close route or changes the engine clock.
-          const decoded = await rpc('/invoice/decode', 'POST', { bolt11: receive.bolt11 });
-          const invoiceExpirySeconds = Number(decoded.expiry);
-          const invoiceExpiresAt = (Number(decoded.timestamp) + invoiceExpirySeconds) * 1000;
-          const automaticCloseAt = invoiceExpiresAt + 120000;
-          const startedWaitingAt = Date.now();
-          const deadline = automaticCloseAt + 60000;
-          assert.equal(invoiceExpirySeconds, 600);
-          assert.ok(Number.isSafeInteger(invoiceExpiresAt) && invoiceExpiresAt > startedWaitingAt);
-          assert.ok(deadline - startedWaitingAt <= 780000, 'Bound the real-clock expiry wait to thirteen minutes');
-          evidence.offlineCloseMode = 'automatic-wall-clock-expiry';
-          console.log('WAIT automatic offline expiry and grace: up to ' +
-            Math.ceil((deadline - startedWaitingAt) / 1000) + ' real seconds');
-          let observedGrace = false;
-          let observedCloseAt;
-          while (Date.now() < deadline) {
-            const current = await rpc('/ffor/epoch?channelId=' + epoch.channelId);
-            const channel = (await rpc('/channels')).find(item => item.channelId === epoch.channelId);
-            const snapshot = await noUnpaidCredit();
-            const now = Date.now();
-            assert.equal(current.epochId, epoch.epochId);
-            assert.equal(channel?.htlcCount, 1);
-            assert.equal(channel.localBalanceSats, before);
-            assert.equal(snapshot.balance.totalSats, before);
-            if (current.state === 'DRAINING') {
-              assert.ok(now >= automaticCloseAt, 'Automatic admission close must preserve the full invoice grace');
-              observedCloseAt = now;
-              break;
-            }
-            assert.equal(current.state, 'ACTIVE', 'An unpaid reservation must stay active until automatic admission close');
-            if (now >= invoiceExpiresAt && now < automaticCloseAt && !observedGrace) {
-              observedGrace = true;
-              pass('real invoice expiry preserves the unpaid voucher during the automatic-close grace', {
-                epochId: epoch.epochId, invoiceExpirySeconds, graceSeconds: 120,
-                reservedHtlcs: channel.htlcCount, completedReceiveRows: 0,
-              });
-            }
-            await delay(2000);
-          }
-          assert.ok(observedGrace, 'Observe the live grace period rather than only its final state');
-          assert.ok(observedCloseAt, 'Installed automatic admission close did not finish within its bounded grace');
-          pass('unchanged installed runtime automatically closes admission after real invoice expiry and grace', {
-            epochId: epoch.epochId, invoiceExpirySeconds, graceSeconds: 120,
-            waitedMs: observedCloseAt - startedWaitingAt,
-            closeDelayAfterGraceMs: observedCloseAt - automaticCloseAt,
-          });
-        } else {
-          evidence.offlineCloseMode = 'explicit-admission-close';
-          await rpc('/ffor/epoch/close', 'POST', { channelId: epoch.channelId });
-        }
-        const draining = async () => {
-          await primary.request('sync');
-          await client.refreshWallet();
-          const book = await rpc('/ffor/epoch?channelId=' + epoch.channelId);
-          const current = (await rpc('/channels')).find(channel => channel.channelId === epoch.channelId);
-          const snapshot = await noUnpaidCredit();
-          return snapshot.primary.connected && book.state === 'DRAINING' && book.epochId === epoch.epochId &&
-            book.slots.length === 1 && book.slots[0].state === 'unsettled' &&
-            current?.htlcCount === 1 && current.localBalanceSats === before &&
-            snapshot.balance.totalSats === before && { book, current };
-        };
-        await wait('unpaid v2 close keeps its reserved voucher without credit', draining);
-        pass((autoExpireOffline ? 'automatic' : 'explicit') + ' unpaid epoch close stops admission and retains the reserved voucher', {
-          channelId: epoch.channelId, epochId: epoch.epochId, state: 'DRAINING', reservedHtlcs: 1,
-        });
-        await client.close();
-        await wait('phone sockets close before unpaid restart', () => sockets.size === 0);
-        await primary.stop();
-        primary = await startPrimary(path.join(temp, 'primary'), port);
-        evidence.processes.push(primary.child.pid);
-        assert.equal(primary.ready.nodeId, providerKey);
-        runtime = await createPortableRuntime(options);
-        client = new EmbeddedWalletClient({ runtime, walletId });
-        await client.startWallet();
-        const preserved = await wait('unpaid reservation survives phone and primary restart', draining);
-        assert.equal((await rpc('/channelize/status')).paused, true);
-        pass('both restarts preserve the unpaid reserved book without a false credit', {
-          epochId: preserved.book.epochId, localBalanceSats: preserved.current.localBalanceSats,
-          reservedHtlcs: preserved.current.htlcCount,
-        });
-
-        // Confirm the current splice before the public primary force-close.
-        // Match the actual funding spend and exact voucher output on chain.
-        btc('-generate', '6');
-        await primary.request('sync');
-        await client.refreshWallet();
-        await primary.request('force_close', { channelId: epoch.channelId });
-        const commitment = await wait('primary broadcasts the unpaid reserved commitment', () => {
-          const transactions = JSON.parse(btc('getrawmempool')).map(txid => JSON.parse(btc('getrawtransaction', txid, 'true')));
-          return transactions.find(tx => tx.vin.some(input => input.txid === preserved.current.fundingTxid &&
-            input.vout === preserved.current.fundingOutputIndex));
-        });
-        const voucherOutputs = commitment.vout.filter(output => Math.round(output.value * 1e8) === amountSats);
-        assert.equal(voucherOutputs.length, 1, 'Identify the exact reserved voucher without guessing its output index');
-        const voucherIndex = voucherOutputs[0].n;
-        btc('-generate', '1');
-        await primary.request('sync');
-        await client.refreshWallet();
-        assert.ok(Number.isSafeInteger(epoch.voucherExpiry) && epoch.voucherExpiry > epoch.settlementDeadline);
-        const height = Number(btc('getblockcount'));
-        const advance = Math.max(0, epoch.voucherExpiry + 1 - height);
-        assert.ok(advance <= 1500, 'Bound the regtest-only timeout advancement');
-        if (advance) btc('-generate', String(advance));
-        const scannedBlocks = new Map();
-        const timeout = await wait('native wallet broadcasts or confirms the real voucher timeout', async () => {
-          await primary.request('sync');
-          await client.refreshWallet();
-          await noUnpaidCredit();
-          const transactions = JSON.parse(btc('getrawmempool')).map(txid => JSON.parse(btc('getrawtransaction', txid, 'true')));
-          const tip = Number(btc('getblockcount'));
-          for (let blockHeight = epoch.voucherExpiry; blockHeight <= tip; blockHeight++) {
-            const hash = btc('getblockhash', String(blockHeight));
-            if (!scannedBlocks.has(hash)) scannedBlocks.set(hash, JSON.parse(btc('getblock', hash, '2')).tx);
-            transactions.push(...scannedBlocks.get(hash));
-          }
-          return transactions.find(tx => tx.locktime === epoch.voucherExpiry &&
-            tx.vin.some(input => input.txid === commitment.txid && input.vout === voucherIndex));
-        });
-        btc('-generate', '6');
-        await primary.request('sync');
-        await client.refreshWallet();
-        const confirmedTimeout = JSON.parse(btc('getrawtransaction', timeout.txid, 'true'));
-        assert.ok(confirmedTimeout.confirmations >= 6);
-        const unspentVoucher = btc('gettxout', commitment.txid, String(voucherIndex), 'true');
-        assert.ok(unspentVoucher === '' || unspentVoucher === 'null');
-        await noUnpaidCredit();
-        assert.ok(!(await primary.request('channels')).some(channel => channel.channelId === epoch.channelId));
-        pass('unpaid reserved voucher resolves through its actual six-confirmation timeout', {
-          commitmentTxid: commitment.txid, voucherOutputIndex: voucherIndex,
-          timeoutTxid: timeout.txid, voucherExpiry: epoch.voucherExpiry,
-          timeoutConfirmations: confirmedTimeout.confirmations, completedReceiveRows: 0,
-        });
-
-        // Restart after chain resolution too. A new home is a new channel;
-        // reserved v2 does not claim that an unpaid book can reopen its old one.
-        await client.close();
-        await wait('phone sockets close after unpaid timeout', () => sockets.size === 0);
-        await primary.stop();
-        primary = await startPrimary(path.join(temp, 'primary'), port);
-        evidence.processes.push(primary.child.pid);
-        assert.equal(primary.ready.nodeId, providerKey);
-        runtime = await createPortableRuntime(options);
-        client = new EmbeddedWalletClient({ runtime, walletId });
-        await client.startWallet();
-        await wait('phone reconnects after durable unpaid timeout', async () => {
-          await primary.request('sync');
-          await client.refreshWallet();
-          return (await noUnpaidCredit()).primary.connected;
-        });
-        await payer.connectPeer(providerKey, '127.0.0.1', port);
-        await wait('payer reestablishes before fresh-home JIT', async () => {
-          await payer.refreshWallet();
-          return payer.listChannels().some(channel => channel.peerPubkey === providerKey && channel.htlcUsable);
-        });
-        const freshQuote = await client.quoteReceive({ amountSats: 10000, description: 'Fresh home after unpaid reservation timeout' });
-        const freshReceive = await client.receive(freshQuote);
-        const freshPayment = await payer.payInvoiceSafe(freshReceive.bolt11, timeoutMs, 1000);
-        assert.equal(freshPayment.status, 'COMPLETED', freshPayment.failureDescription || 'Fresh-home JIT failed');
-        const fresh = await wait('installed phone has one fresh usable JIT home after timeout', async () => {
-          await client.refreshWallet();
-          const snapshot = await noUnpaidCredit();
-          const homes = (await rpc('/channels')).filter(channel => channel.peerPubkey === providerKey && channel.htlcUsable);
-          const rows = snapshot.activity.filter(row => row.paymentHash === freshReceive.paymentHash && row.status === 'completed');
-          return homes.length === 1 && homes[0].channelId !== epoch.channelId && homes[0].htlcCount === 0 &&
-            homes[0].localBalanceSats === freshQuote.netSats && rows.length === 1 && { home: homes[0], rows };
-        });
-        pass('durable unpaid timeout permits a fresh native JIT home with no old invoice credit', {
-          oldChannelId: epoch.channelId, channelId: fresh.home.channelId,
-          localBalanceSats: fresh.home.localBalanceSats, freshReceiveRows: fresh.rows.length,
-          unpaidReceiveRows: 0,
-        });
-        await rpc('/channelize/pause', 'POST', { paused: false, requestId: pauseId });
-      } else {
-        if (process.env.CHICORY_TEST_OFFLINE_CONCURRENT === '1') {
-          const outgoing = await primary.request('invoice', { amountSats: 1000, description: 'Ordinary spend while offline voucher is reserved' });
-          const review = await client.prepareSend({ request: outgoing.bolt11 });
-          const sent = await client.send(review);
-          assert.equal(sent.status, 'completed', sent.message || 'Active reservation must allow ordinary payments');
-          await wait('ordinary outgoing commitment preserves the reserved voucher', async () => {
-            const current = (await rpc('/channels')).find(channel => channel.channelId === epoch.channelId);
-            return current?.htlcUsable && current.htlcCount === 1 && current.localBalanceSats === before - 1000;
-          });
-          const incoming = await rpc('/invoice/create', 'POST', {
-            amountSats: 1200, description: 'Ordinary receive while offline voucher is reserved', expirySecs: 600,
-          });
-          await primary.request('pay', { bolt11: incoming.bolt11 });
-          await wait('ordinary incoming commitment preserves the active reservation', async () => {
-            await client.refreshWallet();
-            const current = (await rpc('/channels')).find(channel => channel.channelId === epoch.channelId);
-            const book = (await rpc('/ffor/epochs')).find(item => item.epochId === epoch.epochId);
-            return current?.htlcUsable && current.htlcCount === 1 && current.localBalanceSats === before + 200 &&
-              book?.state === 'ACTIVE' && !book.capabilityHold && !book.activationMismatch;
-          });
-          before += 200;
-          assert.equal((await client.snapshot()).balance.totalSats, before);
-          pass('native active offline reservation survives ordinary payments in both directions', {
-            channelId: epoch.channelId, epochId: epoch.epochId,
-            sentSats: 1000, receivedSats: 1200, totalSats: before,
-          });
-        }
-
-        await client.close();
-        await wait('phone sockets close before offline payment', () => sockets.size === 0);
-        await primary.stop();
-        primary = await startPrimary(path.join(temp, 'primary'), port);
-        evidence.processes.push(primary.child.pid);
-        assert.equal(primary.ready.nodeId, providerKey);
-        await payer.connectPeer(providerKey, '127.0.0.1', port);
-        await wait('payer reestablishes after offline primary restart', async () => {
-          await primary.request('sync');
-          await payer.refreshWallet();
-          return payer.listChannels().some(channel => channel.peerPubkey === providerKey && channel.htlcUsable);
-        });
-        assert.equal((await primary.request('channels')).find(channel => channel.counterpartyNodeId === phoneNodeId)?.isUsable, false);
-        const paid = await payer.payInvoiceSafe(receive.bolt11, timeoutMs, 1000);
-        assert.equal(paid.status, 'COMPLETED', paid.failureDescription || 'Offline delegated payment failed');
-        assert.equal(sockets.size, 0, 'The phone must remain disconnected throughout settlement');
-        pass('restarted native primary settles the external payment while the phone is stopped', {
-          amountSats, paymentHash: receive.paymentHash,
-        });
-
-        // Restart after settlement as well, before allowing the receiver to read
-        // its receipt. The receipt and upstream claim must both survive this.
-        await primary.stop();
-        primary = await startPrimary(path.join(temp, 'primary'), port);
-        evidence.processes.push(primary.child.pid);
-        assert.equal(primary.ready.nodeId, providerKey);
-        const reopen = async () => {
-          runtime = await createPortableRuntime(options);
-          client = new EmbeddedWalletClient({ runtime, walletId });
-          await client.startWallet();
-          return wait('offline receipt is credited exactly once after reopen', async () => {
-            await client.refreshWallet();
-            const snapshot = await client.snapshot();
-            const rows = snapshot.activity.filter(row => row.paymentHash === receive.paymentHash && row.status === 'completed');
-            const homes = (await rpc('/channels')).filter(channel => channel.peerPubkey === providerKey && channel.state !== 'CLOSED');
-            return snapshot.primary.connected && snapshot.balance.totalSats === before + amountSats &&
-              rows.length === 1 && homes.length === 1 && homes[0].htlcUsable && homes[0].htlcCount === 0 &&
-              homes[0].localBalanceSats === before + amountSats && { snapshot, rows, home: homes[0] };
-          });
-        };
-        const first = await reopen();
-        assert.equal(first.rows[0].amountSats, amountSats);
-        pass('installed phone recovers the durable offline receipt after primary restart', {
-          amountSats, totalSats: first.snapshot.balance.totalSats, activityRows: first.rows.length,
-        });
-        await client.close();
-        const second = await reopen();
-        assert.equal(second.rows[0].amountSats, amountSats);
-        pass('second phone reopen preserves one offline credit and one completed Activity row', {
-          totalSats: second.snapshot.balance.totalSats, activityRows: second.rows.length,
-        });
-      }
-    }
-
     if (process.env.CHICORY_TEST_SPLICES === '1') {
       const before = (await rpc('/channels')).find(channel => channel.htlcUsable);
       assert.ok(before);
@@ -1755,20 +1426,9 @@ async function main() {
           localBalanceSats: channel.localBalanceSats, remoteBalanceSats: channel.remoteBalanceSats,
           capacitySats: channel.capacitySats, htlcCount: channel.htlcCount, htlcUsable: channel.htlcUsable,
           fundingTxid: channel.fundingTxid, fundingOutputIndex: channel.fundingOutputIndex,
-          pendingSpliceTxid: channel.pendingSpliceTxid, fforState: channel.ffor?.state,
+          pendingSpliceTxid: channel.pendingSpliceTxid,
         }))));
         console.error('PORTABLE_BALANCE ' + JSON.stringify(await rpc('/balance')));
-        if (process.env.CHICORY_TEST_OFFLINE === '1') {
-          // Never log the complete epoch, voucher, receipt, or wallet record.
-          // Only public identities and lifecycle flags help diagnose a stall.
-          console.error('PORTABLE_OFFLINE_STATES ' + JSON.stringify((await rpc('/ffor/epochs')).map(epoch => ({
-            channelId: epoch.channelId, epochId: epoch.epochId, role: epoch.role,
-            state: epoch.state, capabilityHold: epoch.capabilityHold,
-            activationMismatch: epoch.activationMismatch, concurrentVersion: epoch.concurrentVersion,
-            slots: (epoch.slots || []).map(slot => ({ k: slot.k, state: slot.state,
-              redeemed: slot.redeemed, fulfilled: slot.fulfilled, removed: slot.removed })),
-          }))));
-        }
       } catch { /* Startup or shutdown may have failed. */ }
     }
     console.error('PORTABLE_DIAGNOSTICS ' + JSON.stringify(diagnostics));

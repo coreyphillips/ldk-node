@@ -66,7 +66,7 @@ async function run(report: (line: string) => void) {
         result = true;
       } else if (command.operation === 'request') {
         const path = command.body?.path || '';
-        const operation = /^\/wallets\/([^/]+)\/api\/(info|channels|balance|invoice\/(create|decode)|ffor\/epochs)$/.exec(path);
+        const operation = /^\/wallets\/([^/]+)\/api\/(info|channels|balance|invoice\/(create|decode))$/.exec(path);
         const metadata = /^\/api\/wallets\/([^/]+)$/.exec(path);
         if ((!operation || !walletIds.has(operation[1])) &&
           (!metadata || !walletIds.has(metadata[1]) ||

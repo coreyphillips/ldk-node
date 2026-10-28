@@ -20,7 +20,7 @@ Primary channel opens are checked before submission to LDK: all selected inputs 
 
 Quote and receive requests refuse any selected-primary channel that is not yet ready, even if another primary channel is ready. This prevents a pending channel from triggering a second intercept channel; pending channels with unrelated peers do not block receiving. Existing channels keep the limits they originally negotiated, including after restart or selecting a primary later. A splice cannot renegotiate them. Quotes and invoice creation refuse a net delivered amount above that persisted limit with `InvalidAmount`; missing limit metadata fails closed. To migrate a pre-update primary channel, explicitly close it, wait for its funds to become available, then open a new private channel using this version. Do not edit channel state or replace a wallet seed to change this limit.
 
-The client currently exposes fixed-amount JIT invoices and native TCP peer connectivity. Offline FFOR receiving, direct-funding request envelopes, Iroh transport and a generic Tor adapter are separate capabilities and are not implied by successful primary pairing.
+The client currently exposes fixed-amount JIT invoices and native TCP peer connectivity. FFOR offline receiving is not supported. Direct-funding request envelopes, Iroh transport and a generic Tor adapter are separate capabilities and are not implied by successful primary pairing.
 
 ## Local Android build
 

@@ -526,7 +526,6 @@ mod tests {
 		assert!(blobs.receive(peer(1), vec![42], true).unwrap());
 		blobs.queue_retrieval(peer(1)).unwrap();
 		let reestablish = msgs::ChannelReestablish {
-			ffor_epoch: None,
 			channel_id: ChannelId([9; 32]),
 			next_local_commitment_number: 2,
 			next_remote_commitment_number: 1,

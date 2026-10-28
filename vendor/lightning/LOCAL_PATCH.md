@@ -85,71 +85,6 @@ cargo test -p lightning@0.2.7 --lib funding_key_reuse
 cargo test -p lightning@0.2.7 --lib liquidity_shortfall
 ```
 
-The experimental concurrent FFOR settler uses native voucher HTLC identities,
-R/S-oriented commitment snapshots and a monitor-owned custody journal. Setup
-requires an idle NORMAL anchor channel without a BOLT STFU session, plus native
-reserve, dust, count and in-flight checks. Activation begins quiescence only
-after the vouchers are irrevocably committed. The entire voucher batch remains unassigned in the holding
-cell until its secret custody update is durable. A failed batch rolls back
-without consuming HTLC ids. Activation binds the exact two irrevocable,
-untrimmed native commitments and remains gated on monitor persistence.
-
-Required fields retain the journal in both the channel and monitor, rejecting
-older readers when custody exists. Restored journals bind to the authenticated
-counterparty, channel and funding outpoint. Epoch and payment-hash archives do
-not evict old identities. A slot's upstream claim binding cannot change after
-SETTLING, and its completion token must be covered by an actually persisted
-native monitor update. Metadata-only descendants preserve earlier completion
-tokens while preventing claim rollback. Force-close retains the journal and
-allows completion of previously bound claims without admitting new claims.
-
-While a concurrent reserved book is live, native commitment checks preserve
-its untrimmed voucher subset during ordinary payments. Fees, splices and
-cooperative close remain blocked. Reserved vouchers cannot be failed after
-activation, including while draining. Fulfillment and two-view removal require
-native monitor evidence for the exact voucher identity. Onchain custody is
-retained independently of the manager; commitment counters must never be
-invented to stand in for chain resolution evidence.
-
-The monitor records authenticated chain outcomes for the exact funding outpoint,
-voucher HTLC and payment hash only after six confirmations. It retains these
-proofs across restart and a lost callback until the resulting custody journal
-is durable. Pending SETTLING upstream obligations survive chain retirement;
-new delegated claims cannot use a resolved voucher. Native tests broadcast
-real signed commitment and timeout or fulfillment transactions, restart below
-the threshold, withhold monitor persistence, replay the proof, and restart after
-journal completion. These are native tests, separate from installed-phone
-interoperability qualification.
-
-An FFOR journal containing a chain removal requires a complete monitor snapshot.
-The incremental persister preserves the original update ID and reports completion
-only after that snapshot is durable. The journal does not authenticate its own
-chain evidence: replay still requires the monitor's independently derived proof.
-This matters when the final claim matures between periodic chain snapshots.
-Custom incremental persisters must honor
-`ChannelMonitorUpdate::requires_full_monitor_persistence`. Native timeout and
-fulfillment regressions deliberately retain a pre-threshold base, delay the async
-snapshot write, and reload through the actual incremental persister after both
-the proof journal and its payment-completion update.
-
-Ordinary voucher redemption also waits for native commitment finalization.
-Receiving `update_fulfill_htlc` alone cannot mark a voucher redeemed. Bounded
-current-epoch proof survives the final revocation and the crash window before
-the corresponding FFOR journal update. Tests cover withheld commitment and
-revocation persistence and restart with new FFOR admission disabled.
-
-`channel_reestablish` carries Beignet's optional odd TLV 55001 as exactly 67
-bytes. The manager coordinates signed state reconciliation and owed activation
-acknowledgments before releasing ordinary channel replay. The bounded wire,
-transcript and signer tests include Beignet's published local fixture vectors.
-Runtime support remains experimental and disabled by default. The local Node
-integration must not advertise protocol readiness until native settlement,
-restart, reconnect and close qualification has completed.
-
-```sh
-cargo test -p lightning@0.2.7 --lib ffor
-```
-
 ## Confirmed splice input conflict rollback
 
 The native rollback API accepts only the authenticated channel peer's completed
@@ -185,8 +120,7 @@ against arbitrary deep reorganizations.
 
 Native regressions exercise actual signed alternative commitments, a postrollback
 payment, justice signatures, monitor replay over a stale-chain snapshot, and
-archive restoration. Recovery preserves pending ordinary HTLC identities and
-FFOR custody created on the surviving funding. Absent outputs fail only after
+archive restoration. Recovery preserves pending ordinary HTLC identities. Absent outputs fail only after
 the retired funding reaches six confirmations, including after restart. Invalid
 recovery metadata is rejected. These native tests do not establish full wallet
 feature parity or replace installed-wallet interoperability qualification.
@@ -194,4 +128,17 @@ feature parity or replace installed-wallet interoperability qualification.
 ```sh
 cargo test -p lightning@0.2.7 --lib native_splice_conflict
 cargo test -p lightning@0.2.7 --lib test_retired_splice_monitor_archive
+```
+
+## Removed private offline-receive extension
+
+The Beignet FFOR implementation, custom feature negotiation, wire messages,
+signing hooks, voucher accounting and custody persistence have been removed.
+Ordinary monitor snapshots remain readable. Snapshots containing the former
+required custody journal or chain-proof TLVs fail with `UnknownRequiredFeature`;
+they are never loaded with that custody silently discarded. Existing experimental
+custody must be resolved with the prior implementation before migrating its store.
+
+```sh
+cargo test -p lightning@0.2.7 --lib removed_ffor
 ```

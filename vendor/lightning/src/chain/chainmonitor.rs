@@ -150,9 +150,6 @@ pub trait Persist<ChannelSigner: EcdsaChannelSigner> {
 	/// Note that on every update, you **must** persist either the [`ChannelMonitorUpdate`] or the
 	/// updated monitor itself to disk/backups. See the [`Persist`] trait documentation for more
 	/// details.
-	/// If [`ChannelMonitorUpdate::requires_full_monitor_persistence`] returns true, persist the
-	/// complete updated monitor. The update alone omits chain-authenticated state needed for replay.
-	/// Completion must still be reported using the supplied update's ID.
 	///
 	/// During blockchain synchronization operations, and in some rare cases, this may be called with
 	/// no [`ChannelMonitorUpdate`], in which case the full [`ChannelMonitor`] needs to be persisted.
@@ -420,7 +417,8 @@ impl<
 		L,
 		AsyncPersister<K, S, L, ES, SP, T, F>,
 		ES,
-	> where
+	>
+where
 	K::Target: KVStore + MaybeSync,
 	SP::Target: SignerProvider + Sized,
 	C::Target: chain::Filter,

@@ -70,7 +70,7 @@ use crate::io;
 use crate::prelude::*;
 use crate::sync::{Arc, Mutex, RwLock};
 use alloc::collections::BTreeSet;
-use bitcoin::hashes::Hash;
+use bitcoin::hashes::{sha256d, Hash};
 use core::iter::repeat;
 use lightning_macros::xtest;
 
@@ -6925,6 +6925,150 @@ pub fn test_override_0msat_htlc_minimum() {
 	nodes[1].node.handle_open_channel(node_a_id, &res);
 	let res = get_event_msg!(nodes[1], MessageSendEvent::SendAcceptChannel, node_a_id);
 	assert_eq!(res.common_fields.htlc_minimum_msat, 1);
+}
+
+#[xtest(feature = "_externalize_tests")]
+pub fn test_channel_update_forwarding_scope() {
+	for announce in [false, true] {
+		let chanmon_cfgs = create_chanmon_cfgs(2);
+		let node_cfgs = create_node_cfgs(2, &chanmon_cfgs);
+		let mut config = test_default_channel_config();
+		config.channel_handshake_config.announce_for_forwarding = announce;
+		config.channel_handshake_config.minimum_depth = 1;
+		config.channel_config.cltv_expiry_delta = 72;
+		let node_chanmgrs =
+			create_node_chanmgrs(2, &node_cfgs, &[Some(config.clone()), Some(config)]);
+		let nodes = create_network(2, &node_cfgs, &node_chanmgrs);
+		let ids = [nodes[0].node.get_our_node_id(), nodes[1].node.get_our_node_id()];
+		let tx = create_chan_between_nodes_with_value_init(&nodes[0], &nodes[1], 100_000, 0);
+		let height = nodes[0].best_block_info().1 + 1;
+		for node in &nodes {
+			confirm_transaction_at(node, &tx, height);
+		}
+		let ready = [
+			get_event_msg!(nodes[0], MessageSendEvent::SendChannelReady, ids[1]),
+			get_event_msg!(nodes[1], MessageSendEvent::SendChannelReady, ids[0]),
+		];
+		for idx in 0..2 {
+			nodes[idx].node.handle_channel_ready(ids[1 - idx], &ready[1 - idx]);
+			expect_channel_ready_event(&nodes[idx], &ids[1 - idx]);
+		}
+		let last_updates = Mutex::new([None::<msgs::UnsignedChannelUpdate>, None]);
+		let check_update = |idx: usize, msg: &msgs::ChannelUpdate, flags: u8| {
+			assert_eq!(msg.contents.message_flags, flags);
+			assert_eq!(msg.contents.cltv_expiry_delta, 72);
+			// The forwarding scope must be included in the signed payload, not patched afterward.
+			let hash = sha256d::Hash::hash(&msg.contents.encode());
+			Secp256k1::verification_only()
+				.verify_ecdsa(&hash_to_message!(hash.as_byte_array()), &msg.signature, &ids[idx])
+				.unwrap();
+			let mut previous = last_updates.lock().unwrap();
+			if let Some(previous) = &previous[idx] {
+				assert_eq!(msg.contents.short_channel_id, previous.short_channel_id);
+				if previous.message_flags != msg.contents.message_flags {
+					assert!(msg.contents.timestamp > previous.timestamp);
+				}
+			}
+			previous[idx] = Some(msg.contents.clone());
+		};
+		for idx in 0..2 {
+			let update =
+				get_event_msg!(nodes[idx], MessageSendEvent::SendChannelUpdate, ids[1 - idx]);
+			// This also covers public channels which become usable before announcement depth.
+			check_update(idx, &update, 3);
+			nodes[1 - idx].node.handle_channel_update(ids[idx], &update);
+		}
+
+		let reconnect = |expected_flags| {
+			for idx in 0..2 {
+				nodes[idx].node.peer_disconnected(ids[1 - idx]);
+			}
+			connect_nodes(&nodes[0], &nodes[1]);
+			let reestablish = [
+				get_event_msg!(nodes[0], MessageSendEvent::SendChannelReestablish, ids[1]),
+				get_event_msg!(nodes[1], MessageSendEvent::SendChannelReestablish, ids[0]),
+			];
+			for idx in 0..2 {
+				nodes[idx].node.handle_channel_reestablish(ids[1 - idx], &reestablish[1 - idx]);
+			}
+			let mut announcements = Vec::new();
+			for idx in 0..2 {
+				let mut updates = 0;
+				for event in nodes[idx].node.get_and_clear_pending_msg_events() {
+					match event {
+						MessageSendEvent::SendChannelUpdate { node_id, msg } => {
+							assert_eq!(node_id, ids[1 - idx]);
+							check_update(idx, &msg, expected_flags);
+							nodes[1 - idx].node.handle_channel_update(ids[idx], &msg);
+							updates += 1;
+						},
+						MessageSendEvent::SendChannelReady { node_id, msg } => {
+							assert_eq!(node_id, ids[1 - idx]);
+							assert_eq!(msg.channel_id, ready[idx].channel_id);
+						},
+						MessageSendEvent::SendAnnouncementSignatures { node_id, msg } => {
+							assert_eq!(node_id, ids[1 - idx]);
+							announcements.push((idx, msg));
+						},
+						_ => panic!("Unexpected reconnect message"),
+					}
+				}
+				assert_eq!(updates, 1);
+			}
+			for (idx, msg) in announcements {
+				nodes[1 - idx].node.handle_announcement_signatures(ids[idx], &msg);
+			}
+			for idx in 0..2 {
+				for event in nodes[idx].node.get_and_clear_pending_msg_events() {
+					match event {
+						MessageSendEvent::BroadcastChannelAnnouncement {
+							update_msg: Some(msg),
+							..
+						} => {
+							check_update(idx, &msg, 1);
+						},
+						_ => panic!("Unexpected announcement response"),
+					}
+				}
+			}
+		};
+		reconnect(3);
+
+		if announce {
+			for node in &nodes {
+				connect_blocks(node, 5);
+			}
+			let signatures = [
+				get_event_msg!(nodes[0], MessageSendEvent::SendAnnouncementSignatures, ids[1]),
+				get_event_msg!(nodes[1], MessageSendEvent::SendAnnouncementSignatures, ids[0]),
+			];
+			// Re-send the ready message before exchanging signatures. This produces a private
+			// update at the current block timestamp, so block progression cannot mask a missing
+			// timestamp increment when the following announcement changes the signed flags.
+			for idx in 0..2 {
+				nodes[idx].node.handle_channel_ready(ids[1 - idx], &ready[1 - idx]);
+				let update =
+					get_event_msg!(nodes[idx], MessageSendEvent::SendChannelUpdate, ids[1 - idx]);
+				check_update(idx, &update, 3);
+			}
+			for idx in 0..2 {
+				nodes[idx].node.handle_announcement_signatures(ids[1 - idx], &signatures[1 - idx]);
+				let events = nodes[idx].node.get_and_clear_pending_msg_events();
+				assert_eq!(events.len(), 1);
+				match &events[0] {
+					MessageSendEvent::BroadcastChannelAnnouncement {
+						update_msg: Some(msg),
+						..
+					} => {
+						check_update(idx, msg, 1);
+					},
+					_ => panic!("Unexpected announcement response"),
+				}
+			}
+			// A public channel's reconnect update remains forwardable after signatures exchange.
+			reconnect(1);
+		}
+	}
 }
 
 #[xtest(feature = "_externalize_tests")]

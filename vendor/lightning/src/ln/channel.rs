@@ -4088,6 +4088,14 @@ where
 		self.config.announce_for_forwarding
 	}
 
+	/// Whether both sides have sent the signatures needed to announce this channel.
+	/// Before then, even a channel intended for announcement needs private policy updates.
+	pub fn has_exchanged_announcement_signatures(&self) -> bool {
+		self.should_announce()
+			&& self.announcement_sigs.is_some()
+			&& self.announcement_sigs_state != AnnouncementSigsState::NotSent
+	}
+
 	/// Gets the fee we'd want to charge for adding an HTLC output to this Channel
 	/// Allowed in any state (including after shutdown)
 	pub fn get_outbound_forwarding_fee_base_msat(&self) -> u32 {
@@ -11815,6 +11823,11 @@ where
 				};
 
 				self.context.announcement_sigs_state = AnnouncementSigsState::MessageSent;
+				if self.context.announcement_sigs.is_some() {
+					// A unicast update can now clear dont_forward. Its signed payload must have
+					// a newer timestamp than the previous private policy update.
+					self.context.update_time_counter += 1;
+				}
 
 				Some(msgs::AnnouncementSignatures {
 					channel_id: self.context.channel_id(),
@@ -11888,6 +11901,10 @@ where
 				&announcement, self.funding.counterparty_funding_pubkey())));
 		}
 
+		if self.context.announcement_sigs.is_none() {
+			// The update accompanying our first announcement has a different forwarding scope.
+			self.context.update_time_counter += 1;
+		}
 		self.context.announcement_sigs = Some((msg.node_signature, msg.bitcoin_signature));
 		if self.funding.funding_tx_confirmation_height == 0 || self.funding.funding_tx_confirmation_height + 5 > best_block_height {
 			return Err(ChannelError::Ignore(

@@ -41,13 +41,14 @@ The original API remains available. LDK Node can now fail unknown or expired
 intercepts instead of leaving them pending when an LSPS client or unrelated
 LSPS provider is configured alongside the Chicory service.
 
-The Lightning patch also contains an opt-in native concurrent-v2 FFOR settler.
-Its signed transcripts, voucher commitments, delegated upstream claims,
-reconnect metadata and chain-resolution proofs use native channel and monitor
-state. Required serialized fields reject older readers when custody exists.
-Monitor persistence gates every acknowledgment and claim; disabling new
-admission preserves existing obligations. See `lightning/LOCAL_PATCH.md` and
-the root compatibility guide for tests and current qualification limits.
+Private and pre-announcement channel updates set the BOLT 7 `dont_forward`
+flag. The flag is covered by the signature, and changing to public forwarding
+scope advances the timestamp. This lets peers retain an early private routing
+policy until their own chain view assigns the channel's SCID.
+
+FFOR offline receiving is removed. Readers reject unsupported persisted custody
+instead of silently discarding obligations. See `lightning/LOCAL_PATCH.md` for
+the removal boundaries and regression commands.
 
 The standalone fuzz workspace repeats these path patches. Applications which
 consume this branch as a dependency must also copy its `[patch.crates-io]`

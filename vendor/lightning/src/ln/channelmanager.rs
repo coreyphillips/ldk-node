@@ -5330,7 +5330,7 @@ where
 			"Attempting to generate broadcast channel update for channel {}",
 			&chan.context.channel_id()
 		);
-		self.get_channel_update_for_unicast(chan)
+		self.get_channel_update(chan, false)
 	}
 
 	/// Gets the current [`channel_update`] for the given channel. This does not check if the channel
@@ -5344,8 +5344,17 @@ where
 	///
 	/// [`channel_update`]: msgs::ChannelUpdate
 	/// [`internal_closing_signed`]: Self::internal_closing_signed
+	fn get_channel_update_for_unicast(
+		&self, chan: &FundedChannel<SP>,
+	) -> Result<msgs::ChannelUpdate, LightningError> {
+		// BOLT 7 requires dont_forward for policy updates sent before announcement signatures
+		// have been exchanged, including channels that will eventually be public.
+		self.get_channel_update(chan, !chan.context.has_exchanged_announcement_signatures())
+	}
+
+	/// Signs a channel update with its intended forwarding scope covered by the signature.
 	#[rustfmt::skip]
-	fn get_channel_update_for_unicast(&self, chan: &FundedChannel<SP>) -> Result<msgs::ChannelUpdate, LightningError> {
+	fn get_channel_update(&self, chan: &FundedChannel<SP>, dont_forward: bool) -> Result<msgs::ChannelUpdate, LightningError> {
 		let logger = WithChannelContext::from(&self.logger, &chan.context, None);
 		log_trace!(logger, "Attempting to generate channel update for channel {}", chan.context.channel_id());
 		let short_channel_id = match chan.funding.get_short_channel_id().or(chan.context.latest_inbound_scid_alias()) {
@@ -5362,7 +5371,7 @@ where
 			chain_hash: self.chain_hash,
 			short_channel_id,
 			timestamp: chan.context.get_update_time_counter(),
-			message_flags: 1, // Only must_be_one
+			message_flags: 1 | ((dont_forward as u8) << 1),
 			channel_flags: (!were_node_one) as u8 | ((!enabled as u8) << 1),
 			cltv_expiry_delta: chan.context.get_cltv_expiry_delta(),
 			htlc_minimum_msat: chan.context.get_counterparty_htlc_minimum_msat(),

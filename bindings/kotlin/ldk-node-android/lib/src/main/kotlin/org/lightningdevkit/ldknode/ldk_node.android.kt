@@ -13235,20 +13235,21 @@ object FfiConverterTypeNodeError : FfiConverterRustBuffer<NodeException> {
             56 -> NodeException.AsyncPaymentServicesDisabled(FfiConverterString.read(buf))
             57 -> NodeException.CannotRbfFundingTransaction(FfiConverterString.read(buf))
             58 -> NodeException.TransactionNotFound(FfiConverterString.read(buf))
-            59 -> NodeException.TransactionAlreadyConfirmed(FfiConverterString.read(buf))
-            60 -> NodeException.NoSpendableOutputs(FfiConverterString.read(buf))
-            61 -> NodeException.CoinSelectionFailed(FfiConverterString.read(buf))
-            62 -> NodeException.InvalidMnemonic(FfiConverterString.read(buf))
-            63 -> NodeException.BackgroundSyncNotEnabled(FfiConverterString.read(buf))
-            64 -> NodeException.AddressTypeAlreadyMonitored(FfiConverterString.read(buf))
-            65 -> NodeException.AddressTypeIsPrimary(FfiConverterString.read(buf))
-            66 -> NodeException.AddressTypeNotMonitored(FfiConverterString.read(buf))
-            67 -> NodeException.OnchainWalletAccountNotRegistered(FfiConverterString.read(buf))
-            68 -> NodeException.InvalidSeedBytes(FfiConverterString.read(buf))
-            69 -> NodeException.LiquiditySourceInsufficientFunds(FfiConverterString.read(buf))
-            70 -> NodeException.LiquidityRequestRejected(FfiConverterString.read(buf))
-            71 -> NodeException.LiquidityRequestTimedOut(FfiConverterString.read(buf))
-            72 -> NodeException.LiquidityReceiveAmountTooSmall(FfiConverterString.read(buf))
+            59 -> NodeException.TransactionNotBroadcastByWallet(FfiConverterString.read(buf))
+            60 -> NodeException.TransactionAlreadyConfirmed(FfiConverterString.read(buf))
+            61 -> NodeException.NoSpendableOutputs(FfiConverterString.read(buf))
+            62 -> NodeException.CoinSelectionFailed(FfiConverterString.read(buf))
+            63 -> NodeException.InvalidMnemonic(FfiConverterString.read(buf))
+            64 -> NodeException.BackgroundSyncNotEnabled(FfiConverterString.read(buf))
+            65 -> NodeException.AddressTypeAlreadyMonitored(FfiConverterString.read(buf))
+            66 -> NodeException.AddressTypeIsPrimary(FfiConverterString.read(buf))
+            67 -> NodeException.AddressTypeNotMonitored(FfiConverterString.read(buf))
+            68 -> NodeException.OnchainWalletAccountNotRegistered(FfiConverterString.read(buf))
+            69 -> NodeException.InvalidSeedBytes(FfiConverterString.read(buf))
+            70 -> NodeException.LiquiditySourceInsufficientFunds(FfiConverterString.read(buf))
+            71 -> NodeException.LiquidityRequestRejected(FfiConverterString.read(buf))
+            72 -> NodeException.LiquidityRequestTimedOut(FfiConverterString.read(buf))
+            73 -> NodeException.LiquidityReceiveAmountTooSmall(FfiConverterString.read(buf))
             else -> throw RuntimeException("invalid error enum value, something is very wrong!!")
         }
     }
@@ -13491,60 +13492,64 @@ object FfiConverterTypeNodeError : FfiConverterRustBuffer<NodeException> {
                 buf.putInt(58)
                 Unit
             }
-            is NodeException.TransactionAlreadyConfirmed -> {
+            is NodeException.TransactionNotBroadcastByWallet -> {
                 buf.putInt(59)
                 Unit
             }
-            is NodeException.NoSpendableOutputs -> {
+            is NodeException.TransactionAlreadyConfirmed -> {
                 buf.putInt(60)
                 Unit
             }
-            is NodeException.CoinSelectionFailed -> {
+            is NodeException.NoSpendableOutputs -> {
                 buf.putInt(61)
                 Unit
             }
-            is NodeException.InvalidMnemonic -> {
+            is NodeException.CoinSelectionFailed -> {
                 buf.putInt(62)
                 Unit
             }
-            is NodeException.BackgroundSyncNotEnabled -> {
+            is NodeException.InvalidMnemonic -> {
                 buf.putInt(63)
                 Unit
             }
-            is NodeException.AddressTypeAlreadyMonitored -> {
+            is NodeException.BackgroundSyncNotEnabled -> {
                 buf.putInt(64)
                 Unit
             }
-            is NodeException.AddressTypeIsPrimary -> {
+            is NodeException.AddressTypeAlreadyMonitored -> {
                 buf.putInt(65)
                 Unit
             }
-            is NodeException.AddressTypeNotMonitored -> {
+            is NodeException.AddressTypeIsPrimary -> {
                 buf.putInt(66)
                 Unit
             }
-            is NodeException.OnchainWalletAccountNotRegistered -> {
+            is NodeException.AddressTypeNotMonitored -> {
                 buf.putInt(67)
                 Unit
             }
-            is NodeException.InvalidSeedBytes -> {
+            is NodeException.OnchainWalletAccountNotRegistered -> {
                 buf.putInt(68)
                 Unit
             }
-            is NodeException.LiquiditySourceInsufficientFunds -> {
+            is NodeException.InvalidSeedBytes -> {
                 buf.putInt(69)
                 Unit
             }
-            is NodeException.LiquidityRequestRejected -> {
+            is NodeException.LiquiditySourceInsufficientFunds -> {
                 buf.putInt(70)
                 Unit
             }
-            is NodeException.LiquidityRequestTimedOut -> {
+            is NodeException.LiquidityRequestRejected -> {
                 buf.putInt(71)
                 Unit
             }
-            is NodeException.LiquidityReceiveAmountTooSmall -> {
+            is NodeException.LiquidityRequestTimedOut -> {
                 buf.putInt(72)
+                Unit
+            }
+            is NodeException.LiquidityReceiveAmountTooSmall -> {
+                buf.putInt(73)
                 Unit
             }
         }.let { /* this makes the `when` an expression, which ensures it is exhaustive */ }

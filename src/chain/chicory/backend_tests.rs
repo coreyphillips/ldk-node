@@ -18,12 +18,15 @@ use lightning::chain::BestBlock;
 use serde_json::{json, Value};
 
 use super::super::bitcoind::BitcoindChainSource;
-use super::super::electrum::confirmed_electrum_transaction;
+use super::super::electrum::{
+	confirmed_electrum_transaction, electrum_transaction_status, ElectrumChainSource,
+};
 use super::super::esplora::EsploraChainSource;
-use crate::config::{AddressTypeRuntimeConfig, Config, EsploraSyncConfig};
+use crate::config::{AddressTypeRuntimeConfig, Config, ElectrumSyncConfig, EsploraSyncConfig};
 use crate::fee_estimator::OnchainFeeEstimator;
 use crate::io::test_utils::InMemoryStore;
 use crate::logger::Logger;
+use crate::payment::ConfirmationStatus;
 use crate::runtime::Runtime;
 use crate::NodeMetrics;
 
@@ -459,5 +462,398 @@ fn conflict_core_proof_checks_block_merkle_depth_and_reorg() {
 			runtime.block_on(source.confirmed_transaction(fixture.tx.compute_txid(), fixture.tip));
 		assert_eq!(result.is_ok(), case == Case::Valid, "{case:?}");
 		assert!(server.count.load(Ordering::Acquire) <= 7);
+	}
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum StatusCase {
+	Confirmed,
+	Unconfirmed,
+	Unknown,
+	WrongTransaction,
+	BadMerkle,
+	Reorg,
+	Inconsistent,
+	WrongTimestamp,
+}
+
+fn assert_transaction_status(
+	result: Result<ConfirmationStatus, crate::Error>, case: StatusCase, fixture: &Fixture,
+) {
+	match case {
+		StatusCase::Confirmed => assert_eq!(
+			result,
+			Ok(ConfirmationStatus::Confirmed {
+				block_hash: fixture.block.block_hash(),
+				height: fixture.height,
+				timestamp: u64::from(fixture.block.header.time),
+			})
+		),
+		StatusCase::Unconfirmed => assert_eq!(result, Ok(ConfirmationStatus::Unconfirmed)),
+		_ => assert!(result.is_err(), "uncertain status must fail: {case:?}, {result:?}"),
+	}
+}
+
+#[test]
+fn transaction_status_electrum_checks_presence_identity_proof_and_reorg() {
+	for case in [
+		StatusCase::Confirmed,
+		StatusCase::Unconfirmed,
+		StatusCase::Unknown,
+		StatusCase::WrongTransaction,
+		StatusCase::BadMerkle,
+		StatusCase::Reorg,
+		StatusCase::Inconsistent,
+	] {
+		let fixture = Fixture::new(Case::Valid);
+		let data = fixture.clone();
+		let server = Server::new(false, move |_, request, n| {
+			let result = match request["method"].as_str().unwrap() {
+				"blockchain.transaction.get" => {
+					let parent = request["params"][0] == data.parent.compute_txid().to_string();
+					json!(serialize_hex(if parent || case == StatusCase::WrongTransaction {
+						&data.parent
+					} else {
+						&data.tx
+					}))
+				},
+				"blockchain.scripthash.get_history" => {
+					if case == StatusCase::Unknown {
+						json!([])
+					} else if case == StatusCase::Inconsistent {
+						json!([
+							{"tx_hash":data.tx.compute_txid(),"height":data.height},
+							{"tx_hash":data.tx.compute_txid(),"height":0}
+						])
+					} else {
+						json!([{"tx_hash":data.tx.compute_txid(),"height":if case == StatusCase::Unconfirmed { 0 } else { data.height }}])
+					}
+				},
+				"blockchain.transaction.get_merkle" => json!({"block_height":data.height,"pos":0,
+					"merkle":if case == StatusCase::BadMerkle { vec!["00".repeat(32)] } else { vec![] }}),
+				"blockchain.block.header" => {
+					let mut header = data.block.header;
+					if case == StatusCase::Reorg && n > 4 {
+						header.nonce = header.nonce.wrapping_add(1);
+					}
+					json!(serialize_hex(&header))
+				},
+				other => panic!("unexpected Electrum status request {other}"),
+			};
+			serde_json::to_vec(&json!({"id":request["id"],"result":result})).unwrap()
+		});
+		let client = Client::from_config(
+			&format!("tcp://{}", server.addr),
+			ConfigBuilder::new().retry(0).timeout(Some(1)).build(),
+		)
+		.unwrap();
+		assert_transaction_status(
+			electrum_transaction_status(
+				&client,
+				fixture.tx.compute_txid(),
+				Instant::now() + Duration::from_secs(3),
+			),
+			case,
+			&fixture,
+		);
+		assert!(server.count.load(Ordering::Acquire) <= 7);
+		drop(client);
+	}
+}
+
+#[test]
+fn transaction_status_electrum_expired_deadline_sends_no_requests() {
+	let server = Server::new(false, |_, _, _| panic!("expired status lookup must not query"));
+	let client = Client::from_config(
+		&format!("tcp://{}", server.addr),
+		ConfigBuilder::new().retry(0).timeout(Some(1)).build(),
+	)
+	.unwrap();
+	let fixture = Fixture::new(Case::Valid);
+	assert!(
+		electrum_transaction_status(&client, fixture.tx.compute_txid(), Instant::now()).is_err()
+	);
+	assert_eq!(server.count.load(Ordering::Acquire), 0);
+	drop(client);
+}
+
+#[test]
+fn transaction_status_esplora_checks_presence_identity_proof_and_reorg() {
+	for case in [
+		StatusCase::Confirmed,
+		StatusCase::Unconfirmed,
+		StatusCase::Unknown,
+		StatusCase::WrongTransaction,
+		StatusCase::BadMerkle,
+		StatusCase::Reorg,
+		StatusCase::Inconsistent,
+		StatusCase::WrongTimestamp,
+	] {
+		let fixture = Fixture::new(Case::Valid);
+		let data = fixture.clone();
+		let server = Server::new(true, move |path, _, n| {
+			if path.ends_with("/raw") {
+				return if case == StatusCase::Unknown {
+					vec![]
+				} else {
+					serialize(if case == StatusCase::WrongTransaction {
+						&data.parent
+					} else {
+						&data.tx
+					})
+				};
+			}
+			if path.ends_with("/status") {
+				return serde_json::to_vec(&if case == StatusCase::Unconfirmed { json!({"confirmed":false}) }
+					else { json!({"confirmed":case != StatusCase::Inconsistent,"block_height":data.height,
+						"block_hash":data.block.block_hash(),"block_time":if case == StatusCase::WrongTimestamp { 1 } else { data.block.header.time }}) }).unwrap();
+			}
+			if path.ends_with("/merkleblock-proof") {
+				return data.merkle_hex(case == StatusCase::BadMerkle).into_bytes();
+			}
+			if path.starts_with("/block-height/") {
+				return if case == StatusCase::Reorg && n > 2 {
+					BlockHash::all_zeros()
+				} else {
+					data.block.block_hash()
+				}
+				.to_string()
+				.into_bytes();
+			}
+			panic!("unexpected Esplora status request {path}");
+		});
+		let logger = Arc::new(Logger::new_log_facade());
+		let runtime = Runtime::new(Arc::clone(&logger)).unwrap();
+		let config = Arc::new(Config::default());
+		let source = EsploraChainSource::new(
+			format!("http://{}", server.addr),
+			HashMap::new(),
+			EsploraSyncConfig::default(),
+			Arc::new(OnchainFeeEstimator::new()),
+			Arc::new(InMemoryStore::new()),
+			Arc::clone(&config),
+			Arc::new(RwLock::new(AddressTypeRuntimeConfig::from_config(&config, vec![]))),
+			logger,
+			Arc::new(RwLock::new(NodeMetrics::default())),
+		);
+		assert_transaction_status(
+			runtime.block_on(source.fetch_transaction_status(fixture.tx.compute_txid())),
+			case,
+			&fixture,
+		);
+		assert!(server.count.load(Ordering::Acquire) <= 5);
+	}
+}
+
+#[test]
+fn transaction_status_core_checks_mempool_identity_proof_and_reorg() {
+	for case in [
+		StatusCase::Confirmed,
+		StatusCase::Unconfirmed,
+		StatusCase::Unknown,
+		StatusCase::WrongTransaction,
+		StatusCase::BadMerkle,
+		StatusCase::Reorg,
+		StatusCase::Inconsistent,
+		StatusCase::WrongTimestamp,
+	] {
+		let fixture = Fixture::new(Case::Valid);
+		let data = fixture.clone();
+		let server = Server::new(true, move |_, request, n| {
+			let result = match request["method"].as_str().unwrap() {
+				"getrawtransaction" => {
+					let hex = serialize_hex(if case == StatusCase::WrongTransaction {
+						&data.parent
+					} else {
+						&data.tx
+					});
+					if case == StatusCase::Unconfirmed || case == StatusCase::Unknown {
+						json!({"hex":hex})
+					} else {
+						json!({"hex":hex,"blockhash":data.block.block_hash(),
+						"confirmations":if case == StatusCase::Inconsistent { 0 } else { 1 },
+						"blocktime":if case == StatusCase::WrongTimestamp { 1 } else { data.block.header.time }})
+					}
+				},
+				"getmempoolentry" => {
+					if case == StatusCase::Unknown {
+						return serde_json::to_vec(&json!({"id":request["id"],"result":null,
+						"error":{"code":-5,"message":"Transaction not in mempool"}}))
+						.unwrap();
+					}
+					json!({"vsize":100})
+				},
+				"getblockheader" => data.header_json(),
+				"getblockhash" => json!(if case == StatusCase::Reorg && n > 2 {
+					BlockHash::all_zeros()
+				} else {
+					data.block.block_hash()
+				}),
+				"getblock" => {
+					let mut block = data.block.clone();
+					if case == StatusCase::BadMerkle {
+						block.txdata[0] = data.parent.clone();
+					}
+					json!(serialize_hex(&block))
+				},
+				other => panic!("unexpected RPC status request {other}"),
+			};
+			serde_json::to_vec(&json!({"id":request["id"],"result":result,"error":null})).unwrap()
+		});
+		let logger = Arc::new(Logger::new_log_facade());
+		let runtime = Runtime::new(Arc::clone(&logger)).unwrap();
+		let source = BitcoindChainSource::new_rpc(
+			"127.0.0.1".to_owned(),
+			server.addr.port(),
+			"test".to_owned(),
+			"test".to_owned(),
+			Arc::new(OnchainFeeEstimator::new()),
+			Arc::new(InMemoryStore::new()),
+			Arc::new(Config::default()),
+			logger,
+			Arc::new(RwLock::new(NodeMetrics::default())),
+		);
+		assert_transaction_status(
+			runtime.block_on(source.fetch_transaction_status(fixture.tx.compute_txid())),
+			case,
+			&fixture,
+		);
+		assert!(server.count.load(Ordering::Acquire) <= 5);
+	}
+}
+
+#[test]
+fn direct_funding_core_unspent_requires_exact_value_script_and_mempool_awareness() {
+	for case in 0..5 {
+		let fixture = Fixture::new(Case::Valid);
+		let output = fixture.parent.output[0].clone();
+		let outpoint = OutPoint { txid: fixture.parent.compute_txid(), vout: 0 };
+		let expected = output.clone();
+		let server = Server::new(true, move |_, request, _| {
+			assert_eq!(request["method"], "gettxout");
+			assert_eq!(request["params"], json!([outpoint.txid.to_string(), 0, true]));
+			let result = match case {
+				1 => Value::Null,
+				2 => json!({"scriptPubKey":{"hex":"00"},"value":expected.value.to_btc()}),
+				3 => {
+					json!({"scriptPubKey":{"hex":expected.script_pubkey.to_hex_string()},"value":expected.value.to_btc() + 0.00000001})
+				},
+				4 => json!({"scriptPubKey":{"hex":expected.script_pubkey.to_hex_string()}}),
+				_ => {
+					json!({"scriptPubKey":{"hex":expected.script_pubkey.to_hex_string()},"value":expected.value.to_btc()})
+				},
+			};
+			serde_json::to_vec(&json!({"id":request["id"],"result":result,"error":null})).unwrap()
+		});
+		let logger = Arc::new(Logger::new_log_facade());
+		let runtime = Runtime::new(logger.clone()).unwrap();
+		let source = BitcoindChainSource::new_rpc(
+			"127.0.0.1".to_owned(),
+			server.addr.port(),
+			"test".to_owned(),
+			"test".to_owned(),
+			Arc::new(OnchainFeeEstimator::new()),
+			Arc::new(InMemoryStore::new()),
+			Arc::new(Config::default()),
+			logger,
+			Arc::new(RwLock::new(NodeMetrics::default())),
+		);
+		let result = runtime.block_on(source.is_unspent_output(outpoint, output));
+		match case {
+			0 => assert_eq!(result, Ok(true)),
+			1 => assert_eq!(result, Ok(false)),
+			_ => assert!(result.is_err()),
+		}
+		assert_eq!(server.count.load(Ordering::Acquire), 1);
+	}
+}
+
+#[test]
+fn direct_funding_esplora_unspent_requires_output_and_positive_spend_status() {
+	for case in 0..4 {
+		let fixture = Fixture::new(Case::Valid);
+		let output = fixture.tx.output[0].clone();
+		let outpoint = OutPoint { txid: fixture.tx.compute_txid(), vout: 0 };
+		let mut transaction = fixture.tx.clone();
+		if case == 3 {
+			transaction.output[0].value = bitcoin::Amount::from_sat(1);
+		}
+		let server = Server::new(true, move |path, _, _| {
+			if path == format!("/tx/{}/raw", outpoint.txid) {
+				return serialize(&transaction);
+			}
+			assert_eq!(path, format!("/tx/{}/outspend/0", outpoint.txid));
+			serde_json::to_vec(&match case {
+				1 => json!({"spent":true}),
+				2 => json!({}),
+				_ => json!({"spent":false}),
+			})
+			.unwrap()
+		});
+		let logger = Arc::new(Logger::new_log_facade());
+		let runtime = Runtime::new(logger.clone()).unwrap();
+		let config = Arc::new(Config::default());
+		let source = EsploraChainSource::new(
+			format!("http://{}", server.addr),
+			HashMap::new(),
+			EsploraSyncConfig::default(),
+			Arc::new(OnchainFeeEstimator::new()),
+			Arc::new(InMemoryStore::new()),
+			config.clone(),
+			Arc::new(RwLock::new(AddressTypeRuntimeConfig::from_config(&config, vec![]))),
+			logger,
+			Arc::new(RwLock::new(NodeMetrics::default())),
+		);
+		let result = runtime.block_on(source.is_unspent_output(outpoint, output));
+		match case {
+			0 => assert_eq!(result, Ok(true)),
+			1 => assert_eq!(result, Ok(false)),
+			_ => assert!(result.is_err()),
+		}
+		assert!(server.count.load(Ordering::Acquire) <= 2);
+	}
+}
+
+#[test]
+fn direct_funding_electrum_unspent_requires_exact_script_outpoint_and_value() {
+	for case in 0..5 {
+		let fixture = Fixture::new(Case::Valid);
+		let output = fixture.parent.output[0].clone();
+		let outpoint = OutPoint { txid: fixture.parent.compute_txid(), vout: 0 };
+		let expected = output.clone();
+		let server = Server::new(false, move |_, request, _| {
+			assert_eq!(request["method"], "blockchain.scripthash.listunspent");
+			let mut hash = bitcoin::hashes::sha256::Hash::hash(expected.script_pubkey.as_bytes())
+				.to_byte_array();
+			hash.reverse();
+			assert_eq!(request["params"][0], hash.as_hex().to_string());
+			let coins = if case == 1 {
+				json!([])
+			} else {
+				json!([{
+					"tx_hash":if case == 2 { fixture.tx.compute_txid() } else { outpoint.txid },
+					"tx_pos":if case == 3 { 1 } else { 0 }, "height":95,
+					"value":if case == 4 { 1 } else { expected.value.to_sat() }
+				}])
+			};
+			serde_json::to_vec(&json!({"jsonrpc":"2.0","id":request["id"],"result":coins})).unwrap()
+		});
+		let logger = Arc::new(Logger::new_log_facade());
+		let runtime = Runtime::new(logger.clone()).unwrap();
+		let config = Arc::new(Config::default());
+		let source = ElectrumChainSource::new(
+			format!("tcp://{}", server.addr),
+			ElectrumSyncConfig::default(),
+			Arc::new(OnchainFeeEstimator::new()),
+			Arc::new(InMemoryStore::new()),
+			config.clone(),
+			Arc::new(RwLock::new(AddressTypeRuntimeConfig::from_config(&config, vec![]))),
+			logger,
+			Arc::new(RwLock::new(NodeMetrics::default())),
+		);
+		source.start(runtime.handle().clone()).unwrap();
+		assert_eq!(runtime.block_on(source.is_unspent_output(outpoint, output)), Ok(case == 0));
+		source.stop();
+		assert_eq!(server.count.load(Ordering::Acquire), 1);
 	}
 }

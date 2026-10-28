@@ -463,6 +463,9 @@ pub struct ChannelDetails {
 	pub inbound_htlc_minimum_msat: Option<u64>,
 	/// The largest value HTLC (in msat) we currently will accept, for this channel.
 	pub inbound_htlc_maximum_msat: Option<u64>,
+	/// Aggregate inbound HTLC limit agreed at opening, preserved across splices.
+	/// `None` only for details serialized before this field was introduced.
+	pub inbound_htlc_value_in_flight_maximum_msat: Option<u64>,
 	/// Set of configurable parameters that affect channel operation.
 	///
 	/// This field is only `None` for `ChannelDetails` objects serialized prior to LDK 0.0.109.
@@ -592,6 +595,7 @@ impl ChannelDetails {
 			is_announced: context.should_announce(),
 			inbound_htlc_minimum_msat: Some(context.get_holder_htlc_minimum_msat()),
 			inbound_htlc_maximum_msat: context.get_holder_htlc_maximum_msat(funding),
+			inbound_htlc_value_in_flight_maximum_msat: Some(context.get_holder_inflight_htlc_limit_msat()),
 			config: Some(context.config()),
 			channel_shutdown_state: Some(context.shutdown_state()),
 			pending_inbound_htlcs: context.get_pending_inbound_htlc_details(funding),
@@ -636,6 +640,7 @@ impl_writeable_tlv_based!(ChannelDetails, {
 	(43, pending_inbound_htlcs, optional_vec),
 	(45, pending_outbound_htlcs, optional_vec),
 	(47, funding_redeem_script, option),
+	(49, inbound_htlc_value_in_flight_maximum_msat, option),
 	(_unused, user_channel_id, (static_value,
 		_user_channel_id_low.unwrap_or(0) as u128 | ((_user_channel_id_high.unwrap_or(0) as u128) << 64)
 	)),
@@ -736,6 +741,7 @@ mod tests {
 			is_announced: false,
 			inbound_htlc_minimum_msat: Some(98),
 			inbound_htlc_maximum_msat: Some(983274),
+			inbound_htlc_value_in_flight_maximum_msat: Some(100_000_000),
 			config: Some(ChannelConfig::default()),
 			feerate_sat_per_1000_weight: Some(212),
 			channel_shutdown_state: Some(ChannelShutdownState::NotShuttingDown),

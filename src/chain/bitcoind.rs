@@ -41,6 +41,7 @@ use crate::fee_estimator::{
 };
 use crate::io::utils::write_node_metrics;
 use crate::logger::{log_bytes, log_error, log_info, log_trace, LdkLogger, Logger};
+use crate::payment::ConfirmationStatus;
 use crate::types::{ChainMonitor, ChannelManager, DynStore, Sweeper, Wallet};
 use crate::{Error, NodeMetrics};
 
@@ -676,6 +677,141 @@ impl BitcoindChainSource {
 		}
 
 		Ok(())
+	}
+
+	pub(super) async fn fetch_transaction(&self, txid: Txid) -> Result<Transaction, Error> {
+		self.api_client
+			.get_raw_transaction(&txid)
+			.await
+			.map_err(|_| Error::TxSyncFailed)?
+			.ok_or(Error::TxSyncFailed)
+	}
+
+	pub(super) async fn is_unspent_output(
+		&self, outpoint: bitcoin::OutPoint, output: bitcoin::TxOut,
+	) -> Result<bool, Error> {
+		let response = match self.api_client.as_ref() {
+			BitcoindClient::Rpc { rpc_client, .. } => {
+				rpc_client
+					.call_method::<DirectFundingUtxoResponse>(
+						"gettxout",
+						&[
+							serde_json::json!(outpoint.txid.to_string()),
+							serde_json::json!(outpoint.vout),
+							serde_json::json!(true),
+						],
+					)
+					.await
+					.map_err(|_| Error::TxSyncFailed)?
+					.0
+			},
+			// REST-only configurations cannot establish mempool-aware unspentness here.
+			BitcoindClient::Rest { .. } => return Err(Error::TxSyncFailed),
+		};
+		if response.is_null() {
+			return Ok(false);
+		}
+		let script = response
+			.get("scriptPubKey")
+			.and_then(|v| v.get("hex"))
+			.and_then(|v| v.as_str())
+			.ok_or(Error::TxSyncFailed)?;
+		if script != output.script_pubkey.to_hex_string() {
+			return Err(Error::TxSyncFailed);
+		}
+		let value = response.get("value").and_then(|v| v.as_f64()).ok_or(Error::TxSyncFailed)?;
+		let value = bitcoin::Amount::from_btc(value).map_err(|_| Error::TxSyncFailed)?;
+		if value != output.value {
+			return Err(Error::TxSyncFailed);
+		}
+		Ok(true)
+	}
+
+	pub(super) async fn fetch_transaction_status(
+		&self, txid: Txid,
+	) -> Result<ConfirmationStatus, Error> {
+		// REST configurations also carry an authenticated RPC client. Confirmed
+		// arbitrary transactions require Core's transaction index.
+		let rpc = match &*self.api_client {
+			BitcoindClient::Rpc { rpc_client, .. } | BitcoindClient::Rest { rpc_client, .. } => {
+				rpc_client
+			},
+		};
+		let value: serde_json::Value = rpc
+			.call_method(
+				"getrawtransaction",
+				&[serde_json::json!(txid.to_string()), serde_json::json!(true)],
+			)
+			.await
+			.map_err(|_| Error::TxSyncFailed)?;
+		let transaction: Transaction = bitcoin::consensus::encode::deserialize_hex(
+			value.get("hex").and_then(|v| v.as_str()).ok_or(Error::TxSyncFailed)?,
+		)
+		.map_err(|_| Error::TxSyncFailed)?;
+		if transaction.compute_txid() != txid {
+			return Err(Error::TxSyncFailed);
+		}
+		let Some(hash) = value.get("blockhash") else {
+			if value.get("confirmations").is_some_and(|v| v.as_i64() != Some(0))
+				|| value.get("in_active_chain").is_some_and(|v| v.as_bool() != Some(false))
+			{
+				return Err(Error::TxSyncFailed);
+			}
+			// A raw transaction may survive a reorg outside both chain and mempool.
+			// Only positive mempool membership authorizes an unconfirmed result.
+			let entry: serde_json::Value = rpc
+				.call_method("getmempoolentry", &[serde_json::json!(txid.to_string())])
+				.await
+				.map_err(|_| Error::TxSyncFailed)?;
+			if !entry.is_object() {
+				return Err(Error::TxSyncFailed);
+			}
+			return Ok(ConfirmationStatus::Unconfirmed);
+		};
+		let block_hash: BlockHash =
+			hash.as_str().ok_or(Error::TxSyncFailed)?.parse().map_err(|_| Error::TxSyncFailed)?;
+		if value.get("confirmations").and_then(|v| v.as_i64()).unwrap_or(0) <= 0
+			|| value.get("in_active_chain").is_some_and(|v| v.as_bool() != Some(true))
+		{
+			return Err(Error::TxSyncFailed);
+		}
+		let header = rpc.get_header(&block_hash, None).await.map_err(|_| Error::TxSyncFailed)?;
+		if header.header.block_hash() != block_hash
+			|| value
+				.get("blocktime")
+				.is_some_and(|v| v.as_u64() != Some(u64::from(header.header.time)))
+		{
+			return Err(Error::TxSyncFailed);
+		}
+		let active: BlockHash = rpc
+			.call_method("getblockhash", &[serde_json::json!(header.height)])
+			.await
+			.map_err(|_| Error::TxSyncFailed)?;
+		if active != block_hash {
+			return Err(Error::TxSyncFailed);
+		}
+		let block = match rpc.get_block(&block_hash).await.map_err(|_| Error::TxSyncFailed)? {
+			BlockData::FullBlock(block) => block,
+			_ => return Err(Error::TxSyncFailed),
+		};
+		if block.block_hash() != block_hash
+			|| !block.check_merkle_root()
+			|| !block.txdata.iter().any(|tx| tx.compute_txid() == txid)
+		{
+			return Err(Error::TxSyncFailed);
+		}
+		let active: BlockHash = rpc
+			.call_method("getblockhash", &[serde_json::json!(header.height)])
+			.await
+			.map_err(|_| Error::TxSyncFailed)?;
+		if active != block_hash {
+			return Err(Error::TxSyncFailed);
+		}
+		Ok(ConfirmationStatus::Confirmed {
+			block_hash,
+			height: header.height,
+			timestamp: u64::from(header.header.time),
+		})
 	}
 
 	#[cfg(feature = "chicory")]
@@ -1484,6 +1620,14 @@ impl TryInto<MempoolMinFeeResponse> for JsonResponse {
 			FeeRate::from_sat_per_kwu(fee_rate_sat_per_kwu)
 		};
 		Ok(MempoolMinFeeResponse(fee_rate))
+	}
+}
+
+struct DirectFundingUtxoResponse(serde_json::Value);
+impl TryInto<DirectFundingUtxoResponse> for JsonResponse {
+	type Error = std::io::Error;
+	fn try_into(self) -> std::io::Result<DirectFundingUtxoResponse> {
+		Ok(DirectFundingUtxoResponse(self.0))
 	}
 }
 

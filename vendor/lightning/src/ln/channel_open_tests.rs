@@ -282,6 +282,8 @@ fn test_inbound_anchors_manual_acceptance() {
 fn test_inbound_anchors_manual_acceptance_overridden() {
 	let overrides = ChannelConfigOverrides {
 		handshake_overrides: Some(ChannelHandshakeConfigUpdate {
+			max_inbound_htlc_value_in_flight_msat: None,
+			retain_counterparty_htlc_limit_for_splicing: None,
 			max_inbound_htlc_value_in_flight_percent_of_channel: Some(5),
 			htlc_minimum_msat: Some(1000),
 			minimum_depth: Some(2),
@@ -1194,6 +1196,8 @@ pub fn test_manually_accept_inbound_channel_request() {
 
 	let config_overrides = ChannelConfigOverrides {
 		handshake_overrides: Some(ChannelHandshakeConfigUpdate {
+			max_inbound_htlc_value_in_flight_msat: None,
+			retain_counterparty_htlc_limit_for_splicing: None,
 			max_inbound_htlc_value_in_flight_percent_of_channel: None,
 			htlc_minimum_msat: None,
 			minimum_depth: None,

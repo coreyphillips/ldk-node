@@ -1,0 +1,206 @@
+{
+  "date": "2026-10-26",
+  "ldkNodeBase": "b63959d535fd66995b3c89213e102aa4f6d5f327",
+  "beignetBase": "cc473ff08cd37cd5d0c4e60dae5032ffc34d079b",
+  "nativeLibraryTestsPassed": 230,
+  "beignetTargetedTestsPassed": 226,
+  "runs": [
+    {
+      "provider": "ldk",
+      "checks": [
+        "jit-quote",
+        "fee-ceiling-refusal",
+        "jit-receive-net-19880",
+        "lightning-send-1000",
+        "deposit-splice-in-40000",
+        "splice-out-5000-at-requested-rate",
+        "backend-transaction-and-parent-lookup",
+        "backend-mempool-and-confirmed-status",
+        "unknown-transaction-status-refused",
+        "confirmed-status-after-restart",
+        "wallet-restart",
+        "supplied-channel-id",
+        "open-id-replay-refused-after-restart",
+        "jit-receive-100000-after-48200-open-and-restart",
+        "lightning-send-60000-above-original-capacity",
+        "existing-channel-policy-route",
+        "provider-identity-and-policy-after-restart",
+        "legacy-channel-oversized-quote-and-invoice-refused",
+        "pending-primary-quote-refused"
+      ],
+      "quote": {
+        "amountMsat": 20000000,
+        "feeMsat": 120000,
+        "fundingSats": 40000
+      },
+      "received": {
+        "amountMsat": 19880000,
+        "direction": "Inbound",
+        "id": "8608e78e477036b57ddbb48cf45aef47366f240f9199a3633ae7d634a3b371e9",
+        "status": "Succeeded"
+      },
+      "depositFirstQuote": {
+        "amountMsat": 100000000,
+        "feeMsat": 200000,
+        "fundingSats": 120000
+      },
+      "depositFirstReceived": {
+        "amountMsat": 99800000,
+        "direction": "Inbound",
+        "id": "ff5c3a91148e17277df2e3b6898e98581c7e1cc48cdec819b3478ff7dc362079",
+        "status": "Succeeded"
+      },
+      "depositFirstOpeningSats": 48200,
+      "depositFirstFinalCapacitySats": 168200,
+      "spliceFeeSats": 361,
+      "spliceConfirmation": {
+        "confirmed": true,
+        "blockHash": "0789d7d5551f8e91d0b7a7a0c9aedaffaf40555df6c559023421d9da9efab9cf",
+        "height": 8421,
+        "timestamp": 1792988542
+      },
+      "finalBalance": {
+        "lightningSats": 53519,
+        "onchainSats": 9466,
+        "spendableOnchainSats": 9466
+      },
+      "fixture": "ldk-rpc"
+    },
+    {
+      "provider": "beignet",
+      "checks": [
+        "jit-quote",
+        "fee-ceiling-refusal",
+        "jit-receive-net-19880",
+        "lightning-send-1000",
+        "deposit-splice-in-40000",
+        "splice-out-5000-at-requested-rate",
+        "backend-transaction-and-parent-lookup",
+        "backend-mempool-and-confirmed-status",
+        "unknown-transaction-status-refused",
+        "confirmed-status-after-restart",
+        "wallet-restart",
+        "supplied-channel-id",
+        "open-id-replay-refused-after-restart",
+        "jit-receive-100000-after-48200-open-and-restart",
+        "lightning-send-60000-above-original-capacity",
+        "existing-channel-policy-route",
+        "provider-identity-and-policy-after-restart",
+        "legacy-channel-oversized-quote-and-invoice-refused",
+        "pending-primary-quote-refused"
+      ],
+      "quote": {
+        "amountMsat": 20000000,
+        "feeMsat": 120000,
+        "fundingSats": 40000
+      },
+      "received": {
+        "amountMsat": 19880000,
+        "direction": "Inbound",
+        "id": "ae643f532aea885c544320a3033fd8b8810993ac7ffa4edab0cb8d1842fc60b4",
+        "status": "Succeeded"
+      },
+      "depositFirstQuote": {
+        "amountMsat": 100000000,
+        "feeMsat": 200000,
+        "fundingSats": 120000
+      },
+      "depositFirstReceived": {
+        "amountMsat": 99800000,
+        "direction": "Inbound",
+        "id": "a76b4ff6155b9fa7383bfcead5e87f5e00bc970429a56197e61948ac30e2ca17",
+        "status": "Succeeded"
+      },
+      "depositFirstOpeningSats": 48200,
+      "depositFirstFinalCapacitySats": 168200,
+      "spliceFeeSats": 361,
+      "spliceConfirmation": {
+        "confirmed": true,
+        "blockHash": "2f3b1da03b99366206143d73c2604fd63e412612c4eb104927bd65689c1aee1d",
+        "height": 8354,
+        "timestamp": 1792988500
+      },
+      "finalBalance": {
+        "lightningSats": 53519,
+        "onchainSats": 9466,
+        "spendableOnchainSats": 9466
+      },
+      "fixture": "beignet-rpc"
+    },
+    {
+      "provider": "beignet",
+      "checks": [
+        "jit-quote",
+        "fee-ceiling-refusal",
+        "jit-receive-net-19880",
+        "lightning-send-1000",
+        "deposit-splice-in-40000",
+        "splice-out-5000-at-requested-rate",
+        "backend-transaction-and-parent-lookup",
+        "backend-mempool-and-confirmed-status",
+        "unknown-transaction-status-refused",
+        "confirmed-status-after-restart",
+        "wallet-restart",
+        "supplied-channel-id",
+        "open-id-replay-refused-after-restart",
+        "jit-receive-100000-after-48200-open-and-restart",
+        "lightning-send-60000-above-original-capacity",
+        "existing-channel-policy-route",
+        "provider-identity-and-policy-after-restart",
+        "legacy-channel-oversized-quote-and-invoice-refused",
+        "pending-primary-quote-refused"
+      ],
+      "quote": {
+        "amountMsat": 20000000,
+        "feeMsat": 120000,
+        "fundingSats": 40000
+      },
+      "received": {
+        "amountMsat": 19880000,
+        "direction": "Inbound",
+        "id": "9dddb2a024633d15a4ac82579b1feaf4b54bc59b99bd5523b8e136d5b4139a10",
+        "status": "Succeeded"
+      },
+      "depositFirstQuote": {
+        "amountMsat": 100000000,
+        "feeMsat": 200000,
+        "fundingSats": 120000
+      },
+      "depositFirstReceived": {
+        "amountMsat": 99800000,
+        "direction": "Inbound",
+        "id": "6a433fe3e2f87d26c33072465a3dd00430eede77a6a4d0f57aebdc65ef18c6d1",
+        "status": "Succeeded"
+      },
+      "depositFirstOpeningSats": 48200,
+      "depositFirstFinalCapacitySats": 168200,
+      "spliceFeeSats": 361,
+      "spliceConfirmation": {
+        "confirmed": true,
+        "blockHash": "4ab8590d920f192048317c808a2a6ee3f17c45ef63a1673b2e9c9755da6fc1bd",
+        "height": 8488,
+        "timestamp": 1792988594
+      },
+      "finalBalance": {
+        "lightningSats": 53519,
+        "onchainSats": 9466,
+        "spendableOnchainSats": 9466
+      },
+      "fixture": "beignet-electrum"
+    }
+  ],
+  "androidAar": {
+    "relativePath": "bindings/kotlin/ldk-node-android/lib/build/outputs/aar/lib-release.aar",
+    "sha256": "88537f56473dc65e619f08b388e252656b0ecd90883f7bb1d8f2fa4cbd5fb0df",
+    "bytes": 22769551,
+    "abis": [
+      "armeabi-v7a",
+      "arm64-v8a",
+      "x86_64"
+    ],
+    "java": 17,
+    "ndk": "28.2.13676358"
+  },
+  "nativeChannelTestsPassed": 23,
+  "nativeChannelDetailsSerializationTestsPassed": 1
+}

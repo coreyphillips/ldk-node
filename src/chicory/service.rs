@@ -25,6 +25,7 @@ use lightning::ln::funding::{FundingTxInput, SpliceContribution};
 use lightning::ln::msgs::Init;
 use lightning::ln::types::ChannelId;
 use lightning::types::payment::PaymentHash;
+use lightning::util::config::ChannelHandshakeConfigUpdate;
 use lightning::util::persist::KVStoreSync;
 use rand::Rng;
 use serde::{Deserialize, Serialize};
@@ -161,6 +162,11 @@ impl fmt::Display for JitConfigError {
 impl std::error::Error for JitConfigError {}
 
 impl JitServiceConfig {
+	fn private_splice_handshake(&self, announced: bool) -> Option<ChannelHandshakeConfigUpdate> {
+		(self.enabled && self.allow_splice_jit && !announced)
+			.then(crate::primary::splice_channel_handshake)
+	}
+
 	/// Validate bounded provider limits before enabling peer requests.
 	pub fn validate(&self) -> Result<(), JitConfigError> {
 		if self.max_live_intents == 0
@@ -667,6 +673,12 @@ impl ChicoryService {
 			service.persist(&state.durable).map_err(|_| BuildError::WriteFailed)?;
 		}
 		Ok(service)
+	}
+
+	pub(crate) fn private_splice_handshake(
+		&self, announced: bool,
+	) -> Option<ChannelHandshakeConfigUpdate> {
+		self.policy.private_splice_handshake(announced)
 	}
 
 	pub(crate) fn begin_wallet_operation(&self) -> Result<WalletOperationGuard<'_>, ()> {
@@ -1265,6 +1277,9 @@ impl ChicoryService {
 			self.forward_group(&mut state, scid, channel, peer);
 		} else if let Some(user_channel_id) = user_channel_id {
 			let mut config = default_user_config(&self.config);
+			if let Some(handshake) = self.private_splice_handshake(false) {
+				config.channel_handshake_config.apply(&handshake);
+			}
 			config.channel_handshake_config.announce_for_forwarding = false;
 			config.channel_handshake_config.require_zero_conf = true;
 			config.channel_handshake_config.reuse_funding_key_on_splice =
@@ -1961,6 +1976,30 @@ fn validate_legacy_durable(state: &DurableState) -> Result<(), ()> {
 
 #[cfg(test)]
 mod tests {
+	#[test]
+	fn splice_handshake_requires_enabled_private_provider() {
+		for enabled in [false, true] {
+			for allow_splice_jit in [false, true] {
+				for announced in [false, true] {
+					let policy =
+						super::JitServiceConfig { enabled, allow_splice_jit, ..Default::default() };
+					let handshake = policy.private_splice_handshake(announced);
+					assert_eq!(handshake.is_some(), enabled && allow_splice_jit && !announced);
+					if let Some(handshake) = handshake {
+						assert_eq!(
+							handshake.max_inbound_htlc_value_in_flight_msat,
+							Some(2_100_000_000_000_000_000)
+						);
+						assert_eq!(
+							handshake.retain_counterparty_htlc_limit_for_splicing,
+							Some(true)
+						);
+					}
+				}
+			}
+		}
+	}
+
 	use std::future::Future;
 	use std::pin::Pin;
 	use std::str::FromStr;

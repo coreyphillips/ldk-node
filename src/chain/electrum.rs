@@ -46,6 +46,7 @@ use crate::fee_estimator::{
 };
 use crate::io::utils::write_node_metrics;
 use crate::logger::{log_bytes, log_error, log_info, log_trace, LdkLogger, Logger};
+use crate::payment::ConfirmationStatus;
 use crate::types::{ChainMonitor, ChannelManager, DynStore, Sweeper, Wallet};
 use crate::NodeMetrics;
 
@@ -620,16 +621,96 @@ impl ElectrumChainSource {
 		}
 	}
 
+	pub(super) async fn fetch_transaction(&self, txid: Txid) -> Result<Transaction, Error> {
+		let runtime =
+			self.electrum_runtime_status.read().unwrap().client().ok_or(Error::NotRunning)?;
+		let permit = Arc::clone(&runtime.lookup_gate)
+			.try_acquire_owned()
+			.map_err(|_| Error::TxSyncFailed)?;
+		let connect = Arc::clone(&runtime.connect_lookup);
+		let deadline = Instant::now() + Duration::from_secs(15);
+		runtime
+			.runtime_handle
+			.spawn_blocking(move || {
+				let _permit = permit;
+				if Instant::now() >= deadline {
+					return Err(Error::TxSyncFailed);
+				}
+				connect()
+					.map_err(|_| Error::TxSyncFailed)?
+					.transaction_get(&txid)
+					.map_err(|_| Error::TxSyncFailed)
+			})
+			.await
+			.map_err(|_| Error::TxSyncFailed)?
+	}
+
+	pub(super) async fn is_unspent_output(
+		&self, outpoint: bitcoin::OutPoint, output: bitcoin::TxOut,
+	) -> Result<bool, Error> {
+		let runtime =
+			self.electrum_runtime_status.read().unwrap().client().ok_or(Error::NotRunning)?;
+		let permit = Arc::clone(&runtime.lookup_gate)
+			.try_acquire_owned()
+			.map_err(|_| Error::TxSyncFailed)?;
+		let connect = Arc::clone(&runtime.connect_lookup);
+		let deadline = Instant::now() + Duration::from_secs(15);
+		runtime
+			.runtime_handle
+			.spawn_blocking(move || {
+				let _permit = permit;
+				if Instant::now() >= deadline {
+					return Err(Error::TxSyncFailed);
+				}
+				let client = connect().map_err(|_| Error::TxSyncFailed)?;
+				let coins = client
+					.script_list_unspent(&output.script_pubkey)
+					.map_err(|_| Error::TxSyncFailed)?;
+				Ok(coins.iter().any(|coin| {
+					coin.tx_hash == outpoint.txid
+						&& coin.tx_pos == outpoint.vout as usize
+						&& coin.value == output.value.to_sat()
+				}))
+			})
+			.await
+			.map_err(|_| Error::TxSyncFailed)?
+	}
+
+	pub(super) async fn fetch_transaction_status(
+		&self, txid: Txid,
+	) -> Result<ConfirmationStatus, Error> {
+		let runtime =
+			self.electrum_runtime_status.read().unwrap().client().ok_or(Error::NotRunning)?;
+		let permit = Arc::clone(&runtime.lookup_gate)
+			.try_acquire_owned()
+			.map_err(|_| Error::TxSyncFailed)?;
+		let connect = Arc::clone(&runtime.connect_lookup);
+		let deadline = Instant::now() + Duration::from_secs(15);
+		runtime
+			.runtime_handle
+			.spawn_blocking(move || {
+				// A timed-out blocking socket still owns its permit until it exits.
+				let _permit = permit;
+				if Instant::now() >= deadline {
+					return Err(Error::TxSyncFailed);
+				}
+				let client = connect().map_err(|_| Error::TxSyncFailed)?;
+				electrum_transaction_status(&client, txid, deadline)
+			})
+			.await
+			.map_err(|_| Error::TxSyncFailed)?
+	}
+
 	#[cfg(feature = "chicory")]
 	pub(super) async fn confirmed_transaction(
 		&self, txid: Txid, tip: lightning::chain::BestBlock,
 	) -> Result<super::chicory::ConfirmedTransaction, Error> {
 		let runtime =
 			self.electrum_runtime_status.read().unwrap().client().ok_or(Error::NotRunning)?;
-		let permit = Arc::clone(&runtime.conflict_gate)
+		let permit = Arc::clone(&runtime.lookup_gate)
 			.try_acquire_owned()
 			.map_err(|_| Error::TxSyncFailed)?;
-		let connect = Arc::clone(&runtime.connect_conflict);
+		let connect = Arc::clone(&runtime.connect_lookup);
 		let deadline = Instant::now() + Duration::from_secs(15);
 		runtime
 			.runtime_handle
@@ -664,6 +745,70 @@ impl ElectrumChainSource {
 			};
 		electrum_client.get_address_balance(address).await
 	}
+}
+
+/// Look up the spent script so transactions with only unspendable outputs are
+/// discoverable. Missing or changing history is an error, never unconfirmation.
+pub(super) fn electrum_transaction_status(
+	client: &impl ElectrumApi, txid: Txid, deadline: Instant,
+) -> Result<ConfirmationStatus, Error> {
+	let remaining = || if Instant::now() < deadline { Ok(()) } else { Err(Error::TxSyncFailed) };
+	remaining()?;
+	let transaction = client.transaction_get(&txid).map_err(|_| Error::TxSyncFailed)?;
+	if transaction.compute_txid() != txid {
+		return Err(Error::TxSyncFailed);
+	}
+	let outpoint = transaction.input.first().ok_or(Error::TxSyncFailed)?.previous_output;
+	let script = if outpoint.is_null() {
+		transaction.output.first().ok_or(Error::TxSyncFailed)?.script_pubkey.clone()
+	} else {
+		remaining()?;
+		let parent = client.transaction_get(&outpoint.txid).map_err(|_| Error::TxSyncFailed)?;
+		if parent.compute_txid() != outpoint.txid {
+			return Err(Error::TxSyncFailed);
+		}
+		parent.output.get(outpoint.vout as usize).ok_or(Error::TxSyncFailed)?.script_pubkey.clone()
+	};
+	let history_height = || {
+		remaining()?;
+		let history = client.script_get_history(&script).map_err(|_| Error::TxSyncFailed)?;
+		let mut rows = history.iter().filter(|row| row.tx_hash == txid);
+		let height = rows.next().ok_or(Error::TxSyncFailed)?.height;
+		if rows.next().is_some() || height < -1 {
+			return Err(Error::TxSyncFailed);
+		}
+		Ok(height)
+	};
+	let height = history_height()?;
+	if height <= 0 {
+		return Ok(ConfirmationStatus::Unconfirmed);
+	}
+	let height = u32::try_from(height).map_err(|_| Error::TxSyncFailed)?;
+	remaining()?;
+	let proof =
+		client.transaction_get_merkle(&txid, height as usize).map_err(|_| Error::TxSyncFailed)?;
+	remaining()?;
+	let header = client.block_header(height as usize).map_err(|_| Error::TxSyncFailed)?;
+	if proof.block_height != height as usize
+		|| proof.merkle.len() > 32
+		|| (proof.merkle.len() < usize::BITS as usize && proof.pos >> proof.merkle.len() != 0)
+		|| !electrum_client::utils::validate_merkle_proof(&txid, &header.merkle_root, &proof)
+		|| history_height()? != height as i32
+	{
+		return Err(Error::TxSyncFailed);
+	}
+	remaining()?;
+	if client.block_header(height as usize).map_err(|_| Error::TxSyncFailed)?.block_hash()
+		!= header.block_hash()
+	{
+		return Err(Error::TxSyncFailed);
+	}
+	remaining()?;
+	Ok(ConfirmationStatus::Confirmed {
+		block_hash: header.block_hash(),
+		height,
+		timestamp: u64::from(header.time),
+	})
 }
 
 /// Read a proof on an isolated, finite-timeout client. The configured chain
@@ -848,10 +993,8 @@ struct ElectrumRuntimeClient {
 	config: Arc<Config>,
 	logger: Arc<Logger>,
 	confirm_gate: Arc<ConfirmGate>,
-	#[cfg(feature = "chicory")]
-	conflict_gate: Arc<tokio::sync::Semaphore>,
-	#[cfg(feature = "chicory")]
-	connect_conflict: Arc<dyn Fn() -> Result<ElectrumClient, ElectrumError> + Send + Sync>,
+	lookup_gate: Arc<tokio::sync::Semaphore>,
+	connect_lookup: Arc<dyn Fn() -> Result<ElectrumClient, ElectrumError> + Send + Sync>,
 }
 
 impl ElectrumRuntimeClient {
@@ -891,8 +1034,7 @@ impl ElectrumRuntimeClient {
 				},
 			)?,
 		);
-		#[cfg(feature = "chicory")]
-		let connect_conflict = {
+		let connect_lookup = {
 			let url = server_url.clone();
 			Arc::new(move || {
 				ElectrumClient::from_config(
@@ -904,10 +1046,8 @@ impl ElectrumRuntimeClient {
 		let connect_main =
 			Arc::new(move || MainElectrumClient::connect(&server_url, &electrum_config));
 		Ok(Self {
-			#[cfg(feature = "chicory")]
-			conflict_gate: Arc::new(tokio::sync::Semaphore::new(2)),
-			#[cfg(feature = "chicory")]
-			connect_conflict,
+			lookup_gate: Arc::new(tokio::sync::Semaphore::new(2)),
+			connect_lookup,
 			main_client: Arc::new(RwLock::new(Arc::new(main_client))),
 			connect_main,
 			tx_sync,

@@ -78,6 +78,10 @@
 #![cfg_attr(docsrs, feature(doc_cfg))]
 
 mod balance;
+mod primary;
+#[path = "chicory/wire.rs"]
+pub mod primary_wire;
+pub use primary::{OnchainFeeRates, PrimaryReceiveQuote};
 mod builder;
 mod chain;
 #[cfg(feature = "chicory")]
@@ -85,6 +89,11 @@ pub mod chicory;
 pub mod config;
 mod connection;
 mod data_store;
+mod direct_funding;
+pub use direct_funding::{
+	DirectFundingError, DirectFundingPaymentDetails, DirectFundingPaymentStatus,
+	DirectFundingRequestDetails,
+};
 mod error;
 mod event;
 mod fee_estimator;
@@ -115,7 +124,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 pub use balance::{AddressTypeBalance, BalanceDetails, LightningBalance, PendingSweepBalance};
 use bitcoin::secp256k1::PublicKey;
-use bitcoin::{Address, Amount};
+use bitcoin::{Address, Amount, FeeRate};
 #[cfg(feature = "uniffi")]
 pub use builder::ArcedNodeBuilder as Builder;
 #[cfg(not(feature = "uniffi"))]
@@ -208,6 +217,8 @@ pub struct Node {
 	gossip_source: Arc<GossipSource>,
 	pathfinding_scores_sync_url: Option<String>,
 	liquidity_source: Option<Arc<LiquiditySource<Arc<Logger>>>>,
+	primary_client: Arc<primary::PrimaryClient>,
+	direct_funding: Arc<direct_funding::Service>,
 	#[cfg(feature = "chicory")]
 	chicory_service: Option<Arc<chicory::ChicoryService>>,
 	kv_store: Arc<DynStore>,
@@ -218,6 +229,7 @@ pub struct Node {
 	rgs_peer_recovery_exclusions: Arc<RgsPeerRecoveryExclusions>,
 	payment_store: Arc<PaymentStore>,
 	lifecycle_lock: Mutex<()>,
+	channel_open_lock: Mutex<()>,
 	is_running: Arc<RwLock<bool>>,
 	background_processor_failed: Arc<AtomicBool>,
 	background_processor_generation: Arc<AtomicU64>,
@@ -671,6 +683,7 @@ impl Node {
 			self.liquidity_source.clone(),
 			#[cfg(feature = "chicory")]
 			self.chicory_service.clone(),
+			Arc::clone(&self.direct_funding),
 			Arc::clone(&self.payment_store),
 			Arc::clone(&self.peer_store),
 			static_invoice_store,
@@ -779,6 +792,38 @@ impl Node {
 							return;
 						}
 						_ = liquidity_handler.handle_next_event() => {}
+					}
+				}
+			});
+		}
+
+		{
+			let service = Arc::clone(&self.direct_funding);
+			let mut incoming = service.transport.subscribe();
+			let mut stop = self.stop_sender.subscribe();
+			self.runtime.spawn_cancellable_background_task(async move {
+				loop {
+					tokio::select! {
+						_ = stop.changed() => return,
+						frame = incoming.recv() => match frame {
+							Ok(frame) => service.receiver.handle(frame).await,
+							Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {},
+							Err(tokio::sync::broadcast::error::RecvError::Closed) => return,
+						}
+					}
+				}
+			});
+			let service = Arc::clone(&self.direct_funding);
+			let mut stop = self.stop_sender.subscribe();
+			self.runtime.spawn_cancellable_background_task(async move {
+				let mut interval = tokio::time::interval(Duration::from_secs(3));
+				loop {
+					tokio::select! {
+						_ = stop.changed() => return,
+						_ = interval.tick() => {
+							service.receiver.tick().await;
+							let _ = service.sender.reconcile().await;
+						}
 					}
 				}
 			});
@@ -1188,6 +1233,21 @@ impl Node {
 		Some(TransactionDetails { amount_sats, inputs, outputs })
 	}
 
+	/// Queries confirmation evidence from the configured chain backend, including for
+	/// transactions outside the wallet. The node must be running. Confirmed results
+	/// include the block header's timestamp and verified transaction inclusion in the
+	/// backend's active chain. The backend is trusted for active-chain identity, as in
+	/// ordinary wallet sync. Missing transactions, inconsistent evidence and network
+	/// failures return an error and must not be interpreted as unconfirmed.
+	pub fn fetch_transaction_status(
+		&self, txid: &bitcoin::Txid,
+	) -> Result<payment::ConfirmationStatus, Error> {
+		if !*self.is_running.read().unwrap() {
+			return Err(Error::NotRunning);
+		}
+		self.runtime.try_block_on(self.chain_source.fetch_transaction_status(*txid))?
+	}
+
 	/// Gets the current balance (in satoshis) for a Bitcoin address.
 	///
 	/// This queries the chain source (Esplora or Electrum) to get the current balance of the
@@ -1415,10 +1475,25 @@ impl Node {
 	fn open_channel_inner(
 		&self, node_id: PublicKey, address: SocketAddress, channel_amount_sats: u64,
 		push_to_counterparty_msat: Option<u64>, channel_config: Option<ChannelConfig>,
-		announce_for_forwarding: bool,
+		announce_for_forwarding: bool, supplied_user_channel_id: Option<UserChannelId>,
 	) -> Result<UserChannelId, Error> {
 		if !*self.is_running.read().unwrap() {
 			return Err(Error::NotRunning);
+		}
+
+		let _open_guard = self.channel_open_lock.lock().unwrap();
+		let user_channel_id =
+			supplied_user_channel_id.map_or_else(|| rand::rng().random(), |id| id.0);
+		if supplied_user_channel_id.is_some() {
+			if self
+				.channel_manager
+				.list_channels()
+				.iter()
+				.any(|channel| channel.user_channel_id == user_channel_id)
+			{
+				return Err(Error::ChannelCreationFailed);
+			}
+			primary::reserve_channel_open_id(self.kv_store.as_ref(), user_channel_id)?;
 		}
 
 		let peer_info = PeerInfo { node_id, address };
@@ -1447,9 +1522,21 @@ impl Node {
 				.channel_handshake_config
 				.max_inbound_htlc_value_in_flight_percent_of_channel = 100;
 		}
+		user_config.channel_handshake_config.apply(&primary::primary_channel_handshake(
+			&self.config,
+			node_id,
+			announce_for_forwarding,
+		));
+		#[cfg(feature = "chicory")]
+		if let Some(handshake) = self
+			.chicory_service
+			.as_ref()
+			.and_then(|service| service.private_splice_handshake(announce_for_forwarding))
+		{
+			user_config.channel_handshake_config.apply(&handshake);
+		}
 
 		let push_msat = push_to_counterparty_msat.unwrap_or(0);
-		let user_channel_id: u128 = rand::rng().random();
 
 		match self.channel_manager.create_channel(
 			peer_info.node_id,
@@ -1552,6 +1639,30 @@ impl Node {
 			push_to_counterparty_msat,
 			channel_config,
 			false,
+			None,
+		)
+	}
+
+	/// Opens a private channel with an application-provided, durable operation identity.
+	///
+	/// Persist this ID before calling. Supplied IDs are reserved in the native store before
+	/// connecting or creating a channel and cannot be reused, including after closure or restart.
+	/// An attempt that fails after reservation still consumes its ID; deliberately retry with a
+	/// fresh ID only after reconciling the previous operation. Duplicate IDs return
+	/// [`Error::ChannelCreationFailed`], and a failed reservation returns [`Error::PersistenceFailed`].
+	pub fn open_channel_with_user_channel_id(
+		&self, node_id: PublicKey, address: SocketAddress, channel_amount_sats: u64,
+		push_to_counterparty_msat: Option<u64>, channel_config: Option<ChannelConfig>,
+		user_channel_id: &UserChannelId,
+	) -> Result<UserChannelId, Error> {
+		self.open_channel_inner(
+			node_id,
+			address,
+			channel_amount_sats,
+			push_to_counterparty_msat,
+			channel_config,
+			false,
+			Some(*user_channel_id),
 		)
 	}
 
@@ -1592,6 +1703,7 @@ impl Node {
 			push_to_counterparty_msat,
 			channel_config,
 			true,
+			None,
 		)
 	}
 
@@ -1648,7 +1760,13 @@ impl Node {
 
 			let inputs = self
 				.wallet
-				.select_confirmed_utxos(vec![shared_input], &[shared_output], fee_rate)
+				.select_confirmed_utxos_with_max_fee(
+					vec![shared_input],
+					&[shared_output],
+					fee_rate,
+					(self.config.primary_node_id == Some(counterparty_node_id))
+						.then_some(splice_amount_sats / 19),
+				)
 				.map_err(|()| {
 					log_error!(
 						self.logger,
@@ -1724,15 +1842,55 @@ impl Node {
 		&self, user_channel_id: &UserChannelId, counterparty_node_id: PublicKey, address: &Address,
 		splice_amount_sats: u64,
 	) -> Result<(), Error> {
+		let fee_rate = self.fee_estimator.estimate_fee_rate(ConfirmationTarget::ChannelFunding);
+		self.splice_out_inner(
+			user_channel_id,
+			counterparty_node_id,
+			address,
+			splice_amount_sats,
+			fee_rate,
+		)
+	}
+
+	/// Removes funds to an onchain address using the caller's selected fee rate.
+	/// The rate is in satoshis per virtual byte and must be positive and representable
+	/// by the Lightning funding protocol. This submits a splice; completion is reported
+	/// by the normal splice events, not by this method returning successfully.
+	pub fn splice_out_with_fee_rate(
+		&self, user_channel_id: &UserChannelId, counterparty_node_id: PublicKey, address: &Address,
+		splice_amount_sats: u64, fee_rate_sat_per_vbyte: u64,
+	) -> Result<(), Error> {
+		if fee_rate_sat_per_vbyte == 0 || fee_rate_sat_per_vbyte > u64::from(u32::MAX) / 250 {
+			return Err(Error::InvalidFeeRate);
+		}
+		let rate = FeeRate::from_sat_per_vb(fee_rate_sat_per_vbyte).ok_or(Error::InvalidFeeRate)?;
+		self.splice_out_inner(
+			user_channel_id,
+			counterparty_node_id,
+			address,
+			splice_amount_sats,
+			rate,
+		)
+	}
+
+	fn splice_out_inner(
+		&self, user_channel_id: &UserChannelId, counterparty_node_id: PublicKey, address: &Address,
+		splice_amount_sats: u64, fee_rate: FeeRate,
+	) -> Result<(), Error> {
+		if !*self.is_running.read().unwrap() {
+			return Err(Error::NotRunning);
+		}
 		let open_channels =
 			self.channel_manager.list_channels_with_counterparty(&counterparty_node_id);
 		if let Some(channel_details) =
 			open_channels.iter().find(|c| c.user_channel_id == user_channel_id.0)
 		{
-			if splice_amount_sats > channel_details.outbound_capacity_msat {
+			if splice_amount_sats == 0 {
 				return Err(Error::ChannelSplicingFailed);
 			}
 
+			// HTLC capacity excludes the current reserve, but a splice can lower that reserve.
+			// Let splice_channel validate the balance, fees and post-splice reserve under its lock.
 			self.wallet.parse_and_validate_address(address)?;
 
 			let contribution = SpliceContribution::SpliceOut {
@@ -1742,7 +1900,6 @@ impl Node {
 				}],
 			};
 
-			let fee_rate = self.fee_estimator.estimate_fee_rate(ConfirmationTarget::ChannelFunding);
 			let funding_feerate_per_kw: u32 = match fee_rate.to_sat_per_kwu().try_into() {
 				Ok(fee_rate) => fee_rate,
 				Err(_) => {

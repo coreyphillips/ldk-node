@@ -1574,6 +1574,38 @@ internal typealias UniffiVTableCallbackInterfaceVssHeaderProviderUniffiByValue =
 
 
 
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 @Synchronized
 private fun findLibraryName(componentName: String): String {
     val libOverride = System.getProperty("uniffi.component.$componentName.libraryOverride")
@@ -2154,6 +2186,11 @@ internal interface UniffiLib : Library {
         `url`: RustBufferByValue,
         uniffiCallStatus: UniffiRustCallStatus,
     ): Unit
+    fun uniffi_ldk_node_fn_method_builder_set_primary_node(
+        `ptr`: Pointer?,
+        `nodeId`: RustBufferByValue,
+        uniffiCallStatus: UniffiRustCallStatus,
+    ): Unit
     fun uniffi_ldk_node_fn_method_builder_set_scoring_decay_params(
         `ptr`: Pointer?,
         `params`: RustBufferByValue,
@@ -2300,6 +2337,11 @@ internal interface UniffiLib : Library {
         `ptr`: Pointer?,
         uniffiCallStatus: UniffiRustCallStatus,
     ): Pointer?
+    fun uniffi_ldk_node_fn_method_node_check_primary_connection(
+        `ptr`: Pointer?,
+        `nodeId`: RustBufferByValue,
+        uniffiCallStatus: UniffiRustCallStatus,
+    ): Unit
     fun uniffi_ldk_node_fn_method_node_close_channel(
         `ptr`: Pointer?,
         `userChannelId`: RustBufferByValue,
@@ -2317,8 +2359,19 @@ internal interface UniffiLib : Library {
         `persist`: Byte,
         uniffiCallStatus: UniffiRustCallStatus,
     ): Unit
+    fun uniffi_ldk_node_fn_method_node_create_direct_funding_request(
+        `ptr`: Pointer?,
+        `amountSats`: RustBufferByValue,
+        `expirySecs`: Int,
+        uniffiCallStatus: UniffiRustCallStatus,
+    ): RustBufferByValue
     fun uniffi_ldk_node_fn_method_node_current_sync_intervals(
         `ptr`: Pointer?,
+        uniffiCallStatus: UniffiRustCallStatus,
+    ): RustBufferByValue
+    fun uniffi_ldk_node_fn_method_node_decode_direct_funding_request(
+        `ptr`: Pointer?,
+        `request`: RustBufferByValue,
         uniffiCallStatus: UniffiRustCallStatus,
     ): RustBufferByValue
     fun uniffi_ldk_node_fn_method_node_disconnect(
@@ -2326,6 +2379,10 @@ internal interface UniffiLib : Library {
         `nodeId`: RustBufferByValue,
         uniffiCallStatus: UniffiRustCallStatus,
     ): Unit
+    fun uniffi_ldk_node_fn_method_node_estimated_fee_rates(
+        `ptr`: Pointer?,
+        uniffiCallStatus: UniffiRustCallStatus,
+    ): RustBufferByValue
     fun uniffi_ldk_node_fn_method_node_event_handled(
         `ptr`: Pointer?,
         uniffiCallStatus: UniffiRustCallStatus,
@@ -2338,6 +2395,16 @@ internal interface UniffiLib : Library {
     ): RustBufferByValue
     fun uniffi_ldk_node_fn_method_node_export_pathfinding_scores(
         `ptr`: Pointer?,
+        uniffiCallStatus: UniffiRustCallStatus,
+    ): RustBufferByValue
+    fun uniffi_ldk_node_fn_method_node_fetch_transaction_details(
+        `ptr`: Pointer?,
+        `txid`: RustBufferByValue,
+        uniffiCallStatus: UniffiRustCallStatus,
+    ): RustBufferByValue
+    fun uniffi_ldk_node_fn_method_node_fetch_transaction_status(
+        `ptr`: Pointer?,
+        `txid`: RustBufferByValue,
         uniffiCallStatus: UniffiRustCallStatus,
     ): RustBufferByValue
     fun uniffi_ldk_node_fn_method_node_force_close_channel(
@@ -2368,11 +2435,24 @@ internal interface UniffiLib : Library {
         `txid`: RustBufferByValue,
         uniffiCallStatus: UniffiRustCallStatus,
     ): RustBufferByValue
+    fun uniffi_ldk_node_fn_method_node_has_pending_funding_operation(
+        `ptr`: Pointer?,
+        uniffiCallStatus: UniffiRustCallStatus,
+    ): Byte
+    fun uniffi_ldk_node_fn_method_node_invalidate_direct_funding_request(
+        `ptr`: Pointer?,
+        `requestId`: RustBufferByValue,
+        uniffiCallStatus: UniffiRustCallStatus,
+    ): Unit
     fun uniffi_ldk_node_fn_method_node_list_balances(
         `ptr`: Pointer?,
         uniffiCallStatus: UniffiRustCallStatus,
     ): RustBufferByValue
     fun uniffi_ldk_node_fn_method_node_list_channels(
+        `ptr`: Pointer?,
+        uniffiCallStatus: UniffiRustCallStatus,
+    ): RustBufferByValue
+    fun uniffi_ldk_node_fn_method_node_list_direct_funding_payments(
         `ptr`: Pointer?,
         uniffiCallStatus: UniffiRustCallStatus,
     ): RustBufferByValue
@@ -2441,11 +2521,44 @@ internal interface UniffiLib : Library {
         `channelConfig`: RustBufferByValue,
         uniffiCallStatus: UniffiRustCallStatus,
     ): RustBufferByValue
+    fun uniffi_ldk_node_fn_method_node_open_channel_with_user_channel_id(
+        `ptr`: Pointer?,
+        `nodeId`: RustBufferByValue,
+        `address`: RustBufferByValue,
+        `channelAmountSats`: Long,
+        `pushToCounterpartyMsat`: RustBufferByValue,
+        `channelConfig`: RustBufferByValue,
+        `userChannelId`: RustBufferByValue,
+        uniffiCallStatus: UniffiRustCallStatus,
+    ): RustBufferByValue
     fun uniffi_ldk_node_fn_method_node_payment(
         `ptr`: Pointer?,
         `paymentId`: RustBufferByValue,
         uniffiCallStatus: UniffiRustCallStatus,
     ): RustBufferByValue
+    fun uniffi_ldk_node_fn_method_node_prepare_direct_funding(
+        `ptr`: Pointer?,
+        `request`: RustBufferByValue,
+        `amountSats`: RustBufferByValue,
+        uniffiCallStatus: UniffiRustCallStatus,
+    ): RustBufferByValue
+    fun uniffi_ldk_node_fn_method_node_quote_primary_receive(
+        `ptr`: Pointer?,
+        `nodeId`: RustBufferByValue,
+        `amountMsat`: Long,
+        `targetInboundSats`: Long,
+        uniffiCallStatus: UniffiRustCallStatus,
+    ): RustBufferByValue
+    fun uniffi_ldk_node_fn_method_node_receive_via_primary(
+        `ptr`: Pointer?,
+        `nodeId`: RustBufferByValue,
+        `amountMsat`: Long,
+        `description`: RustBufferByValue,
+        `expirySecs`: Int,
+        `maxFeeMsat`: Long,
+        `targetInboundSats`: Long,
+        uniffiCallStatus: UniffiRustCallStatus,
+    ): Pointer?
     fun uniffi_ldk_node_fn_method_node_remove_address_type_from_monitor(
         `ptr`: Pointer?,
         `addressType`: RustBufferByValue,
@@ -2462,6 +2575,13 @@ internal interface UniffiLib : Library {
         `paymentId`: RustBufferByValue,
         uniffiCallStatus: UniffiRustCallStatus,
     ): Unit
+    fun uniffi_ldk_node_fn_method_node_send_direct_funding(
+        `ptr`: Pointer?,
+        `request`: RustBufferByValue,
+        `amountSats`: RustBufferByValue,
+        `maxFeeSats`: Long,
+        uniffiCallStatus: UniffiRustCallStatus,
+    ): RustBufferByValue
     fun uniffi_ldk_node_fn_method_node_set_primary_address_type(
         `ptr`: Pointer?,
         `addressType`: RustBufferByValue,
@@ -2493,6 +2613,15 @@ internal interface UniffiLib : Library {
         `counterpartyNodeId`: RustBufferByValue,
         `address`: RustBufferByValue,
         `spliceAmountSats`: Long,
+        uniffiCallStatus: UniffiRustCallStatus,
+    ): Unit
+    fun uniffi_ldk_node_fn_method_node_splice_out_with_fee_rate(
+        `ptr`: Pointer?,
+        `userChannelId`: RustBufferByValue,
+        `counterpartyNodeId`: RustBufferByValue,
+        `address`: RustBufferByValue,
+        `spliceAmountSats`: Long,
+        `feeRateSatPerVbyte`: Long,
         uniffiCallStatus: UniffiRustCallStatus,
     ): Unit
     fun uniffi_ldk_node_fn_method_node_spontaneous_payment(
@@ -3386,6 +3515,8 @@ internal interface UniffiLib : Library {
     ): Short
     fun uniffi_ldk_node_checksum_method_builder_set_pathfinding_scores_source(
     ): Short
+    fun uniffi_ldk_node_checksum_method_builder_set_primary_node(
+    ): Short
     fun uniffi_ldk_node_checksum_method_builder_set_scoring_decay_params(
     ): Short
     fun uniffi_ldk_node_checksum_method_builder_set_scoring_fee_params(
@@ -3424,21 +3555,33 @@ internal interface UniffiLib : Library {
     ): Short
     fun uniffi_ldk_node_checksum_method_node_bolt12_payment(
     ): Short
+    fun uniffi_ldk_node_checksum_method_node_check_primary_connection(
+    ): Short
     fun uniffi_ldk_node_checksum_method_node_close_channel(
     ): Short
     fun uniffi_ldk_node_checksum_method_node_config(
     ): Short
     fun uniffi_ldk_node_checksum_method_node_connect(
     ): Short
+    fun uniffi_ldk_node_checksum_method_node_create_direct_funding_request(
+    ): Short
     fun uniffi_ldk_node_checksum_method_node_current_sync_intervals(
     ): Short
+    fun uniffi_ldk_node_checksum_method_node_decode_direct_funding_request(
+    ): Short
     fun uniffi_ldk_node_checksum_method_node_disconnect(
+    ): Short
+    fun uniffi_ldk_node_checksum_method_node_estimated_fee_rates(
     ): Short
     fun uniffi_ldk_node_checksum_method_node_event_handled(
     ): Short
     fun uniffi_ldk_node_checksum_method_node_export_onchain_wallet_account_xpub(
     ): Short
     fun uniffi_ldk_node_checksum_method_node_export_pathfinding_scores(
+    ): Short
+    fun uniffi_ldk_node_checksum_method_node_fetch_transaction_details(
+    ): Short
+    fun uniffi_ldk_node_checksum_method_node_fetch_transaction_status(
     ): Short
     fun uniffi_ldk_node_checksum_method_node_force_close_channel(
     ): Short
@@ -3450,9 +3593,15 @@ internal interface UniffiLib : Library {
     ): Short
     fun uniffi_ldk_node_checksum_method_node_get_transaction_details(
     ): Short
+    fun uniffi_ldk_node_checksum_method_node_has_pending_funding_operation(
+    ): Short
+    fun uniffi_ldk_node_checksum_method_node_invalidate_direct_funding_request(
+    ): Short
     fun uniffi_ldk_node_checksum_method_node_list_balances(
     ): Short
     fun uniffi_ldk_node_checksum_method_node_list_channels(
+    ): Short
+    fun uniffi_ldk_node_checksum_method_node_list_direct_funding_payments(
     ): Short
     fun uniffi_ldk_node_checksum_method_node_list_monitored_address_types(
     ): Short
@@ -3482,13 +3631,23 @@ internal interface UniffiLib : Library {
     ): Short
     fun uniffi_ldk_node_checksum_method_node_open_channel(
     ): Short
+    fun uniffi_ldk_node_checksum_method_node_open_channel_with_user_channel_id(
+    ): Short
     fun uniffi_ldk_node_checksum_method_node_payment(
+    ): Short
+    fun uniffi_ldk_node_checksum_method_node_prepare_direct_funding(
+    ): Short
+    fun uniffi_ldk_node_checksum_method_node_quote_primary_receive(
+    ): Short
+    fun uniffi_ldk_node_checksum_method_node_receive_via_primary(
     ): Short
     fun uniffi_ldk_node_checksum_method_node_remove_address_type_from_monitor(
     ): Short
     fun uniffi_ldk_node_checksum_method_node_remove_onchain_wallet_account(
     ): Short
     fun uniffi_ldk_node_checksum_method_node_remove_payment(
+    ): Short
+    fun uniffi_ldk_node_checksum_method_node_send_direct_funding(
     ): Short
     fun uniffi_ldk_node_checksum_method_node_set_primary_address_type(
     ): Short
@@ -3499,6 +3658,8 @@ internal interface UniffiLib : Library {
     fun uniffi_ldk_node_checksum_method_node_splice_in(
     ): Short
     fun uniffi_ldk_node_checksum_method_node_splice_out(
+    ): Short
+    fun uniffi_ldk_node_checksum_method_node_splice_out_with_fee_rate(
     ): Short
     fun uniffi_ldk_node_checksum_method_node_spontaneous_payment(
     ): Short
@@ -3952,6 +4113,9 @@ private fun uniffiCheckApiChecksums(lib: UniffiLib) {
     if (lib.uniffi_ldk_node_checksum_method_builder_set_pathfinding_scores_source() != 63501.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
+    if (lib.uniffi_ldk_node_checksum_method_builder_set_primary_node() != 53706.toShort()) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
     if (lib.uniffi_ldk_node_checksum_method_builder_set_scoring_decay_params() != 19869.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
@@ -4009,6 +4173,9 @@ private fun uniffiCheckApiChecksums(lib: UniffiLib) {
     if (lib.uniffi_ldk_node_checksum_method_node_bolt12_payment() != 49254.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
+    if (lib.uniffi_ldk_node_checksum_method_node_check_primary_connection() != 60941.toShort()) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
     if (lib.uniffi_ldk_node_checksum_method_node_close_channel() != 62479.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
@@ -4018,10 +4185,19 @@ private fun uniffiCheckApiChecksums(lib: UniffiLib) {
     if (lib.uniffi_ldk_node_checksum_method_node_connect() != 34120.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
+    if (lib.uniffi_ldk_node_checksum_method_node_create_direct_funding_request() != 41849.toShort()) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
     if (lib.uniffi_ldk_node_checksum_method_node_current_sync_intervals() != 51918.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
+    if (lib.uniffi_ldk_node_checksum_method_node_decode_direct_funding_request() != 10123.toShort()) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
     if (lib.uniffi_ldk_node_checksum_method_node_disconnect() != 43538.toShort()) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_ldk_node_checksum_method_node_estimated_fee_rates() != 5053.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_ldk_node_checksum_method_node_event_handled() != 38712.toShort()) {
@@ -4031,6 +4207,12 @@ private fun uniffiCheckApiChecksums(lib: UniffiLib) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_ldk_node_checksum_method_node_export_pathfinding_scores() != 62331.toShort()) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_ldk_node_checksum_method_node_fetch_transaction_details() != 21405.toShort()) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_ldk_node_checksum_method_node_fetch_transaction_status() != 5238.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_ldk_node_checksum_method_node_force_close_channel() != 48831.toShort()) {
@@ -4048,10 +4230,19 @@ private fun uniffiCheckApiChecksums(lib: UniffiLib) {
     if (lib.uniffi_ldk_node_checksum_method_node_get_transaction_details() != 65000.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
+    if (lib.uniffi_ldk_node_checksum_method_node_has_pending_funding_operation() != 42644.toShort()) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_ldk_node_checksum_method_node_invalidate_direct_funding_request() != 24105.toShort()) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
     if (lib.uniffi_ldk_node_checksum_method_node_list_balances() != 57528.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_ldk_node_checksum_method_node_list_channels() != 7954.toShort()) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_ldk_node_checksum_method_node_list_direct_funding_payments() != 63471.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_ldk_node_checksum_method_node_list_monitored_address_types() != 25084.toShort()) {
@@ -4096,7 +4287,19 @@ private fun uniffiCheckApiChecksums(lib: UniffiLib) {
     if (lib.uniffi_ldk_node_checksum_method_node_open_channel() != 40283.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
+    if (lib.uniffi_ldk_node_checksum_method_node_open_channel_with_user_channel_id() != 36770.toShort()) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
     if (lib.uniffi_ldk_node_checksum_method_node_payment() != 60296.toShort()) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_ldk_node_checksum_method_node_prepare_direct_funding() != 16597.toShort()) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_ldk_node_checksum_method_node_quote_primary_receive() != 37655.toShort()) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_ldk_node_checksum_method_node_receive_via_primary() != 17747.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_ldk_node_checksum_method_node_remove_address_type_from_monitor() != 37081.toShort()) {
@@ -4106,6 +4309,9 @@ private fun uniffiCheckApiChecksums(lib: UniffiLib) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_ldk_node_checksum_method_node_remove_payment() != 47952.toShort()) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_ldk_node_checksum_method_node_send_direct_funding() != 27855.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_ldk_node_checksum_method_node_set_primary_address_type() != 11005.toShort()) {
@@ -4121,6 +4327,9 @@ private fun uniffiCheckApiChecksums(lib: UniffiLib) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_ldk_node_checksum_method_node_splice_out() != 22115.toShort()) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_ldk_node_checksum_method_node_splice_out_with_fee_rate() != 61607.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_ldk_node_checksum_method_node_spontaneous_payment() != 37403.toShort()) {
@@ -6422,6 +6631,18 @@ open class Builder: Disposable, BuilderInterface {
         }
     }
 
+    override fun `setPrimaryNode`(`nodeId`: PublicKey) {
+        callWithPointer {
+            uniffiRustCall { uniffiRustCallStatus ->
+                UniffiLib.INSTANCE.uniffi_ldk_node_fn_method_builder_set_primary_node(
+                    it,
+                    FfiConverterTypePublicKey.lower(`nodeId`),
+                    uniffiRustCallStatus,
+                )
+            }
+        }
+    }
+
     override fun `setScoringDecayParams`(`params`: ScoringDecayParameters) {
         callWithPointer {
             uniffiRustCall { uniffiRustCallStatus ->
@@ -7416,6 +7637,19 @@ open class Node: Disposable, NodeInterface {
     }
 
     @Throws(NodeException::class)
+    override fun `checkPrimaryConnection`(`nodeId`: PublicKey) {
+        callWithPointer {
+            uniffiRustCallWithError(NodeExceptionErrorHandler) { uniffiRustCallStatus ->
+                UniffiLib.INSTANCE.uniffi_ldk_node_fn_method_node_check_primary_connection(
+                    it,
+                    FfiConverterTypePublicKey.lower(`nodeId`),
+                    uniffiRustCallStatus,
+                )
+            }
+        }
+    }
+
+    @Throws(NodeException::class)
     override fun `closeChannel`(`userChannelId`: UserChannelId, `counterpartyNodeId`: PublicKey) {
         callWithPointer {
             uniffiRustCallWithError(NodeExceptionErrorHandler) { uniffiRustCallStatus ->
@@ -7455,11 +7689,38 @@ open class Node: Disposable, NodeInterface {
         }
     }
 
+    @Throws(DirectFundingException::class)
+    override fun `createDirectFundingRequest`(`amountSats`: kotlin.ULong?, `expirySecs`: kotlin.UInt): DirectFundingRequestDetails {
+        return FfiConverterTypeDirectFundingRequestDetails.lift(callWithPointer {
+            uniffiRustCallWithError(DirectFundingExceptionErrorHandler) { uniffiRustCallStatus ->
+                UniffiLib.INSTANCE.uniffi_ldk_node_fn_method_node_create_direct_funding_request(
+                    it,
+                    FfiConverterOptionalULong.lower(`amountSats`),
+                    FfiConverterUInt.lower(`expirySecs`),
+                    uniffiRustCallStatus,
+                )
+            }
+        })
+    }
+
     override fun `currentSyncIntervals`(): RuntimeSyncIntervals {
         return FfiConverterTypeRuntimeSyncIntervals.lift(callWithPointer {
             uniffiRustCall { uniffiRustCallStatus ->
                 UniffiLib.INSTANCE.uniffi_ldk_node_fn_method_node_current_sync_intervals(
                     it,
+                    uniffiRustCallStatus,
+                )
+            }
+        })
+    }
+
+    @Throws(DirectFundingException::class)
+    override fun `decodeDirectFundingRequest`(`request`: kotlin.String): DirectFundingRequestDetails {
+        return FfiConverterTypeDirectFundingRequestDetails.lift(callWithPointer {
+            uniffiRustCallWithError(DirectFundingExceptionErrorHandler) { uniffiRustCallStatus ->
+                UniffiLib.INSTANCE.uniffi_ldk_node_fn_method_node_decode_direct_funding_request(
+                    it,
+                    FfiConverterString.lower(`request`),
                     uniffiRustCallStatus,
                 )
             }
@@ -7477,6 +7738,17 @@ open class Node: Disposable, NodeInterface {
                 )
             }
         }
+    }
+
+    override fun `estimatedFeeRates`(): OnchainFeeRates {
+        return FfiConverterTypeOnchainFeeRates.lift(callWithPointer {
+            uniffiRustCall { uniffiRustCallStatus ->
+                UniffiLib.INSTANCE.uniffi_ldk_node_fn_method_node_estimated_fee_rates(
+                    it,
+                    uniffiRustCallStatus,
+                )
+            }
+        })
     }
 
     @Throws(NodeException::class)
@@ -7511,6 +7783,32 @@ open class Node: Disposable, NodeInterface {
             uniffiRustCallWithError(NodeExceptionErrorHandler) { uniffiRustCallStatus ->
                 UniffiLib.INSTANCE.uniffi_ldk_node_fn_method_node_export_pathfinding_scores(
                     it,
+                    uniffiRustCallStatus,
+                )
+            }
+        })
+    }
+
+    @Throws(NodeException::class)
+    override fun `fetchTransactionDetails`(`txid`: Txid): TransactionDetails {
+        return FfiConverterTypeTransactionDetails.lift(callWithPointer {
+            uniffiRustCallWithError(NodeExceptionErrorHandler) { uniffiRustCallStatus ->
+                UniffiLib.INSTANCE.uniffi_ldk_node_fn_method_node_fetch_transaction_details(
+                    it,
+                    FfiConverterTypeTxid.lower(`txid`),
+                    uniffiRustCallStatus,
+                )
+            }
+        })
+    }
+
+    @Throws(NodeException::class)
+    override fun `fetchTransactionStatus`(`txid`: Txid): ConfirmationStatus {
+        return FfiConverterTypeConfirmationStatus.lift(callWithPointer {
+            uniffiRustCallWithError(NodeExceptionErrorHandler) { uniffiRustCallStatus ->
+                UniffiLib.INSTANCE.uniffi_ldk_node_fn_method_node_fetch_transaction_status(
+                    it,
+                    FfiConverterTypeTxid.lower(`txid`),
                     uniffiRustCallStatus,
                 )
             }
@@ -7584,6 +7882,30 @@ open class Node: Disposable, NodeInterface {
         })
     }
 
+    override fun `hasPendingFundingOperation`(): kotlin.Boolean {
+        return FfiConverterBoolean.lift(callWithPointer {
+            uniffiRustCall { uniffiRustCallStatus ->
+                UniffiLib.INSTANCE.uniffi_ldk_node_fn_method_node_has_pending_funding_operation(
+                    it,
+                    uniffiRustCallStatus,
+                )
+            }
+        })
+    }
+
+    @Throws(DirectFundingException::class)
+    override fun `invalidateDirectFundingRequest`(`requestId`: kotlin.String) {
+        callWithPointer {
+            uniffiRustCallWithError(DirectFundingExceptionErrorHandler) { uniffiRustCallStatus ->
+                UniffiLib.INSTANCE.uniffi_ldk_node_fn_method_node_invalidate_direct_funding_request(
+                    it,
+                    FfiConverterString.lower(`requestId`),
+                    uniffiRustCallStatus,
+                )
+            }
+        }
+    }
+
     override fun `listBalances`(): BalanceDetails {
         return FfiConverterTypeBalanceDetails.lift(callWithPointer {
             uniffiRustCall { uniffiRustCallStatus ->
@@ -7599,6 +7921,17 @@ open class Node: Disposable, NodeInterface {
         return FfiConverterSequenceTypeChannelDetails.lift(callWithPointer {
             uniffiRustCall { uniffiRustCallStatus ->
                 UniffiLib.INSTANCE.uniffi_ldk_node_fn_method_node_list_channels(
+                    it,
+                    uniffiRustCallStatus,
+                )
+            }
+        })
+    }
+
+    override fun `listDirectFundingPayments`(): List<DirectFundingPaymentDetails> {
+        return FfiConverterSequenceTypeDirectFundingPaymentDetails.lift(callWithPointer {
+            uniffiRustCall { uniffiRustCallStatus ->
+                UniffiLib.INSTANCE.uniffi_ldk_node_fn_method_node_list_direct_funding_payments(
                     it,
                     uniffiRustCallStatus,
                 )
@@ -7779,6 +8112,24 @@ open class Node: Disposable, NodeInterface {
         })
     }
 
+    @Throws(NodeException::class)
+    override fun `openChannelWithUserChannelId`(`nodeId`: PublicKey, `address`: SocketAddress, `channelAmountSats`: kotlin.ULong, `pushToCounterpartyMsat`: kotlin.ULong?, `channelConfig`: ChannelConfig?, `userChannelId`: UserChannelId): UserChannelId {
+        return FfiConverterTypeUserChannelId.lift(callWithPointer {
+            uniffiRustCallWithError(NodeExceptionErrorHandler) { uniffiRustCallStatus ->
+                UniffiLib.INSTANCE.uniffi_ldk_node_fn_method_node_open_channel_with_user_channel_id(
+                    it,
+                    FfiConverterTypePublicKey.lower(`nodeId`),
+                    FfiConverterTypeSocketAddress.lower(`address`),
+                    FfiConverterULong.lower(`channelAmountSats`),
+                    FfiConverterOptionalULong.lower(`pushToCounterpartyMsat`),
+                    FfiConverterOptionalTypeChannelConfig.lower(`channelConfig`),
+                    FfiConverterTypeUserChannelId.lower(`userChannelId`),
+                    uniffiRustCallStatus,
+                )
+            }
+        })
+    }
+
     override fun `payment`(`paymentId`: PaymentId): PaymentDetails? {
         return FfiConverterOptionalTypePaymentDetails.lift(callWithPointer {
             uniffiRustCall { uniffiRustCallStatus ->
@@ -7788,6 +8139,53 @@ open class Node: Disposable, NodeInterface {
                     uniffiRustCallStatus,
                 )
             }
+        })
+    }
+
+    @Throws(DirectFundingException::class)
+    override fun `prepareDirectFunding`(`request`: kotlin.String, `amountSats`: kotlin.ULong?): DirectFundingRequestDetails {
+        return FfiConverterTypeDirectFundingRequestDetails.lift(callWithPointer {
+            uniffiRustCallWithError(DirectFundingExceptionErrorHandler) { uniffiRustCallStatus ->
+                UniffiLib.INSTANCE.uniffi_ldk_node_fn_method_node_prepare_direct_funding(
+                    it,
+                    FfiConverterString.lower(`request`),
+                    FfiConverterOptionalULong.lower(`amountSats`),
+                    uniffiRustCallStatus,
+                )
+            }
+        })
+    }
+
+    @Throws(NodeException::class)
+    override fun `quotePrimaryReceive`(`nodeId`: PublicKey, `amountMsat`: kotlin.ULong, `targetInboundSats`: kotlin.ULong): PrimaryReceiveQuote {
+        return FfiConverterTypePrimaryReceiveQuote.lift(callWithPointer {
+            uniffiRustCallWithError(NodeExceptionErrorHandler) { uniffiRustCallStatus ->
+                UniffiLib.INSTANCE.uniffi_ldk_node_fn_method_node_quote_primary_receive(
+                    it,
+                    FfiConverterTypePublicKey.lower(`nodeId`),
+                    FfiConverterULong.lower(`amountMsat`),
+                    FfiConverterULong.lower(`targetInboundSats`),
+                    uniffiRustCallStatus,
+                )
+            }
+        })
+    }
+
+    @Throws(NodeException::class)
+    override fun `receiveViaPrimary`(`nodeId`: PublicKey, `amountMsat`: kotlin.ULong, `description`: Bolt11InvoiceDescription, `expirySecs`: kotlin.UInt, `maxFeeMsat`: kotlin.ULong, `targetInboundSats`: kotlin.ULong): Bolt11Invoice {
+        return FfiConverterTypeBolt11Invoice.lift(callWithPointer {
+            uniffiRustCallWithError(NodeExceptionErrorHandler) { uniffiRustCallStatus ->
+                UniffiLib.INSTANCE.uniffi_ldk_node_fn_method_node_receive_via_primary(
+                    it,
+                    FfiConverterTypePublicKey.lower(`nodeId`),
+                    FfiConverterULong.lower(`amountMsat`),
+                    FfiConverterTypeBolt11InvoiceDescription.lower(`description`),
+                    FfiConverterUInt.lower(`expirySecs`),
+                    FfiConverterULong.lower(`maxFeeMsat`),
+                    FfiConverterULong.lower(`targetInboundSats`),
+                    uniffiRustCallStatus,
+                )
+            }!!
         })
     }
 
@@ -7829,6 +8227,21 @@ open class Node: Disposable, NodeInterface {
                 )
             }
         }
+    }
+
+    @Throws(DirectFundingException::class)
+    override fun `sendDirectFunding`(`request`: kotlin.String, `amountSats`: kotlin.ULong?, `maxFeeSats`: kotlin.ULong): DirectFundingPaymentDetails {
+        return FfiConverterTypeDirectFundingPaymentDetails.lift(callWithPointer {
+            uniffiRustCallWithError(DirectFundingExceptionErrorHandler) { uniffiRustCallStatus ->
+                UniffiLib.INSTANCE.uniffi_ldk_node_fn_method_node_send_direct_funding(
+                    it,
+                    FfiConverterString.lower(`request`),
+                    FfiConverterOptionalULong.lower(`amountSats`),
+                    FfiConverterULong.lower(`maxFeeSats`),
+                    uniffiRustCallStatus,
+                )
+            }
+        })
     }
 
     @Throws(NodeException::class)
@@ -7897,6 +8310,23 @@ open class Node: Disposable, NodeInterface {
                     FfiConverterTypePublicKey.lower(`counterpartyNodeId`),
                     FfiConverterTypeAddress.lower(`address`),
                     FfiConverterULong.lower(`spliceAmountSats`),
+                    uniffiRustCallStatus,
+                )
+            }
+        }
+    }
+
+    @Throws(NodeException::class)
+    override fun `spliceOutWithFeeRate`(`userChannelId`: UserChannelId, `counterpartyNodeId`: PublicKey, `address`: Address, `spliceAmountSats`: kotlin.ULong, `feeRateSatPerVbyte`: kotlin.ULong) {
+        callWithPointer {
+            uniffiRustCallWithError(NodeExceptionErrorHandler) { uniffiRustCallStatus ->
+                UniffiLib.INSTANCE.uniffi_ldk_node_fn_method_node_splice_out_with_fee_rate(
+                    it,
+                    FfiConverterTypeUserChannelId.lower(`userChannelId`),
+                    FfiConverterTypePublicKey.lower(`counterpartyNodeId`),
+                    FfiConverterTypeAddress.lower(`address`),
+                    FfiConverterULong.lower(`spliceAmountSats`),
+                    FfiConverterULong.lower(`feeRateSatPerVbyte`),
                     uniffiRustCallStatus,
                 )
             }
@@ -10250,6 +10680,7 @@ object FfiConverterTypeConfig: FfiConverterRustBuffer<Config> {
             FfiConverterOptionalSequenceTypeSocketAddress.read(buf),
             FfiConverterOptionalTypeNodeAlias.read(buf),
             FfiConverterSequenceTypePublicKey.read(buf),
+            FfiConverterOptionalTypePublicKey.read(buf),
             FfiConverterULong.read(buf),
             FfiConverterOptionalTypeAnchorChannelsConfig.read(buf),
             FfiConverterOptionalTypeRouteParametersConfig.read(buf),
@@ -10269,6 +10700,7 @@ object FfiConverterTypeConfig: FfiConverterRustBuffer<Config> {
             FfiConverterOptionalSequenceTypeSocketAddress.allocationSize(value.`announcementAddresses`) +
             FfiConverterOptionalTypeNodeAlias.allocationSize(value.`nodeAlias`) +
             FfiConverterSequenceTypePublicKey.allocationSize(value.`trustedPeers0conf`) +
+            FfiConverterOptionalTypePublicKey.allocationSize(value.`primaryNodeId`) +
             FfiConverterULong.allocationSize(value.`probingLiquidityLimitMultiplier`) +
             FfiConverterOptionalTypeAnchorChannelsConfig.allocationSize(value.`anchorChannelsConfig`) +
             FfiConverterOptionalTypeRouteParametersConfig.allocationSize(value.`routeParameters`) +
@@ -10287,6 +10719,7 @@ object FfiConverterTypeConfig: FfiConverterRustBuffer<Config> {
         FfiConverterOptionalSequenceTypeSocketAddress.write(value.`announcementAddresses`, buf)
         FfiConverterOptionalTypeNodeAlias.write(value.`nodeAlias`, buf)
         FfiConverterSequenceTypePublicKey.write(value.`trustedPeers0conf`, buf)
+        FfiConverterOptionalTypePublicKey.write(value.`primaryNodeId`, buf)
         FfiConverterULong.write(value.`probingLiquidityLimitMultiplier`, buf)
         FfiConverterOptionalTypeAnchorChannelsConfig.write(value.`anchorChannelsConfig`, buf)
         FfiConverterOptionalTypeRouteParametersConfig.write(value.`routeParameters`, buf)
@@ -10318,6 +10751,80 @@ object FfiConverterTypeCustomTlvRecord: FfiConverterRustBuffer<CustomTlvRecord> 
     override fun write(value: CustomTlvRecord, buf: ByteBuffer) {
         FfiConverterULong.write(value.`typeNum`, buf)
         FfiConverterSequenceUByte.write(value.`value`, buf)
+    }
+}
+
+
+
+
+object FfiConverterTypeDirectFundingPaymentDetails: FfiConverterRustBuffer<DirectFundingPaymentDetails> {
+    override fun read(buf: ByteBuffer): DirectFundingPaymentDetails {
+        return DirectFundingPaymentDetails(
+            FfiConverterString.read(buf),
+            FfiConverterString.read(buf),
+            FfiConverterULong.read(buf),
+            FfiConverterOptionalULong.read(buf),
+            FfiConverterOptionalString.read(buf),
+            FfiConverterTypeDirectFundingPaymentStatus.read(buf),
+            FfiConverterBoolean.read(buf),
+            FfiConverterULong.read(buf),
+        )
+    }
+
+    override fun allocationSize(value: DirectFundingPaymentDetails) = (
+            FfiConverterString.allocationSize(value.`requestId`) +
+            FfiConverterString.allocationSize(value.`paymentHash`) +
+            FfiConverterULong.allocationSize(value.`amountSats`) +
+            FfiConverterOptionalULong.allocationSize(value.`feeSats`) +
+            FfiConverterOptionalString.allocationSize(value.`fundingTxid`) +
+            FfiConverterTypeDirectFundingPaymentStatus.allocationSize(value.`status`) +
+            FfiConverterBoolean.allocationSize(value.`isOutbound`) +
+            FfiConverterULong.allocationSize(value.`createdAt`)
+    )
+
+    override fun write(value: DirectFundingPaymentDetails, buf: ByteBuffer) {
+        FfiConverterString.write(value.`requestId`, buf)
+        FfiConverterString.write(value.`paymentHash`, buf)
+        FfiConverterULong.write(value.`amountSats`, buf)
+        FfiConverterOptionalULong.write(value.`feeSats`, buf)
+        FfiConverterOptionalString.write(value.`fundingTxid`, buf)
+        FfiConverterTypeDirectFundingPaymentStatus.write(value.`status`, buf)
+        FfiConverterBoolean.write(value.`isOutbound`, buf)
+        FfiConverterULong.write(value.`createdAt`, buf)
+    }
+}
+
+
+
+
+object FfiConverterTypeDirectFundingRequestDetails: FfiConverterRustBuffer<DirectFundingRequestDetails> {
+    override fun read(buf: ByteBuffer): DirectFundingRequestDetails {
+        return DirectFundingRequestDetails(
+            FfiConverterString.read(buf),
+            FfiConverterString.read(buf),
+            FfiConverterString.read(buf),
+            FfiConverterString.read(buf),
+            FfiConverterOptionalULong.read(buf),
+            FfiConverterULong.read(buf),
+        )
+    }
+
+    override fun allocationSize(value: DirectFundingRequestDetails) = (
+            FfiConverterString.allocationSize(value.`request`) +
+            FfiConverterString.allocationSize(value.`requestId`) +
+            FfiConverterString.allocationSize(value.`paymentHash`) +
+            FfiConverterString.allocationSize(value.`receiverNodeId`) +
+            FfiConverterOptionalULong.allocationSize(value.`amountSats`) +
+            FfiConverterULong.allocationSize(value.`expiresAt`)
+    )
+
+    override fun write(value: DirectFundingRequestDetails, buf: ByteBuffer) {
+        FfiConverterString.write(value.`request`, buf)
+        FfiConverterString.write(value.`requestId`, buf)
+        FfiConverterString.write(value.`paymentHash`, buf)
+        FfiConverterString.write(value.`receiverNodeId`, buf)
+        FfiConverterOptionalULong.write(value.`amountSats`, buf)
+        FfiConverterULong.write(value.`expiresAt`, buf)
     }
 }
 
@@ -10740,6 +11247,34 @@ object FfiConverterTypeNodeStatus: FfiConverterRustBuffer<NodeStatus> {
 
 
 
+object FfiConverterTypeOnchainFeeRates: FfiConverterRustBuffer<OnchainFeeRates> {
+    override fun read(buf: ByteBuffer): OnchainFeeRates {
+        return OnchainFeeRates(
+            FfiConverterULong.read(buf),
+            FfiConverterULong.read(buf),
+            FfiConverterULong.read(buf),
+            FfiConverterULong.read(buf),
+        )
+    }
+
+    override fun allocationSize(value: OnchainFeeRates) = (
+            FfiConverterULong.allocationSize(value.`fastSatPerVbyte`) +
+            FfiConverterULong.allocationSize(value.`normalSatPerVbyte`) +
+            FfiConverterULong.allocationSize(value.`slowSatPerVbyte`) +
+            FfiConverterULong.allocationSize(value.`channelFundingSatPerVbyte`)
+    )
+
+    override fun write(value: OnchainFeeRates, buf: ByteBuffer) {
+        FfiConverterULong.write(value.`fastSatPerVbyte`, buf)
+        FfiConverterULong.write(value.`normalSatPerVbyte`, buf)
+        FfiConverterULong.write(value.`slowSatPerVbyte`, buf)
+        FfiConverterULong.write(value.`channelFundingSatPerVbyte`, buf)
+    }
+}
+
+
+
+
 object FfiConverterTypeOnchainWalletAccount: FfiConverterRustBuffer<OnchainWalletAccount> {
     override fun read(buf: ByteBuffer): OnchainWalletAccount {
         return OnchainWalletAccount(
@@ -10868,6 +11403,31 @@ object FfiConverterTypePeerDetails: FfiConverterRustBuffer<PeerDetails> {
         FfiConverterTypeSocketAddress.write(value.`address`, buf)
         FfiConverterBoolean.write(value.`isPersisted`, buf)
         FfiConverterBoolean.write(value.`isConnected`, buf)
+    }
+}
+
+
+
+
+object FfiConverterTypePrimaryReceiveQuote: FfiConverterRustBuffer<PrimaryReceiveQuote> {
+    override fun read(buf: ByteBuffer): PrimaryReceiveQuote {
+        return PrimaryReceiveQuote(
+            FfiConverterULong.read(buf),
+            FfiConverterULong.read(buf),
+            FfiConverterULong.read(buf),
+        )
+    }
+
+    override fun allocationSize(value: PrimaryReceiveQuote) = (
+            FfiConverterULong.allocationSize(value.`amountMsat`) +
+            FfiConverterULong.allocationSize(value.`feeMsat`) +
+            FfiConverterULong.allocationSize(value.`fundingSats`)
+    )
+
+    override fun write(value: PrimaryReceiveQuote, buf: ByteBuffer) {
+        FfiConverterULong.write(value.`amountMsat`, buf)
+        FfiConverterULong.write(value.`feeMsat`, buf)
+        FfiConverterULong.write(value.`fundingSats`, buf)
     }
 }
 
@@ -11687,6 +12247,118 @@ object FfiConverterTypeCurrency: FfiConverterRustBuffer<Currency> {
     override fun allocationSize(value: Currency) = 4UL
 
     override fun write(value: Currency, buf: ByteBuffer) {
+        buf.putInt(value.ordinal + 1)
+    }
+}
+
+
+
+
+object DirectFundingExceptionErrorHandler : UniffiRustCallStatusErrorHandler<DirectFundingException> {
+    override fun lift(errorBuf: RustBufferByValue): DirectFundingException = FfiConverterTypeDirectFundingError.lift(errorBuf)
+}
+
+object FfiConverterTypeDirectFundingError : FfiConverterRustBuffer<DirectFundingException> {
+    override fun read(buf: ByteBuffer): DirectFundingException {
+        return when (buf.getInt()) {
+            1 -> DirectFundingException.InvalidRequest(FfiConverterString.read(buf))
+            2 -> DirectFundingException.Expired(FfiConverterString.read(buf))
+            3 -> DirectFundingException.WrongNetwork(FfiConverterString.read(buf))
+            4 -> DirectFundingException.AmountRequired(FfiConverterString.read(buf))
+            5 -> DirectFundingException.AmountMismatch(FfiConverterString.read(buf))
+            6 -> DirectFundingException.InsufficientFunds(FfiConverterString.read(buf))
+            7 -> DirectFundingException.Unavailable(FfiConverterString.read(buf))
+            8 -> DirectFundingException.Declined(FfiConverterString.read(buf))
+            9 -> DirectFundingException.InvalidFunding(FfiConverterString.read(buf))
+            10 -> DirectFundingException.PersistenceFailed(FfiConverterString.read(buf))
+            11 -> DirectFundingException.NotRunning(FfiConverterString.read(buf))
+            12 -> DirectFundingException.ChainUnavailable(FfiConverterString.read(buf))
+            13 -> DirectFundingException.Timeout(FfiConverterString.read(buf))
+            14 -> DirectFundingException.Busy(FfiConverterString.read(buf))
+            else -> throw RuntimeException("invalid error enum value, something is very wrong!!")
+        }
+    }
+
+    override fun allocationSize(value: DirectFundingException): ULong {
+        return 4UL
+    }
+
+    override fun write(value: DirectFundingException, buf: ByteBuffer) {
+        when (value) {
+            is DirectFundingException.InvalidRequest -> {
+                buf.putInt(1)
+                Unit
+            }
+            is DirectFundingException.Expired -> {
+                buf.putInt(2)
+                Unit
+            }
+            is DirectFundingException.WrongNetwork -> {
+                buf.putInt(3)
+                Unit
+            }
+            is DirectFundingException.AmountRequired -> {
+                buf.putInt(4)
+                Unit
+            }
+            is DirectFundingException.AmountMismatch -> {
+                buf.putInt(5)
+                Unit
+            }
+            is DirectFundingException.InsufficientFunds -> {
+                buf.putInt(6)
+                Unit
+            }
+            is DirectFundingException.Unavailable -> {
+                buf.putInt(7)
+                Unit
+            }
+            is DirectFundingException.Declined -> {
+                buf.putInt(8)
+                Unit
+            }
+            is DirectFundingException.InvalidFunding -> {
+                buf.putInt(9)
+                Unit
+            }
+            is DirectFundingException.PersistenceFailed -> {
+                buf.putInt(10)
+                Unit
+            }
+            is DirectFundingException.NotRunning -> {
+                buf.putInt(11)
+                Unit
+            }
+            is DirectFundingException.ChainUnavailable -> {
+                buf.putInt(12)
+                Unit
+            }
+            is DirectFundingException.Timeout -> {
+                buf.putInt(13)
+                Unit
+            }
+            is DirectFundingException.Busy -> {
+                buf.putInt(14)
+                Unit
+            }
+        }.let { /* this makes the `when` an expression, which ensures it is exhaustive */ }
+    }
+}
+
+
+
+
+
+object FfiConverterTypeDirectFundingPaymentStatus: FfiConverterRustBuffer<DirectFundingPaymentStatus> {
+    override fun read(buf: ByteBuffer) = try {
+        DirectFundingPaymentStatus.entries[buf.getInt() - 1]
+    } catch (e: IndexOutOfBoundsException) {
+        throw RuntimeException("invalid enum value, something is very wrong!!", e)
+    }
+
+    override fun allocationSize(value: DirectFundingPaymentStatus) = 4UL
+
+    override fun write(value: DirectFundingPaymentStatus, buf: ByteBuffer) {
         buf.putInt(value.ordinal + 1)
     }
 }
@@ -12573,6 +13245,10 @@ object FfiConverterTypeNodeError : FfiConverterRustBuffer<NodeException> {
             66 -> NodeException.AddressTypeNotMonitored(FfiConverterString.read(buf))
             67 -> NodeException.OnchainWalletAccountNotRegistered(FfiConverterString.read(buf))
             68 -> NodeException.InvalidSeedBytes(FfiConverterString.read(buf))
+            69 -> NodeException.LiquiditySourceInsufficientFunds(FfiConverterString.read(buf))
+            70 -> NodeException.LiquidityRequestRejected(FfiConverterString.read(buf))
+            71 -> NodeException.LiquidityRequestTimedOut(FfiConverterString.read(buf))
+            72 -> NodeException.LiquidityReceiveAmountTooSmall(FfiConverterString.read(buf))
             else -> throw RuntimeException("invalid error enum value, something is very wrong!!")
         }
     }
@@ -12853,6 +13529,22 @@ object FfiConverterTypeNodeError : FfiConverterRustBuffer<NodeException> {
             }
             is NodeException.InvalidSeedBytes -> {
                 buf.putInt(68)
+                Unit
+            }
+            is NodeException.LiquiditySourceInsufficientFunds -> {
+                buf.putInt(69)
+                Unit
+            }
+            is NodeException.LiquidityRequestRejected -> {
+                buf.putInt(70)
+                Unit
+            }
+            is NodeException.LiquidityRequestTimedOut -> {
+                buf.putInt(71)
+                Unit
+            }
+            is NodeException.LiquidityReceiveAmountTooSmall -> {
+                buf.putInt(72)
                 Unit
             }
         }.let { /* this makes the `when` an expression, which ensures it is exhaustive */ }
@@ -14921,6 +15613,31 @@ object FfiConverterSequenceTypeCustomTlvRecord: FfiConverterRustBuffer<List<Cust
         buf.putInt(value.size)
         value.iterator().forEach {
             FfiConverterTypeCustomTlvRecord.write(it, buf)
+        }
+    }
+}
+
+
+
+
+object FfiConverterSequenceTypeDirectFundingPaymentDetails: FfiConverterRustBuffer<List<DirectFundingPaymentDetails>> {
+    override fun read(buf: ByteBuffer): List<DirectFundingPaymentDetails> {
+        val len = buf.getInt()
+        return List<DirectFundingPaymentDetails>(len) {
+            FfiConverterTypeDirectFundingPaymentDetails.read(buf)
+        }
+    }
+
+    override fun allocationSize(value: List<DirectFundingPaymentDetails>): ULong {
+        val sizeForLength = 4UL
+        val sizeForItems = value.sumOf { FfiConverterTypeDirectFundingPaymentDetails.allocationSize(it) }
+        return sizeForLength + sizeForItems
+    }
+
+    override fun write(value: List<DirectFundingPaymentDetails>, buf: ByteBuffer) {
+        buf.putInt(value.size)
+        value.iterator().forEach {
+            FfiConverterTypeDirectFundingPaymentDetails.write(it, buf)
         }
     }
 }

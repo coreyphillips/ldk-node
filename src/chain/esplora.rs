@@ -32,6 +32,7 @@ use crate::fee_estimator::{
 };
 use crate::io::utils::write_node_metrics;
 use crate::logger::{log_bytes, log_error, log_info, log_trace, LdkLogger, Logger};
+use crate::payment::ConfirmationStatus;
 use crate::types::{ChainMonitor, ChannelManager, DynStore, Sweeper, Wallet};
 use crate::{Error, NodeMetrics};
 
@@ -547,6 +548,71 @@ impl EsploraChainSource {
 			return Err(esplora_client::Error::InvalidResponse);
 		}
 		Ok(())
+	}
+
+	pub(super) async fn fetch_transaction(&self, txid: Txid) -> Result<Transaction, Error> {
+		self.esplora_client
+			.get_tx(&txid)
+			.await
+			.map_err(|_| Error::TxSyncFailed)?
+			.ok_or(Error::TxSyncFailed)
+	}
+
+	pub(super) async fn is_unspent_output(
+		&self, outpoint: bitcoin::OutPoint, output: bitcoin::TxOut,
+	) -> Result<bool, Error> {
+		let tx = self.fetch_transaction(outpoint.txid).await?;
+		if tx.output.get(outpoint.vout as usize) != Some(&output) {
+			return Err(Error::TxSyncFailed);
+		}
+		self.esplora_client
+			.get_output_status(&outpoint.txid, outpoint.vout as u64)
+			.await
+			.map_err(|_| Error::TxSyncFailed)?
+			.map(|status| !status.spent)
+			.ok_or(Error::TxSyncFailed)
+	}
+
+	pub(super) async fn fetch_transaction_status(
+		&self, txid: Txid,
+	) -> Result<ConfirmationStatus, Error> {
+		let client = &self.esplora_client;
+		let transaction = self.fetch_transaction(txid).await?;
+		if transaction.compute_txid() != txid {
+			return Err(Error::TxSyncFailed);
+		}
+		let status = client.get_tx_status(&txid).await.map_err(|_| Error::TxSyncFailed)?;
+		if !status.confirmed {
+			if status.block_hash.is_some()
+				|| status.block_height.is_some()
+				|| status.block_time.is_some()
+			{
+				return Err(Error::TxSyncFailed);
+			}
+			return Ok(ConfirmationStatus::Unconfirmed);
+		}
+		let height = status.block_height.ok_or(Error::TxSyncFailed)?;
+		let block_hash = status.block_hash.ok_or(Error::TxSyncFailed)?;
+		let timestamp = status.block_time.ok_or(Error::TxSyncFailed)?;
+		if client.get_block_hash(height).await.map_err(|_| Error::TxSyncFailed)? != block_hash {
+			return Err(Error::TxSyncFailed);
+		}
+		let proof = client
+			.get_merkle_block(&txid)
+			.await
+			.map_err(|_| Error::TxSyncFailed)?
+			.ok_or(Error::TxSyncFailed)?;
+		let mut matches = Vec::new();
+		let mut indexes = Vec::new();
+		proof.extract_matches(&mut matches, &mut indexes).map_err(|_| Error::TxSyncFailed)?;
+		if proof.header.block_hash() != block_hash
+			|| u64::from(proof.header.time) != timestamp
+			|| !matches.contains(&txid)
+			|| client.get_block_hash(height).await.map_err(|_| Error::TxSyncFailed)? != block_hash
+		{
+			return Err(Error::TxSyncFailed);
+		}
+		Ok(ConfirmationStatus::Confirmed { block_hash, height, timestamp })
 	}
 
 	#[cfg(feature = "chicory")]

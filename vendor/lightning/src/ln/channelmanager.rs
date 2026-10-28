@@ -66,7 +66,7 @@ use crate::ln::channel::{
 };
 use crate::ln::channel_state::ChannelDetails;
 use crate::ln::ffor;
-use crate::ln::funding::SpliceContribution;
+use crate::ln::funding::{FundingSigningDetails, FundingTxInput, SpliceContribution};
 use crate::ln::inbound_payment;
 use crate::ln::interactivetxs::InteractiveTxMessageSend;
 use crate::ln::msgs;
@@ -752,8 +752,9 @@ impl SentHTLCId {
 			HTLCSource::OutboundRoute { session_priv, .. } => {
 				Self::OutboundRoute { session_priv: session_priv.secret_bytes() }
 			},
-			HTLCSource::FforVoucher { channel_id, epoch_id, slot } =>
-				Self::FforVoucher { channel_id: *channel_id, epoch_id: *epoch_id, slot: *slot },
+			HTLCSource::FforVoucher { channel_id, epoch_id, slot } => {
+				Self::FforVoucher { channel_id: *channel_id, epoch_id: *epoch_id, slot: *slot }
+			},
 		}
 	}
 }
@@ -787,7 +788,11 @@ mod fuzzy_channelmanager {
 	pub enum HTLCSource {
 		PreviousHopData(HTLCPreviousHopData),
 		/// A native parked voucher, never an ordinary outbound payment.
-		FforVoucher { channel_id: ChannelId, epoch_id: [u8; 32], slot: u16 },
+		FforVoucher {
+			channel_id: ChannelId,
+			epoch_id: [u8; 32],
+			slot: u16,
+		},
 		OutboundRoute {
 			path: Path,
 			session_priv: SecretKey,
@@ -1347,10 +1352,21 @@ impl MaybeReadable for EventUnblockedChannel {
 /// [`ChannelMonitorUpdate`] we care about is a preimage update, which bypass the monitor update
 /// blocking logic entirely and can never be blocked.
 pub(crate) enum MonitorUpdateCompletionAction {
-	SpliceConflictPersisted { record: crate::ln::splice_conflict::SpliceConflictRecord },
-	FforJournalPersisted { token: crate::ln::ffor_monitor::FforPersistenceToken },
-	FforUpstreamClaimed { home_channel: ChannelId, epoch: [u8; 32], slot: u16,
-		upstream_peer: PublicKey, upstream_funding: OutPoint, upstream_channel: ChannelId, upstream_htlc_id: u64 },
+	SpliceConflictPersisted {
+		record: crate::ln::splice_conflict::SpliceConflictRecord,
+	},
+	FforJournalPersisted {
+		token: crate::ln::ffor_monitor::FforPersistenceToken,
+	},
+	FforUpstreamClaimed {
+		home_channel: ChannelId,
+		epoch: [u8; 32],
+		slot: u16,
+		upstream_peer: PublicKey,
+		upstream_funding: OutPoint,
+		upstream_channel: ChannelId,
+		upstream_htlc_id: u64,
+	},
 	/// Indicates that a payment ultimately destined for us was claimed and we should emit an
 	/// [`events::Event::PaymentClaimed`] to the user if we haven't yet generated such an event for
 	/// this payment. Note that this is only best-effort. On restart it's possible such a duplicate
@@ -4228,6 +4244,120 @@ where
 		Ok(temporary_channel_id)
 	}
 
+	/// Initiates a confirmed v2 channel using explicit externally signed funding inputs.
+	///
+	/// The caller must reserve the inputs and validate their ownership and chain status before
+	/// calling. The counterparty must contribute zero satoshis. Funding witnesses are supplied
+	/// only after [`Event::FundingTransactionReadyForSigning`] through
+	/// [`Self::funding_transaction_signed`]. Never broadcast the transaction independently.
+	/// Pre-commitment negotiations are not persisted; callers must persist their own request
+	/// binding and recover conservatively after a restart.
+	pub fn create_channel_v2(
+		&self, peer: PublicKey, amount_sats: u64, inputs: Vec<FundingTxInput>,
+		change_script: bitcoin::ScriptBuf, funding_feerate_per_kw: u32, user_channel_id: u128,
+		override_config: Option<UserConfig>,
+	) -> Result<ChannelId, APIError> {
+		if amount_sats < 1000 || inputs.is_empty() {
+			return Err(APIError::APIMisuseError {
+				err: "External v2 funding requires an amount and inputs".to_owned(),
+			});
+		}
+		let _persistence_guard = PersistenceNotifierGuard::notify_on_drop(self);
+		let peers = self.per_peer_state.read().unwrap();
+		let peer_mutex = peers.get(&peer).ok_or_else(|| APIError::ChannelUnavailable {
+			err: "Funding peer is not connected".to_owned(),
+		})?;
+		let mut state = peer_mutex.lock().unwrap();
+		if !state.is_connected || !state.latest_features.supports_dual_fund() {
+			return Err(APIError::ChannelUnavailable {
+				err: "Funding peer does not support v2 channels".to_owned(),
+			});
+		}
+		let config = override_config.unwrap_or_else(|| self.config.read().unwrap().clone());
+		let alias = self.create_and_insert_outbound_scid_alias();
+		let result = PendingV2Channel::new_outbound(
+			&self.fee_estimator,
+			&self.entropy_source,
+			&self.signer_provider,
+			peer,
+			&state.latest_features,
+			amount_sats,
+			inputs,
+			user_channel_id,
+			&config,
+			self.current_best_block().height,
+			alias,
+			ConfirmationTarget::NonAnchorChannelFee,
+			&*self.logger,
+		)
+		.and_then(|mut channel| {
+			channel.set_external_funding_parameters(change_script, funding_feerate_per_kw)?;
+			Ok(channel)
+		});
+		let channel = result.map_err(|error| {
+			self.outbound_scid_aliases.lock().unwrap().remove(&alias);
+			error
+		})?;
+		let temporary_id = channel.context.channel_id();
+		if state.channel_by_id.contains_key(&temporary_id) {
+			self.outbound_scid_aliases.lock().unwrap().remove(&alias);
+			return Err(APIError::APIMisuseError {
+				err: "Duplicate temporary channel ID".to_owned(),
+			});
+		}
+		let message = channel.get_open_channel_v2(self.chain_hash);
+		state.channel_by_id.insert(temporary_id, Channel::from(channel));
+		state
+			.pending_msg_events
+			.push(MessageSendEvent::SendOpenChannelV2 { node_id: peer, msg: message });
+		Ok(temporary_id)
+	}
+
+	/// Returns immutable funding bytes only after the counterparty commitment is protected by
+	/// a durable monitor update. This does not sign, broadcast, or reserve any additional inputs.
+	pub fn funding_signing_details(
+		&self, channel_id: &ChannelId, peer: &PublicKey,
+	) -> Result<FundingSigningDetails, APIError> {
+		let peers = self.per_peer_state.read().unwrap();
+		let state = peers
+			.get(peer)
+			.ok_or_else(|| APIError::ChannelUnavailable { err: "Unknown funding peer".to_owned() })?
+			.lock()
+			.unwrap();
+		state.channel_by_id.get(channel_id).and_then(Channel::funding_signing_details).ok_or_else(
+			|| APIError::ChannelUnavailable {
+				err: "Funding transaction is not ready for signatures".to_owned(),
+			},
+		)
+	}
+
+	/// Cancels only a v2 opening that has not constructed its funding transaction or created
+	/// a monitor obligation. Existing channels and all interactive signing sessions are refused.
+	/// The caller must separately retain any externally signed input obligations.
+	pub fn abandon_unfunded_channel(
+		&self, channel_id: &ChannelId, peer: &PublicKey,
+	) -> Result<(), APIError> {
+		let _persistence_guard = PersistenceNotifierGuard::notify_on_drop(self);
+		let peers = self.per_peer_state.read().unwrap();
+		let peer_mutex = peers.get(peer).ok_or_else(|| APIError::ChannelUnavailable {
+			err: "Unknown funding peer".to_owned(),
+		})?;
+		let mut state = peer_mutex.lock().unwrap();
+		if state.channel_by_id.get_mut(channel_id).and_then(Channel::as_unfunded_v2_mut).is_none() {
+			return Err(APIError::APIMisuseError {
+				err: "Only an unfunded v2 negotiation can be abandoned".to_owned(),
+			});
+		}
+		let mut channel = state.channel_by_id.remove(channel_id).unwrap();
+		let reason = ClosureReason::LocallyCoopClosedUnfundedChannel;
+		let error = ChannelError::Close((reason.to_string(), reason));
+		let (_, error) = convert_channel_err!(self, state, error, &mut channel, UNFUNDED_CHANNEL);
+		mem::drop(state);
+		mem::drop(peers);
+		let _ = handle_error!(self, Err::<(), _>(error), *peer);
+		Ok(())
+	}
+
 	fn list_funded_channels_with_filter<
 		Fn: FnMut(&(&InitFeatures, &ChannelId, &Channel<SP>)) -> bool,
 	>(
@@ -4300,9 +4430,11 @@ where
 	#[doc(hidden)]
 	pub fn has_pending_funding_operation(&self) -> bool {
 		let peers = self.per_peer_state.read().unwrap();
-		peers.values().any(|peer| peer.lock().unwrap().channel_by_id.values().any(|channel| {
-			channel.as_funded().map_or(true, |funded| funded.has_pending_funding_operation())
-		}))
+		peers.values().any(|peer| {
+			peer.lock().unwrap().channel_by_id.values().any(|channel| {
+				channel.as_funded().map_or(true, |funded| funded.has_pending_funding_operation())
+			})
+		})
 	}
 
 	/// Gets the list of usable channels, in random order. Useful as an argument to
@@ -4813,7 +4945,7 @@ where
 		let mut res = Ok(());
 		PersistenceNotifierGuard::optionally_notify(self, || {
 			let result = self.internal_splice_channel(
-				channel_id, counterparty_node_id, contribution, funding_feerate_per_kw, locktime
+				channel_id, counterparty_node_id, contribution, funding_feerate_per_kw, locktime, None
 			);
 			res = result;
 			match res {
@@ -4824,9 +4956,35 @@ where
 		res
 	}
 
+	/// Initiates a splice whose replacement funding must reach the given confirmation depth.
+	///
+	/// This is required when another party supplies the input. The caller must independently
+	/// verify input ownership and confirmation. The peer must echo the requested depth before
+	/// transaction negotiation proceeds. A refusal does not release any earlier funding attempt.
+	pub fn splice_channel_with_minimum_depth(
+		&self, channel_id: &ChannelId, peer: &PublicKey, contribution: SpliceContribution,
+		funding_feerate_per_kw: u32, locktime: Option<u32>, minimum_depth: u16,
+	) -> Result<(), APIError> {
+		if !(1..=6).contains(&minimum_depth) {
+			return Err(APIError::APIMisuseError {
+				err: "Splice depth must be between 1 and 6".to_owned(),
+			});
+		}
+		let _persistence_guard = PersistenceNotifierGuard::notify_on_drop(self);
+		self.internal_splice_channel(
+			channel_id,
+			peer,
+			contribution,
+			funding_feerate_per_kw,
+			locktime,
+			Some(minimum_depth),
+		)
+	}
+
 	fn internal_splice_channel(
 		&self, channel_id: &ChannelId, counterparty_node_id: &PublicKey,
 		contribution: SpliceContribution, funding_feerate_per_kw: u32, locktime: Option<u32>,
+		minimum_depth: Option<u16>,
 	) -> Result<(), APIError> {
 		let per_peer_state = self.per_peer_state.read().unwrap();
 
@@ -4857,10 +5015,11 @@ where
 				let locktime = locktime.unwrap_or_else(|| self.current_best_block().height);
 				if let Some(chan) = chan_phase_entry.get_mut().as_funded_mut() {
 					let logger = WithChannelContext::from(&self.logger, &chan.context, None);
-					let msg_opt = chan.splice_channel(
+					let msg_opt = chan.splice_channel_with_minimum_depth(
 						contribution,
 						funding_feerate_per_kw,
 						locktime,
+						minimum_depth,
 						&&logger,
 					)?;
 					if let Some(msg) = msg_opt {
@@ -4888,8 +5047,11 @@ where
 		}
 	}
 
-	#[cfg(test)]
-	pub(crate) fn abandon_splice(
+	/// Abandons a splice only while native state proves it can still be released safely.
+	///
+	/// Refuses after commitment signatures have created a durable obligation. Such attempts
+	/// must remain recoverable; a timeout or lost payer witness never authorizes rollback.
+	pub fn abandon_splice(
 		&self, channel_id: &ChannelId, counterparty_node_id: &PublicKey,
 	) -> Result<(), APIError> {
 		let mut res = Ok(());
@@ -4897,14 +5059,13 @@ where
 			let result = self.internal_abandon_splice(channel_id, counterparty_node_id);
 			res = result;
 			match res {
-				Ok(_) => NotifyOption::SkipPersistHandleEvents,
+				Ok(_) => NotifyOption::DoPersist,
 				Err(_) => NotifyOption::SkipPersistNoEvents,
 			}
 		});
 		res
 	}
 
-	#[cfg(test)]
 	fn internal_abandon_splice(
 		&self, channel_id: &ChannelId, counterparty_node_id: &PublicKey,
 	) -> Result<(), APIError> {
@@ -7474,11 +7635,20 @@ where
 			if let HTLCForwardInfo::AddHTLC(payment) = forward {
 				if let Some(result) = self.process_ffor_forward(short_chan_id, payment) {
 					if result.is_err() {
-						let target = self.short_to_chan_info.read().unwrap().get(&short_chan_id).cloned();
-						failed_forwards.push((HTLCSource::PreviousHopData(payment.htlc_previous_hop_data()),
+						let target =
+							self.short_to_chan_info.read().unwrap().get(&short_chan_id).cloned();
+						failed_forwards.push((
+							HTLCSource::PreviousHopData(payment.htlc_previous_hop_data()),
 							payment.forward_info.payment_hash,
-							HTLCFailReason::reason(LocalHTLCFailureReason::UnknownNextPeer, Vec::new()),
-							HTLCHandlingFailureType::Forward { node_id: target.map(|x| x.0), channel_id: target.map(|x| x.1).unwrap_or(ChannelId([0; 32])) }));
+							HTLCFailReason::reason(
+								LocalHTLCFailureReason::UnknownNextPeer,
+								Vec::new(),
+							),
+							HTLCHandlingFailureType::Forward {
+								node_id: target.map(|x| x.0),
+								channel_id: target.map(|x| x.1).unwrap_or(ChannelId([0; 32])),
+							},
+						));
 					}
 					return false;
 				}
@@ -7634,16 +7804,19 @@ where
 						if reason == LocalHTLCFailureReason::HTLCMaximum
 							&& self.config.read().unwrap().intercept_liquidity_shortfalls
 							&& optimal_channel.can_intercept_liquidity_shortfall(
-								*outgoing_amt_msat, &self.fee_estimator,
-							)
-							&& payment.forward_info.incoming_amt_msat.is_some()
-							&& payment.forward_info.routing.incoming_cltv_expiry().is_some_and(|expiry| {
-								check_incoming_htlc_cltv(
-									self.best_block.read().unwrap().height.saturating_add(1),
-									*outgoing_cltv_value, expiry,
-								).is_ok()
-							})
-						{
+								*outgoing_amt_msat,
+								&self.fee_estimator,
+							) && payment.forward_info.incoming_amt_msat.is_some()
+							&& payment.forward_info.routing.incoming_cltv_expiry().is_some_and(
+								|expiry| {
+									check_incoming_htlc_cltv(
+										self.best_block.read().unwrap().height.saturating_add(1),
+										*outgoing_cltv_value,
+										expiry,
+									)
+									.is_ok()
+								},
+							) {
 							let intercept_id = InterceptId::from_incoming_shared_secret(
 								&payment.forward_info.incoming_shared_secret,
 							);
@@ -7651,17 +7824,23 @@ where
 							// A hard global ceiling also bounds unrecognized incoming payments
 							// before the application's authorization handler can reject them.
 							if intercepted.len() < 1024 {
-								if let hash_map::Entry::Vacant(entry) = intercepted.entry(intercept_id) {
+								if let hash_map::Entry::Vacant(entry) =
+									intercepted.entry(intercept_id)
+								{
 									entry.insert(payment.clone());
 									drop(intercepted);
 									self.pending_events.lock().unwrap().push_back((
 										events::Event::HTLCIntercepted {
 											requested_next_hop_scid: short_chan_id,
 											payment_hash: *payment_hash,
-											inbound_amount_msat: payment.forward_info.incoming_amt_msat.unwrap(),
+											inbound_amount_msat: payment
+												.forward_info
+												.incoming_amt_msat
+												.unwrap(),
 											expected_outbound_amount_msat: *outgoing_amt_msat,
 											intercept_id,
-										}, None,
+										},
+										None,
 									));
 									continue;
 								}
@@ -9049,7 +9228,8 @@ where
 		ComplFunc: FnOnce(
 			Option<u64>,
 			bool,
-		) -> (Option<MonitorUpdateCompletionAction>, Option<RAAMonitorUpdateBlockingAction>),
+		)
+			-> (Option<MonitorUpdateCompletionAction>, Option<RAAMonitorUpdateBlockingAction>),
 	>(
 		&self, prev_hop: HTLCPreviousHopData, payment_preimage: PaymentPreimage,
 		payment_info: Option<PaymentClaimDetails>, attribution_data: Option<AttributionData>,
@@ -9087,7 +9267,8 @@ where
 		ComplFunc: FnOnce(
 			Option<u64>,
 			bool,
-		) -> (Option<MonitorUpdateCompletionAction>, Option<RAAMonitorUpdateBlockingAction>),
+		)
+			-> (Option<MonitorUpdateCompletionAction>, Option<RAAMonitorUpdateBlockingAction>),
 	>(
 		&self, prev_hop: HTLCClaimSource, payment_preimage: PaymentPreimage,
 		payment_info: Option<PaymentClaimDetails>, attribution_data: Option<AttributionData>,
@@ -9198,17 +9379,39 @@ where
 							// the post-update action no matter the situation.
 							let in_flight_mons = peer_state.in_flight_monitor_updates.get(&chan_id);
 							if in_flight_mons.map(|(_, mons)| !mons.is_empty()).unwrap_or(false) {
-								let actions = peer_state.monitor_update_blocked_actions.entry(chan_id).or_insert_with(Vec::new);
+								let actions = peer_state
+									.monitor_update_blocked_actions
+									.entry(chan_id)
+									.or_insert_with(Vec::new);
 								// Periodic recovery must not accumulate callbacks while the
 								// same upstream preimage update remains in flight.
-								let claim_key = |action: &MonitorUpdateCompletionAction| match action {
-									MonitorUpdateCompletionAction::FforUpstreamClaimed { home_channel, epoch, slot,
-										upstream_peer, upstream_funding, upstream_channel, upstream_htlc_id } =>
-										Some((*home_channel, *epoch, *slot, *upstream_peer, *upstream_funding, *upstream_channel, *upstream_htlc_id)),
-									_ => None,
-								};
-								let duplicate = claim_key(&action).is_some_and(|key| actions.iter().any(|old| claim_key(old) == Some(key)));
-								if !duplicate { actions.push(action); }
+								let claim_key =
+									|action: &MonitorUpdateCompletionAction| match action {
+										MonitorUpdateCompletionAction::FforUpstreamClaimed {
+											home_channel,
+											epoch,
+											slot,
+											upstream_peer,
+											upstream_funding,
+											upstream_channel,
+											upstream_htlc_id,
+										} => Some((
+											*home_channel,
+											*epoch,
+											*slot,
+											*upstream_peer,
+											*upstream_funding,
+											*upstream_channel,
+											*upstream_htlc_id,
+										)),
+										_ => None,
+									};
+								let duplicate = claim_key(&action).is_some_and(|key| {
+									actions.iter().any(|old| claim_key(old) == Some(key))
+								});
+								if !duplicate {
+									actions.push(action);
+								}
 								return;
 							}
 
@@ -9255,7 +9458,10 @@ where
 									"Duplicate claims should always either be for forwarded payments(freeing another channel immediately) or during init (for claim replay)");
 								mem::drop(per_peer_state);
 								self.handle_monitor_update_completion_actions([action]);
-							} else if matches!(action, MonitorUpdateCompletionAction::FforUpstreamClaimed { .. }) {
+							} else if matches!(
+								action,
+								MonitorUpdateCompletionAction::FforUpstreamClaimed { .. }
+							) {
 								mem::drop(per_peer_state);
 								self.handle_monitor_update_completion_actions([action]);
 							} else {
@@ -10480,6 +10686,61 @@ This indicates a bug inside LDK. Please report this error at https://github.com/
 			output_script,
 			user_channel_id: user_id,
 		}, None));
+		Ok(())
+	}
+
+	fn internal_accept_channel_v2(
+		&self, peer: PublicKey, msg: &msgs::AcceptChannelV2,
+	) -> Result<(), MsgHandleErrInternal> {
+		let temporary_id = msg.common_fields.temporary_channel_id;
+		let peers = self.per_peer_state.read().unwrap();
+		let peer_mutex = peers.get(&peer).ok_or_else(|| {
+			MsgHandleErrInternal::send_err_msg_no_close(
+				"Unknown v2 funding peer".to_owned(),
+				temporary_id,
+			)
+		})?;
+		let mut state = peer_mutex.lock().unwrap();
+		let pending = state
+			.channel_by_id
+			.get_mut(&temporary_id)
+			.and_then(Channel::as_unfunded_v2_mut)
+			.filter(|channel| channel.funding.is_outbound());
+		if pending.is_none() {
+			return Err(MsgHandleErrInternal::send_err_msg_no_close(
+				"Unexpected accept_channel2".to_owned(),
+				temporary_id,
+			));
+		}
+		// Only a still-unfunded outbound v2 channel can be removed by this negotiation. In
+		// particular, a peer cannot discard an existing monitor obligation by sending its ID.
+		let mut channel = state.channel_by_id.remove(&temporary_id).unwrap();
+		let result = channel.as_unfunded_v2_mut().unwrap().accept_channel_v2(
+			msg,
+			&self.config.read().unwrap().channel_handshake_limits,
+			&state.latest_features,
+			&self.signer_provider,
+			&self.entropy_source,
+			self.get_our_node_id(),
+		);
+		let first = match result {
+			Ok(first) => first,
+			Err(error) => {
+				let (remove, error) =
+					convert_channel_err!(self, state, error, &mut channel, UNFUNDED_CHANNEL);
+				if !remove {
+					state.channel_by_id.insert(temporary_id, channel);
+				}
+				return Err(error);
+			},
+		};
+		let permanent_id = channel.context().channel_id();
+		if state.channel_by_id.contains_key(&permanent_id) {
+			let error = ChannelError::close("Duplicate v2 channel ID".to_owned());
+			return Err(convert_channel_err!(self, state, error, &mut channel, UNFUNDED_CHANNEL).1);
+		}
+		state.channel_by_id.insert(permanent_id, channel);
+		state.pending_msg_events.push(first.into_msg_send_event(peer));
 		Ok(())
 	}
 
@@ -12228,15 +12489,34 @@ This indicates a bug inside LDK. Please report this error at https://github.com/
 		{
 			for monitor_event in monitor_events.drain(..) {
 				match monitor_event {
-					MonitorEvent::FforVoucherResolved { epoch_id, slot, commitment_txid, output_index, resolving_txid, fulfilled } => {
-						self.ffor_chain_result(channel_id, epoch_id, slot, counterparty_node_id, funding_outpoint,
-							crate::ln::ffor::ChainRemoval { commitment_txid: commitment_txid.to_byte_array(), output_index,
-								resolving_txid: resolving_txid.to_byte_array(), fulfilled });
+					MonitorEvent::FforVoucherResolved {
+						epoch_id,
+						slot,
+						commitment_txid,
+						output_index,
+						resolving_txid,
+						fulfilled,
+					} => {
+						self.ffor_chain_result(
+							channel_id,
+							epoch_id,
+							slot,
+							counterparty_node_id,
+							funding_outpoint,
+							crate::ln::ffor::ChainRemoval {
+								commitment_txid: commitment_txid.to_byte_array(),
+								output_index,
+								resolving_txid: resolving_txid.to_byte_array(),
+								fulfilled,
+							},
+						);
 					},
 					MonitorEvent::HTLCEvent(htlc_update) => {
 						// Voucher custody is retired only by the monitor's authenticated
 						// anti-reorg proof and the subsequent durable journal transition.
-						if matches!(&htlc_update.source, HTLCSource::FforVoucher { .. }) { continue; }
+						if matches!(&htlc_update.source, HTLCSource::FforVoucher { .. }) {
+							continue;
+						}
 						let logger = WithContext::from(
 							&self.logger,
 							Some(counterparty_node_id),
@@ -14959,11 +15239,9 @@ where
 	fn handle_accept_channel_v2(
 		&self, counterparty_node_id: PublicKey, msg: &msgs::AcceptChannelV2,
 	) {
-		let err = Err(MsgHandleErrInternal::send_err_msg_no_close(
-			"Dual-funded channels not supported".to_owned(),
-			msg.common_fields.temporary_channel_id.clone(),
-		));
-		let _: Result<(), _> = handle_error!(self, err, counterparty_node_id);
+		let _persistence_guard = PersistenceNotifierGuard::notify_on_drop(self);
+		let result = self.internal_accept_channel_v2(counterparty_node_id, msg);
+		let _ = handle_error!(self, result, counterparty_node_id);
 	}
 
 	fn handle_funding_created(&self, counterparty_node_id: PublicKey, msg: &msgs::FundingCreated) {
@@ -15216,7 +15494,9 @@ where
 	) {
 		let _persistence_guard = PersistenceNotifierGuard::notify_on_drop(self);
 		let res = self.internal_channel_reestablish(&counterparty_node_id, msg);
-		if res.is_ok() { self.ffor_reestablished(counterparty_node_id, msg); }
+		if res.is_ok() {
+			self.ffor_reestablished(counterparty_node_id, msg);
+		}
 		let _ = handle_error!(self, res, counterparty_node_id);
 	}
 
@@ -18376,18 +18656,36 @@ where
 		let mut ffor_runtime = ffor_manager::FforRuntime::new();
 		let mut splice_conflict_runtime = splice_conflict_manager::SpliceConflictRuntime::new();
 		for (_, monitor) in args.channel_monitors.iter() {
-			splice_conflict_runtime.restore(monitor.channel_id(), monitor.get_counterparty_node_id(),
-				monitor.get_splice_conflict_records(), monitor.get_latest_update_id())?;
+			splice_conflict_runtime.restore(
+				monitor.channel_id(),
+				monitor.get_counterparty_node_id(),
+				monitor.get_splice_conflict_records(),
+				monitor.get_latest_update_id(),
+			)?;
 			if let Some(journal) = monitor.get_ffor_journal() {
-				for slot in journal.epoch.slots.iter().filter(|slot| slot.state == crate::ln::ffor::SlotState::Settling) {
+				for slot in journal
+					.epoch
+					.slots
+					.iter()
+					.filter(|slot| slot.state == crate::ln::ffor::SlotState::Settling)
+				{
 					let upstream = slot.upstream.as_ref().ok_or(DecodeError::InvalidValue)?;
 					// The immutable admission tuple retains the historical funding
 					// outpoint. A legitimate upstream splice can change its current
 					// outpoint without changing this native monitor's identity.
-					if !args.channel_monitors.values().any(|upstream_monitor| upstream_monitor.channel_id().0 == upstream.channel_id
-						&& upstream_monitor.get_counterparty_node_id() == upstream.counterparty_node_id) { return Err(DecodeError::InvalidValue); }
+					if !args.channel_monitors.values().any(|upstream_monitor| {
+						upstream_monitor.channel_id().0 == upstream.channel_id
+							&& upstream_monitor.get_counterparty_node_id()
+								== upstream.counterparty_node_id
+					}) {
+						return Err(DecodeError::InvalidValue);
+					}
 				}
-				ffor_runtime.restore(journal, monitor.get_funding_txo(), monitor.get_latest_update_id())?;
+				ffor_runtime.restore(
+					journal,
+					monitor.get_funding_txo(),
+					monitor.get_latest_update_id(),
+				)?;
 			}
 		}
 

@@ -1,0 +1,88 @@
+{
+  "recorded_at": "2026-10-27T03:13:47.722034+00:00",
+  "network": "regtest",
+  "native_library_tests": {
+    "passed": 288,
+    "failed": 0,
+    "log": "/tmp/bgnq-native-lib-final.log"
+  },
+  "doctests": {
+    "passed": 13,
+    "failed": 0,
+    "log": "/tmp/bgnq-native-doctests.log"
+  },
+  "all_targets_compile": {
+    "passed": true,
+    "features": [
+      "chicory",
+      "uniffi"
+    ],
+    "log": "/tmp/bgnq-all-targets.log",
+    "warnings": "Existing vendor cfg/deprecation and macro warnings remain."
+  },
+  "aggregate_tests": {
+    "passed": 56,
+    "failed": 0
+  },
+  "sender_tests": {
+    "passed": 21,
+    "failed": 0
+  },
+  "receiver_tests": {
+    "passed": 9,
+    "failed": 0
+  },
+  "fuzz": {
+    "runs": 20000,
+    "coverage_counters": 1904,
+    "features": 3833,
+    "crashes": 0,
+    "coverage_instrumented": true,
+    "address_sanitizer": false,
+    "log": "/tmp/bgnq-fuzz-instrumented.log"
+  },
+  "android_aar": {
+    "path": "bindings/kotlin/ldk-node-android/lib/build/outputs/aar/lib-release.aar",
+    "sha256": "f2c95398bed9ac387f548bddc8b4d27edcd908541a527734d1d05e892122690c",
+    "abis": [
+      "armeabi-v7a",
+      "arm64-v8a",
+      "x86_64"
+    ],
+    "native_symbols_and_16kb_alignment_validated": true
+  },
+  "beignet_interoperability": [
+    {
+      "name": "Beignet p2wpkh payer -> native new channel",
+      "txid": "c4244d6b0718128e87fed37d1000a4d4a9d4f7c2d65923d6392a6e23a0d0ab3e",
+      "valueSats": 100000
+    },
+    {
+      "name": "Beignet p2tr payer -> native splice",
+      "txid": "a94b4a4344756240984c5fa0451f67625eead1fe657423c677df2062f37f8179",
+      "valueSats": 140000
+    },
+    {
+      "name": "native payer -> Beignet new channel",
+      "txid": "76b942a66e4aea894f0a81792a5cdab07e47f52b82755448d1014125dbf77262",
+      "valueSats": "100000"
+    },
+    {
+      "name": "native payer -> Beignet splice",
+      "txid": "c2ee555fccbe4b08359b1284e22136dea61aa2630e88559b61006444df52c6a0",
+      "valueSats": "140000"
+    }
+  ],
+  "limitations": [
+    "No mainnet funds or physical Umbrel hardware exercised.",
+    "No claim of exhaustive failure schedules or complete branch coverage."
+  ],
+  "existing_v1_channel_coverage": {
+    "passed_tests": [
+      "ln::splicing_tests::test_external_splice_depth_and_durable_signing_snapshot",
+      "ln::splicing_tests::test_external_splice_requires_depth_ack_and_can_abandon_before_commitments"
+    ],
+    "splice_suite_passed": 21,
+    "scope": "External-input splice of ordinary V1 channels, durable signing/restart and confirmation-depth gating; full sealed-message integration fixtures begin with a v2 channel."
+  }
+}

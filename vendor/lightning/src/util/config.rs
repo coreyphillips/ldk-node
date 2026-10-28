@@ -89,6 +89,16 @@ pub struct ChannelHandshakeConfig {
 	///
 	/// Maximum value: `100` (Any values larger will be treated as `100` instead.)
 	pub max_inbound_htlc_value_in_flight_percent_of_channel: u8,
+	/// Optional absolute aggregate inbound HTLC limit negotiated for a new channel.
+	/// Overrides the percentage limit, clamped to 1 through Bitcoin's maximum msat value.
+	/// Live balances, reserves, commitment fees and HTLC count limits still apply.
+	/// Existing channels retain their negotiated limit. Default: `None`.
+	pub max_inbound_htlc_value_in_flight_msat: Option<u64>,
+	/// Retain a private peer's negotiated aggregate HTLC limit across future splices,
+	/// rather than clamping it to opening capacity. Public channels are unaffected.
+	/// This never permits spending above live balances or other channel limits.
+	/// Default: `false`.
+	pub retain_counterparty_htlc_limit_for_splicing: bool,
 	/// If set, we attempt to negotiate the `scid_privacy` (referred to as `scid_alias` in the
 	/// BOLTs) option for outbound private channels. This provides better privacy by not including
 	/// our real on-chain channel UTXO in each invoice and requiring that our counterparty only
@@ -281,6 +291,8 @@ impl Default for ChannelHandshakeConfig {
 			our_to_self_delay: BREAKDOWN_TIMEOUT,
 			our_htlc_minimum_msat: 1,
 			max_inbound_htlc_value_in_flight_percent_of_channel: 10,
+			max_inbound_htlc_value_in_flight_msat: None,
+			retain_counterparty_htlc_limit_for_splicing: false,
 			negotiate_scid_privacy: false,
 			require_zero_conf: false,
 			reuse_funding_key_on_splice: false,
@@ -305,6 +317,8 @@ impl Readable for ChannelHandshakeConfig {
 			our_to_self_delay: Readable::read(reader)?,
 			our_htlc_minimum_msat: Readable::read(reader)?,
 			max_inbound_htlc_value_in_flight_percent_of_channel: Readable::read(reader)?,
+			max_inbound_htlc_value_in_flight_msat: Readable::read(reader)?,
+			retain_counterparty_htlc_limit_for_splicing: Readable::read(reader)?,
 			negotiate_scid_privacy: Readable::read(reader)?,
 			require_zero_conf: Readable::read(reader)?,
 			reuse_funding_key_on_splice: Readable::read(reader)?,
@@ -1138,6 +1152,10 @@ pub struct ChannelHandshakeConfigUpdate {
 	/// Overrides the percentage of the channel value we will cap the total value of outstanding inbound HTLCs to. See
 	/// [`ChannelHandshakeConfig::max_inbound_htlc_value_in_flight_percent_of_channel`].
 	pub max_inbound_htlc_value_in_flight_percent_of_channel: Option<u8>,
+	/// Overrides the absolute aggregate inbound limit for this new channel.
+	pub max_inbound_htlc_value_in_flight_msat: Option<u64>,
+	/// Overrides private-channel retention of the peer's negotiated aggregate limit.
+	pub retain_counterparty_htlc_limit_for_splicing: Option<bool>,
 
 	/// Overrides the smallest value HTLC we will accept to process. See [`ChannelHandshakeConfig::our_htlc_minimum_msat`].
 	pub htlc_minimum_msat: Option<u64>,
@@ -1166,6 +1184,13 @@ impl ChannelHandshakeConfig {
 			config.max_inbound_htlc_value_in_flight_percent_of_channel
 		{
 			self.max_inbound_htlc_value_in_flight_percent_of_channel = max_in_flight_percent;
+		}
+
+		if let Some(limit) = config.max_inbound_htlc_value_in_flight_msat {
+			self.max_inbound_htlc_value_in_flight_msat = Some(limit);
+		}
+		if let Some(retain) = config.retain_counterparty_htlc_limit_for_splicing {
+			self.retain_counterparty_htlc_limit_for_splicing = retain;
 		}
 
 		if let Some(htlc_minimum_msat) = config.htlc_minimum_msat {

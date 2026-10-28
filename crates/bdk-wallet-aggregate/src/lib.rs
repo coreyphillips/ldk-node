@@ -96,6 +96,8 @@ where
 	wallets: HashMap<K, PersistedWallet<P>>,
 	persisters: HashMap<K, P>,
 	primary: K,
+	input_reservations: HashMap<OutPoint, String>,
+	signed_candidates: HashMap<Txid, HashSet<OutPoint>>,
 }
 
 /// Delegates to the primary wallet.
@@ -153,7 +155,111 @@ where
 			persisters.insert(key, persister);
 		}
 
-		Self { wallets, persisters, primary: primary_key }
+		Self {
+			wallets,
+			persisters,
+			primary: primary_key,
+			input_reservations: HashMap::new(),
+			signed_candidates: HashMap::new(),
+		}
+	}
+
+	/// Restore or acquire an outpoint reservation. The caller must persist ownership before
+	/// exposing a signature, and restore all live reservations before making the wallet available.
+	/// Repeating the same owner is idempotent; a different owner can never take its coin.
+	pub fn reserve_input(&mut self, outpoint: OutPoint, owner: &str) -> bool {
+		if let Some(existing) = self.input_reservations.get(&outpoint) {
+			return existing == owner;
+		}
+		if self.signed_candidates.values().any(|inputs| inputs.contains(&outpoint)) {
+			return false;
+		}
+		self.input_reservations.insert(outpoint, owner.to_owned());
+		true
+	}
+
+	/// Release a reservation only for the owner which acquired it.
+	pub fn release_input(&mut self, outpoint: OutPoint, owner: &str) -> bool {
+		if self.input_reservations.get(&outpoint).map(String::as_str) != Some(owner) {
+			return false;
+		}
+		self.input_reservations.remove(&outpoint);
+		true
+	}
+
+	/// All inputs excluded from ordinary transaction builders, including manual selection.
+	pub fn reserved_inputs(&self) -> Vec<OutPoint> {
+		self.input_reservations.keys().copied().collect()
+	}
+
+	/// Whether this outpoint is available for a new reservation.
+	pub fn input_is_available(&self, outpoint: &OutPoint) -> bool {
+		!self.input_reservations.contains_key(outpoint)
+			&& !self.signed_candidates.values().any(|inputs| inputs.contains(outpoint))
+	}
+
+	fn check_reserved_inputs(&self, tx: &Transaction, owner: Option<&str>) -> Result<(), Error> {
+		if tx.input.iter().any(|input| {
+			self.input_reservations
+				.get(&input.previous_output)
+				.is_some_and(|held| Some(held.as_str()) != owner)
+		}) {
+			return Err(Error::OnchainTxSigningFailed);
+		}
+		Ok(())
+	}
+
+	/// Whether a loaded wallet controls an input, including outputs already spent.
+	pub fn owns_input(&self, outpoint: OutPoint) -> bool {
+		self.wallets.values().any(|wallet| {
+			wallet
+				.get_tx(outpoint.txid)
+				.and_then(|tx| tx.tx_node.tx.output.get(outpoint.vout as usize).cloned())
+				.is_some_and(|out| wallet.is_mine(out.script_pubkey))
+		})
+	}
+
+	fn remember_signed(&mut self, tx: &Transaction) {
+		let inputs = tx
+			.input
+			.iter()
+			.filter(|input| self.owns_input(input.previous_output))
+			.map(|input| input.previous_output)
+			.collect();
+		self.signed_candidates.insert(tx.compute_txid(), inputs);
+	}
+
+	/// Sign exactly one reserved wallet input. Foreign inputs remain unsigned. This narrow
+	/// bypass is for the reservation owner after validating the complete transaction.
+	pub fn sign_reserved_input(
+		&mut self, psbt: Psbt, owner: &str, outpoint: OutPoint,
+	) -> Result<Transaction, Error> {
+		if self.input_reservations.get(&outpoint).map(String::as_str) != Some(owner)
+			|| psbt
+				.unsigned_tx
+				.input
+				.iter()
+				.filter(|input| input.previous_output == outpoint)
+				.count() != 1
+		{
+			return Err(Error::OnchainTxSigningFailed);
+		}
+		self.check_reserved_inputs(&psbt.unsigned_tx, Some(owner))?;
+		for (input, metadata) in psbt.unsigned_tx.input.iter().zip(&psbt.inputs) {
+			let known_owned_script = metadata.witness_utxo.as_ref().is_some_and(|prevout| {
+				self.wallets.values().any(|wallet| wallet.is_mine(prevout.script_pubkey.clone()))
+			});
+			if input.previous_output != outpoint
+				&& (self.owns_input(input.previous_output) || known_owned_script)
+			{
+				return Err(Error::OnchainTxSigningFailed);
+			}
+		}
+		// The caller has checked the fee independently. Ownership probes deliberately
+		// pay no output and include an unspendable poison input; the ordinary PSBT fee
+		// sanity limit would reject proofs for large coins despite no possible broadcast.
+		signing::sign_wallet_inputs(psbt, &mut self.wallets)
+			.map(Psbt::extract_tx_unchecked_fee_rate)
 	}
 
 	// ─── Accessors ──────────────────────────────────────────────────────
@@ -614,6 +720,7 @@ where
 
 	/// Cancel a transaction in all wallets that know about it.
 	pub fn cancel_tx(&mut self, tx: &Transaction) -> Result<(), Error> {
+		self.signed_candidates.remove(&tx.compute_txid());
 		for (key, wallet) in self.wallets.iter_mut() {
 			wallet.cancel_tx(tx);
 			let persister = self.persisters.get_mut(key).ok_or(Error::PersisterNotFound)?;
@@ -916,6 +1023,9 @@ where
 	pub fn prepare_utxos_for_psbt(
 		&self, utxos: &[LocalOutput],
 	) -> Result<Vec<UtxoPsbtInfo>, Error> {
+		if utxos.iter().any(|u| self.input_reservations.contains_key(&u.outpoint)) {
+			return Err(Error::InsufficientFunds);
+		}
 		utxo::prepare_utxos_for_psbt(utxos, &self.wallets, &self.primary)
 	}
 
@@ -923,6 +1033,9 @@ where
 	pub fn prepare_outpoints_for_psbt(
 		&self, outpoints: &[OutPoint],
 	) -> Result<Vec<UtxoPsbtInfo>, Error> {
+		if outpoints.iter().any(|o| self.input_reservations.contains_key(o)) {
+			return Err(Error::InsufficientFunds);
+		}
 		utxo::prepare_outpoints_for_psbt(outpoints, &self.wallets, &self.primary)
 	}
 
@@ -930,12 +1043,18 @@ where
 
 	/// Sign an unsigned transaction using all wallets that own inputs.
 	pub fn sign_owned_inputs(&mut self, unsigned_tx: Transaction) -> Result<Transaction, Error> {
-		signing::sign_owned_inputs(unsigned_tx, &mut self.wallets)
+		self.check_reserved_inputs(&unsigned_tx, None)?;
+		let tx = signing::sign_owned_inputs(unsigned_tx, &mut self.wallets)?;
+		self.remember_signed(&tx);
+		Ok(tx)
 	}
 
 	/// Sign a PSBT using all wallets that own inputs.
 	pub fn sign_psbt_all(&mut self, psbt: Psbt) -> Result<Transaction, Error> {
-		signing::sign_psbt_all_wallets(psbt, &mut self.wallets)
+		self.check_reserved_inputs(&psbt.unsigned_tx, None)?;
+		let tx = signing::sign_psbt_all_wallets(psbt, &mut self.wallets)?;
+		self.remember_signed(&tx);
+		Ok(tx)
 	}
 
 	// ─── Cross-wallet RBF ───────────────────────────────────────────────
@@ -979,6 +1098,7 @@ where
 			.list_confirmed_unspent()
 			.into_iter()
 			.filter(|u| !original_outpoints.contains(&u.outpoint))
+			.filter(|u| !self.input_reservations.contains_key(&u.outpoint))
 			.filter(|u| u.outpoint.txid != original_txid)
 			.collect();
 
@@ -1025,6 +1145,10 @@ where
 		&self, target_amount: u64, available_utxos: Vec<LocalOutput>, fee_rate: FeeRate,
 		algorithm: CoinSelectionAlgorithm, drain_script: &Script, excluded_outpoints: &[OutPoint],
 	) -> Result<Vec<OutPoint>, Error> {
+		let available_utxos = available_utxos
+			.into_iter()
+			.filter(|u| !self.input_reservations.contains_key(&u.outpoint))
+			.collect();
 		utxo::select_utxos_with_algorithm(utxo::SelectionRequest {
 			target_amount,
 			available_utxos,
@@ -1086,6 +1210,7 @@ where
 			.into_iter()
 			.filter(|u| !primary_outpoints.contains(&u.outpoint))
 			.filter(|u| !excluded_txids.contains(&u.outpoint.txid))
+			.filter(|u| !self.input_reservations.contains_key(&u.outpoint))
 			.collect();
 
 		if non_primary.is_empty() {
@@ -1116,6 +1241,7 @@ where
 			.into_iter()
 			.filter(|u| !primary_outpoints.contains(&u.outpoint))
 			.filter(|u| !excluded_txids.contains(&u.outpoint.txid))
+			.filter(|u| !self.input_reservations.contains_key(&u.outpoint))
 			.filter(|u| {
 				!segwit_only
 					|| u.txout.script_pubkey.witness_version().is_some()
@@ -1160,6 +1286,7 @@ where
 			.list_unspent()
 			.into_iter()
 			.filter(|u| !excluded_txids.contains(&u.outpoint.txid))
+			.filter(|u| !self.input_reservations.contains_key(&u.outpoint))
 			.filter(&utxo_filter)
 			.collect();
 
@@ -1323,6 +1450,7 @@ where
 	pub fn build_and_sign_drain(
 		&mut self, destination: ScriptBuf, fee_rate: FeeRate,
 	) -> Result<Transaction, Error> {
+		let excluded = self.reserved_inputs();
 		// Collect non-primary UTXOs first (immutable borrow).
 		let non_primary_infos = self.non_primary_foreign_utxos(&HashSet::new())?;
 
@@ -1335,6 +1463,7 @@ where
 		}
 
 		let mut builder = wallet.build_tx();
+		builder.unspendable(excluded);
 
 		// drain_wallet() tells BDK to include all primary UTXOs.
 		builder.drain_wallet();
@@ -1388,8 +1517,13 @@ where
 		let parent_fee_rate = parent_fee / parent_tx.weight();
 
 		// Find spendable outputs from this transaction across ALL wallets.
-		let utxos: Vec<LocalOutput> =
-			self.list_unspent().into_iter().filter(|u| u.outpoint.txid == parent_txid).collect();
+		let utxos: Vec<LocalOutput> = self
+			.list_unspent()
+			.into_iter()
+			.filter(|u| {
+				u.outpoint.txid == parent_txid && !self.input_reservations.contains_key(&u.outpoint)
+			})
+			.collect();
 		if utxos.is_empty() {
 			return Err(Error::NoSpendableOutputs);
 		}
@@ -1510,6 +1644,7 @@ where
 	) -> Result<(Transaction, Amount), Error> {
 		// Find original transaction.
 		let original_tx = self.find_tx(txid).ok_or(Error::TransactionNotFound)?;
+		self.check_reserved_inputs(&original_tx, None)?;
 
 		// Must not be confirmed.
 		if self.is_tx_confirmed_in_any_wallet(&txid) {
@@ -1534,6 +1669,8 @@ where
 			self.build_cross_wallet_rbf_with_fallback(&original_tx, new_fee_rate)?
 		};
 
+		self.check_reserved_inputs(&tx, None)?;
+		self.remember_signed(&tx);
 		Ok((tx, original_fee))
 	}
 
@@ -1543,11 +1680,13 @@ where
 	fn build_rbf_primary_with_fallback(
 		&mut self, txid: Txid, fee_rate: FeeRate,
 	) -> Result<Transaction, Error> {
+		let excluded = self.reserved_inputs();
 		// Attempt 1: primary-only fee bump.
 		let primary_result: Result<Psbt, Error> = {
 			let wallet = self.wallets.get_mut(&self.primary).ok_or(Error::WalletNotFound)?;
 			match wallet.build_fee_bump(txid) {
 				Ok(mut builder) => {
+					builder.unspendable(excluded.clone());
 					builder.fee_rate(fee_rate);
 					builder.finish().map_err(|e| {
 						log::debug!("Primary-only RBF failed: {}", e);
@@ -1596,6 +1735,7 @@ where
 					log::error!("Failed to create fee bump builder (with foreign): {}", e);
 					Error::OnchainTxCreationFailed
 				})?;
+				builder.unspendable(excluded);
 				builder.fee_rate(fee_rate);
 
 				for info in &non_primary_infos {
@@ -3567,5 +3707,138 @@ mod tests {
 		let signed = r.unwrap();
 		assert!(signed.input[0].witness.is_empty(), "foreign anchor input is left for LDK");
 		assert!(!signed.input[1].witness.is_empty(), "own input is signed");
+	}
+	#[test]
+	fn reservation_excludes_manual_selection_signing_and_wrong_owner_release() {
+		let mut persister = NoopPersister;
+		let wallet = create_funded_wallet(&mut persister, Amount::from_sat(100_000));
+		let mut aggregate = AggregateWallet::new(wallet, persister, 0u8, vec![]);
+		let coin = aggregate.list_unspent()[0].clone();
+		assert!(aggregate.reserve_input(coin.outpoint, "request-a"));
+		assert!(aggregate.reserve_input(coin.outpoint, "request-a"));
+		assert!(!aggregate.reserve_input(coin.outpoint, "request-b"));
+		assert!(!aggregate.release_input(coin.outpoint, "request-b"));
+		assert!(aggregate.prepare_outpoints_for_psbt(&[coin.outpoint]).is_err());
+		let tx = Transaction {
+			version: bitcoin::transaction::Version::TWO,
+			lock_time: LockTime::ZERO,
+			input: vec![TxIn { previous_output: coin.outpoint, ..Default::default() }],
+			output: vec![TxOut {
+				value: Amount::from_sat(99_000),
+				script_pubkey: recipient_script(),
+			}],
+		};
+		assert!(aggregate.sign_owned_inputs(tx.clone()).is_err());
+		let mut psbt = Psbt::from_unsigned_tx(tx).unwrap();
+		psbt.inputs[0].witness_utxo = Some(coin.txout);
+		assert!(aggregate.sign_reserved_input(psbt.clone(), "request-b", coin.outpoint).is_err());
+		assert!(aggregate.sign_reserved_input(psbt, "request-a", coin.outpoint).is_ok());
+		assert!(aggregate.release_input(coin.outpoint, "request-a"));
+		assert!(aggregate.prepare_outpoints_for_psbt(&[coin.outpoint]).is_ok());
+	}
+
+	#[test]
+	fn reservation_keeps_unreserved_coins_usable_for_drain_and_funding() {
+		for drain in [false, true] {
+			let mut persister = NoopPersister;
+			let mut wallet = create_funded_wallet(&mut persister, Amount::from_sat(100_000));
+			fund_wallet(&mut wallet, Amount::from_sat(200_000), 0x02);
+			let mut aggregate = AggregateWallet::new(wallet, persister, 0u8, vec![]);
+			let held = aggregate
+				.list_unspent()
+				.into_iter()
+				.find(|u| u.txout.value.to_sat() == 100_000)
+				.unwrap();
+			assert!(aggregate.reserve_input(held.outpoint, "request"));
+			let tx = if drain {
+				aggregate
+					.build_and_sign_drain(recipient_script(), FeeRate::from_sat_per_vb(2).unwrap())
+					.unwrap()
+			} else {
+				aggregate
+					.build_and_sign_funding_tx(
+						recipient_script(),
+						Amount::from_sat(50_000),
+						FeeRate::from_sat_per_vb(2).unwrap(),
+						LockTime::ZERO,
+					)
+					.unwrap()
+			};
+			assert!(tx.input.iter().all(|i| i.previous_output != held.outpoint));
+			assert_eq!(tx.input.len(), 1);
+			assert!(aggregate.reserved_inputs().contains(&held.outpoint));
+		}
+	}
+
+	#[test]
+	fn reserved_signer_refuses_second_owned_input_even_when_unreserved() {
+		let mut persister = NoopPersister;
+		let mut wallet = create_funded_wallet(&mut persister, Amount::from_sat(100_000));
+		fund_wallet(&mut wallet, Amount::from_sat(200_000), 0x02);
+		let mut aggregate = AggregateWallet::new(wallet, persister, 0u8, vec![]);
+		let coins = aggregate.list_unspent();
+		assert!(aggregate.reserve_input(coins[0].outpoint, "request"));
+		let tx = Transaction {
+			version: bitcoin::transaction::Version::TWO,
+			lock_time: LockTime::ZERO,
+			input: coins
+				.iter()
+				.map(|coin| TxIn { previous_output: coin.outpoint, ..Default::default() })
+				.collect(),
+			output: vec![TxOut {
+				value: Amount::from_sat(299_000),
+				script_pubkey: recipient_script(),
+			}],
+		};
+		let mut psbt = Psbt::from_unsigned_tx(tx).unwrap();
+		for (input, coin) in psbt.inputs.iter_mut().zip(&coins) {
+			input.witness_utxo = Some(coin.txout.clone());
+		}
+		assert!(aggregate.sign_reserved_input(psbt.clone(), "request", coins[0].outpoint).is_err());
+		// An authenticated foreign prevout can pay one of our scripts before wallet
+		// synchronization learns its transaction. It still must not get signed.
+		psbt.unsigned_tx.input[1].previous_output.txid = Txid::from_byte_array([91; 32]);
+		assert!(!aggregate.owns_input(psbt.unsigned_tx.input[1].previous_output));
+		assert!(aggregate.sign_reserved_input(psbt, "request", coins[0].outpoint).is_err());
+	}
+
+	#[test]
+	fn signed_candidate_cannot_be_reserved_until_its_matching_cancellation() {
+		let mut persister = NoopPersister;
+		let wallet = create_funded_wallet(&mut persister, Amount::from_sat(100_000));
+		let mut aggregate = AggregateWallet::new(wallet, persister, 0u8, vec![]);
+		let outpoint = aggregate.list_unspent()[0].outpoint;
+		let tx = aggregate
+			.build_and_sign_funding_tx(
+				recipient_script(),
+				Amount::from_sat(50_000),
+				FeeRate::from_sat_per_vb(2).unwrap(),
+				LockTime::ZERO,
+			)
+			.unwrap();
+		assert!(!aggregate.reserve_input(outpoint, "request"));
+		let mut unrelated = tx.clone();
+		unrelated.output[0].value = Amount::from_sat(1);
+		aggregate.cancel_tx(&unrelated).unwrap();
+		assert!(!aggregate.reserve_input(outpoint, "request"));
+		aggregate.cancel_tx(&tx).unwrap();
+		assert!(aggregate.reserve_input(outpoint, "request"));
+	}
+
+	#[test]
+	fn reservation_follows_outpoint_across_wallet_membership_changes() {
+		let mut persister = NoopPersister;
+		let wallet = create_funded_wallet(&mut persister, Amount::from_sat(100_000));
+		let mut aggregate = AggregateWallet::new(wallet, persister, 0u8, vec![]);
+		let outpoint = aggregate.list_unspent()[0].outpoint;
+		assert!(aggregate.reserve_input(outpoint, "request"));
+		let mut secondary_persister = NoopPersister;
+		let secondary =
+			create_empty_wallet_from_xprv(&mut secondary_persister, test_xprv_from_byte(0x43));
+		aggregate.add_wallet_and_persist(1u8, secondary, secondary_persister).unwrap();
+		assert_eq!(aggregate.reserved_inputs(), vec![outpoint]);
+		aggregate.remove_wallet(1).unwrap();
+		assert_eq!(aggregate.reserved_inputs(), vec![outpoint]);
+		assert!(!aggregate.input_is_available(&outpoint));
 	}
 }

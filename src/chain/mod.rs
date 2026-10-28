@@ -587,6 +587,57 @@ where
 }
 
 impl ChainSource {
+	/// Confirm an advertised output remains unspent using the configured chain backend.
+	pub(crate) async fn is_unspent_output(
+		&self, outpoint: bitcoin::OutPoint, output: bitcoin::TxOut,
+	) -> Result<bool, Error> {
+		tokio::time::timeout(Duration::from_secs(15), async {
+			match &self.kind {
+				ChainSourceKind::Bitcoind(source) => {
+					source.is_unspent_output(outpoint, output).await
+				},
+				ChainSourceKind::Electrum(source) => {
+					source.is_unspent_output(outpoint, output).await
+				},
+				ChainSourceKind::Esplora(source) => {
+					source.is_unspent_output(outpoint, output).await
+				},
+			}
+		})
+		.await
+		.map_err(|_| Error::TxSyncTimeout)?
+	}
+
+	pub(crate) async fn fetch_transaction_status(
+		&self, txid: Txid,
+	) -> Result<crate::payment::ConfirmationStatus, Error> {
+		tokio::time::timeout(Duration::from_secs(15), async {
+			match &self.kind {
+				ChainSourceKind::Bitcoind(source) => source.fetch_transaction_status(txid).await,
+				ChainSourceKind::Electrum(source) => source.fetch_transaction_status(txid).await,
+				ChainSourceKind::Esplora(source) => source.fetch_transaction_status(txid).await,
+			}
+		})
+		.await
+		.map_err(|_| Error::TxSyncTimeout)?
+	}
+
+	pub(crate) async fn fetch_transaction(&self, txid: Txid) -> Result<Transaction, Error> {
+		let transaction = tokio::time::timeout(Duration::from_secs(15), async {
+			match &self.kind {
+				ChainSourceKind::Bitcoind(source) => source.fetch_transaction(txid).await,
+				ChainSourceKind::Electrum(source) => source.fetch_transaction(txid).await,
+				ChainSourceKind::Esplora(source) => source.fetch_transaction(txid).await,
+			}
+		})
+		.await
+		.map_err(|_| Error::TxSyncTimeout)??;
+		if transaction.compute_txid() != txid {
+			return Err(Error::TxSyncFailed);
+		}
+		Ok(transaction)
+	}
+
 	pub(crate) fn new_esplora(
 		server_url: String, headers: HashMap<String, String>, sync_config: EsploraSyncConfig,
 		fee_estimator: Arc<OnchainFeeEstimator>, tx_broadcaster: Arc<Broadcaster>,

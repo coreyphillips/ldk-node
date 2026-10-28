@@ -18,6 +18,30 @@ use crate::events::bump_transaction::Utxo;
 use crate::ln::chan_utils::EMPTY_SCRIPT_SIG_WEIGHT;
 use crate::sign::{P2TR_KEY_PATH_WITNESS_WEIGHT, P2WPKH_WITNESS_WEIGHT};
 
+/// The exact interactive funding transaction which is ready for external input signatures.
+///
+/// Returned only after the counterparty commitment is verified and its monitor update is durable.
+/// The caller must preserve every transaction field and validate the intended payment before
+/// releasing a witness. This snapshot does not authorize broadcasting or cancellation.
+#[derive(Debug, Clone)]
+pub struct FundingSigningDetails {
+	/// The transaction negotiated by the channel counterparties.
+	pub unsigned_transaction: Transaction,
+	/// Previous outputs in the same order as the transaction inputs.
+	pub prevouts: Vec<TxOut>,
+	/// The previous channel funding input, if this transaction is a splice.
+	pub shared_input_index: Option<u16>,
+	/// The index of the new channel funding output.
+	pub funding_output_index: u16,
+	/// The new channel's 2-of-2 witness script.
+	pub funding_redeem_script: ScriptBuf,
+	/// The previous channel's witness script when splicing.
+	pub previous_funding_redeem_script: Option<ScriptBuf>,
+	/// Whether local funding witnesses have already been accepted. Never start another payment
+	/// when this is true, even if the final transaction or receipt is not yet available.
+	pub local_witnesses_submitted: bool,
+}
+
 /// The components of a splice's funding transaction that are contributed by one party.
 #[derive(Debug, Clone)]
 pub enum SpliceContribution {

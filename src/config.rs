@@ -358,6 +358,9 @@ pub struct Config {
 	/// funding transaction ends up never being confirmed on-chain. Zero-confirmation channels
 	/// should therefore only be accepted from trusted peers.
 	pub trusted_peers_0conf: Vec<PublicKey>,
+	/// Optional primary for Beignet-compatible just-in-time receiving.
+	/// Only configure a peer whose unconfirmed funding you trust.
+	pub primary_node_id: Option<PublicKey>,
 	/// The liquidity factor by which we filter the outgoing channels used for sending probes.
 	///
 	/// Channels with available liquidity less than the required amount times this value won't be
@@ -428,6 +431,7 @@ impl Default for Config {
 			listening_addresses: None,
 			announcement_addresses: None,
 			trusted_peers_0conf: Vec::new(),
+			primary_node_id: None,
 			probing_liquidity_limit_multiplier: DEFAULT_PROBING_LIQUIDITY_LIMIT_MULTIPLIER,
 			anchor_channels_config: Some(AnchorChannelsConfig::default()),
 			route_parameters: None,
@@ -674,6 +678,9 @@ pub(crate) fn default_user_config(config: &Config) -> UserConfig {
 	user_config.channel_handshake_config.negotiate_anchors_zero_fee_htlc_tx =
 		config.anchor_channels_config.is_some();
 	user_config.reject_inbound_splices = false;
+	if config.primary_node_id.is_some() {
+		user_config.channel_handshake_config.reuse_funding_key_on_splice = true;
+	}
 
 	if may_announce_channel(config).is_err() {
 		user_config.accept_forwards_to_priv_channels = false;

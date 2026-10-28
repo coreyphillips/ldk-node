@@ -23,7 +23,7 @@ mod conflict_service;
 mod offline;
 mod peer_storage;
 mod service;
-pub mod wire;
+pub use crate::primary_wire as wire;
 
 /// Secret-free durable reservation status for an authenticated operator interface.
 pub use lightning::ln::channelmanager::FforEpochStatus as OfflineReceiveEpochStatus;

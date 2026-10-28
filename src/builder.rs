@@ -522,6 +522,21 @@ impl NodeBuilder {
 		self
 	}
 
+	/// Selects a Beignet-compatible primary, trusting its zero-confirmation funding.
+	/// The caller must explicitly approve this peer and connect it before requesting liquidity.
+	pub fn set_primary_node(&mut self, node_id: PublicKey) -> &mut Self {
+		self.config.primary_node_id = Some(node_id);
+		if !self.config.trusted_peers_0conf.contains(&node_id) {
+			self.config.trusted_peers_0conf.push(node_id);
+		}
+		if let Some(anchors) = &mut self.config.anchor_channels_config {
+			if !anchors.trusted_peers_no_reserve.contains(&node_id) {
+				anchors.trusted_peers_no_reserve.push(node_id);
+			}
+		}
+		self
+	}
+
 	/// Sets scorer decay parameters used for liquidity estimate decay.
 	pub fn set_scoring_decay_params(&mut self, params: ScoringDecayParameters) -> &mut Self {
 		self.config.scoring_decay_params = Some(params);
@@ -1090,6 +1105,11 @@ impl ArcedNodeBuilder {
 	/// Sets scorer fee parameters used for pathfinding penalties.
 	pub fn set_scoring_fee_params(&self, params: ScoringFeeParameters) {
 		self.inner.write().unwrap().set_scoring_fee_params(params);
+	}
+
+	/// Selects a trusted Beignet-compatible primary for just-in-time receiving.
+	pub fn set_primary_node(&self, node_id: PublicKey) {
+		self.inner.write().unwrap().set_primary_node(node_id);
 	}
 
 	/// Sets scorer decay parameters used for liquidity estimate decay.
@@ -2415,6 +2435,16 @@ fn build_with_store_internal(
 		})
 		.transpose()?;
 
+	let primary_client = Arc::new(crate::primary::PrimaryClient::new(config.primary_node_id));
+	let direct_funding = Arc::new(crate::direct_funding::Service::new(
+		Arc::clone(&wallet),
+		Arc::clone(&channel_manager),
+		Arc::clone(&keys_manager),
+		Arc::clone(&chain_source),
+		Arc::clone(&fee_estimator),
+		Arc::clone(&kv_store),
+		Arc::clone(&config),
+	)?);
 	let (liquidity_source, custom_message_handler) =
 		if let Some(lsc) = liquidity_source_config.as_ref() {
 			let mut liquidity_source_builder = LiquiditySourceBuilder::new(
@@ -2468,7 +2498,11 @@ fn build_with_store_internal(
 
 	#[cfg(feature = "chicory")]
 	let custom_message_handler = custom_message_handler.with_chicory(chicory_service.clone());
-	let custom_message_handler = Arc::new(custom_message_handler);
+	let custom_message_handler = Arc::new(
+		custom_message_handler
+			.with_primary(Arc::clone(&primary_client))
+			.with_direct_funding(Arc::clone(&direct_funding)),
+	);
 	#[cfg(feature = "chicory")]
 	let channel_message_handler = Arc::new(crate::chicory::PeerStorageChannelHandler::new(
 		Arc::clone(&channel_manager),
@@ -2526,6 +2560,7 @@ fn build_with_store_internal(
 
 	let connection_manager =
 		Arc::new(ConnectionManager::new(Arc::clone(&peer_manager), Arc::clone(&logger)));
+	direct_funding.transport.attach(&peer_manager, &connection_manager);
 
 	// Read output_sweeper, event_queue, and peer_store in parallel
 	let (output_sweeper_res, event_queue_res, peer_store_res) = {
@@ -2680,6 +2715,8 @@ fn build_with_store_internal(
 		gossip_source,
 		pathfinding_scores_sync_url,
 		liquidity_source,
+		primary_client,
+		direct_funding,
 		#[cfg(feature = "chicory")]
 		chicory_service,
 		kv_store,
@@ -2690,6 +2727,7 @@ fn build_with_store_internal(
 		rgs_peer_recovery_exclusions: Arc::new(RgsPeerRecoveryExclusions::default()),
 		payment_store,
 		lifecycle_lock: Mutex::new(()),
+		channel_open_lock: Mutex::new(()),
 		is_running,
 		background_processor_failed: Arc::new(AtomicBool::new(false)),
 		background_processor_generation: Arc::new(AtomicU64::new(0)),

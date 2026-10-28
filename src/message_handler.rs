@@ -17,14 +17,15 @@ use lightning_liquidity::lsps0::ser::RawLSPSMessage;
 use lightning_types::features::{InitFeatures, NodeFeatures};
 
 #[cfg(feature = "chicory")]
-use crate::chicory::{wire, ChicoryService};
+use crate::chicory::ChicoryService;
 use crate::liquidity::LiquiditySource;
+use crate::primary::PrimaryClient;
+use crate::primary_wire as wire;
 
 /// Multiplex independent application protocols without replacing LSPS support.
 #[derive(Debug)]
 pub(crate) enum NodeCustomMessage {
 	Liquidity(RawLSPSMessage),
-	#[cfg(feature = "chicory")]
 	Beignet(wire::Envelope),
 	#[cfg(feature = "chicory")]
 	Ffor(FforFrame),
@@ -58,7 +59,6 @@ impl Writeable for NodeCustomMessage {
 	fn write<W: Writer>(&self, writer: &mut W) -> Result<(), lightning::io::Error> {
 		match self {
 			Self::Liquidity(message) => message.write(writer),
-			#[cfg(feature = "chicory")]
 			Self::Beignet(message) => {
 				let bytes = message.encode().map_err(|_| {
 					lightning::io::Error::new(
@@ -88,7 +88,6 @@ impl Type for NodeCustomMessage {
 	fn type_id(&self) -> u16 {
 		match self {
 			Self::Liquidity(message) => message.type_id(),
-			#[cfg(feature = "chicory")]
 			Self::Beignet(_) => wire::CUSTOM_MESSAGE_TYPE,
 			#[cfg(feature = "chicory")]
 			Self::Ffor(message) => message.message_type,
@@ -101,6 +100,8 @@ where
 	L::Target: Logger,
 {
 	liquidity_source: Option<Arc<LiquiditySource<L>>>,
+	primary_client: Option<Arc<PrimaryClient>>,
+	direct_funding: Option<Arc<crate::direct_funding::Service>>,
 	#[cfg(feature = "chicory")]
 	chicory_service: Option<Arc<ChicoryService>>,
 }
@@ -112,6 +113,8 @@ where
 	pub(crate) fn new_liquidity(liquidity_source: Arc<LiquiditySource<L>>) -> Self {
 		Self {
 			liquidity_source: Some(liquidity_source),
+			primary_client: None,
+			direct_funding: None,
 			#[cfg(feature = "chicory")]
 			chicory_service: None,
 		}
@@ -120,9 +123,34 @@ where
 	pub(crate) fn new_ignoring() -> Self {
 		Self {
 			liquidity_source: None,
+			primary_client: None,
+			direct_funding: None,
 			#[cfg(feature = "chicory")]
 			chicory_service: None,
 		}
+	}
+
+	pub(crate) fn with_primary(mut self, client: Arc<PrimaryClient>) -> Self {
+		self.primary_client = Some(client);
+		self
+	}
+
+	fn has_beignet_handler(&self) -> bool {
+		if self.direct_funding.is_some() {
+			return true;
+		}
+		#[cfg(feature = "chicory")]
+		if self.chicory_service.is_some() {
+			return true;
+		}
+		self.primary_client.as_ref().is_some_and(|client| client.enabled())
+	}
+
+	pub(crate) fn with_direct_funding(
+		mut self, service: Arc<crate::direct_funding::Service>,
+	) -> Self {
+		self.direct_funding = Some(service);
+		self
 	}
 
 	#[cfg(feature = "chicory")]
@@ -151,8 +179,7 @@ where
 			buffer.read_exact(&mut payload)?;
 			return Ok(Some(NodeCustomMessage::Ffor(FforFrame { message_type, payload })));
 		}
-		#[cfg(feature = "chicory")]
-		if message_type == wire::CUSTOM_MESSAGE_TYPE && self.chicory_service.is_some() {
+		if message_type == wire::CUSTOM_MESSAGE_TYPE && self.has_beignet_handler() {
 			// BOLT 8 already limits frames. Keep the bound here as well for callers
 			// that invoke the reader directly, before allocating from untrusted input.
 			let length = buffer.remaining_bytes();
@@ -188,8 +215,14 @@ where
 					source.liquidity_manager().handle_custom_message(message, sender_node_id)?;
 				}
 			},
-			#[cfg(feature = "chicory")]
 			NodeCustomMessage::Beignet(message) => {
+				if let Some(service) = &self.direct_funding {
+					service.transport.handle_message(sender_node_id, &message);
+				}
+				if let Some(client) = &self.primary_client {
+					client.handle_message(sender_node_id, &message);
+				}
+				#[cfg(feature = "chicory")]
 				if let Some(service) = &self.chicory_service {
 					service.handle_message(sender_node_id, message);
 				}
@@ -209,7 +242,7 @@ where
 	}
 
 	fn get_and_clear_pending_msg(&self) -> Vec<(PublicKey, Self::CustomMessage)> {
-		let messages = self
+		let mut messages = self
 			.liquidity_source
 			.as_ref()
 			.map(|source| {
@@ -221,6 +254,23 @@ where
 					.collect::<Vec<_>>()
 			})
 			.unwrap_or_default();
+		if let Some(service) = &self.direct_funding {
+			messages.extend(
+				service
+					.transport
+					.take_messages()
+					.into_iter()
+					.map(|(peer, message)| (peer, NodeCustomMessage::Beignet(message))),
+			);
+		}
+		if let Some(client) = &self.primary_client {
+			messages.extend(
+				client
+					.take_messages()
+					.into_iter()
+					.map(|(peer, message)| (peer, NodeCustomMessage::Beignet(message))),
+			);
+		}
 		#[cfg(feature = "chicory")]
 		let messages = {
 			let mut messages = messages;
@@ -281,6 +331,9 @@ where
 	}
 
 	fn peer_disconnected(&self, peer: PublicKey) {
+		if let Some(client) = &self.primary_client {
+			client.disconnected(peer);
+		}
 		if let Some(source) = &self.liquidity_source {
 			source.liquidity_manager().peer_disconnected(peer);
 		}

@@ -2372,7 +2372,6 @@ fn do_test_splice_out_initiator_reserve_breach_zero_fee_commitments(
 	}
 }
 
-
 #[test]
 fn test_remote_splice_depth_on_restored_zero_conf_channel() {
 	do_test_remote_splice_depth_on_restored_zero_conf_channel(false, 0);
@@ -2474,7 +2473,9 @@ fn do_test_remote_splice_depth_on_restored_zero_conf_channel(reuse: bool, closin
 		&splice_ack.funding_pubkey,
 	)
 	.to_p2wsh();
-	if reuse { assert_eq!(funding_script, old_funding_script); }
+	if reuse {
+		assert_eq!(funding_script, old_funding_script);
+	}
 	let commitment = complete_interactive_funding_negotiation(
 		&nodes[1],
 		&nodes[0],
@@ -2533,19 +2534,27 @@ fn do_test_remote_splice_depth_on_restored_zero_conf_channel(reuse: bool, closin
 		mine_transaction(&nodes[1], &splice_tx);
 		connect_blocks(&nodes[1], 5);
 		send_payment(&nodes[0], &[&nodes[1]], 100_000);
-		for node in &nodes { node.tx_broadcaster.txn_broadcast(); }
+		for node in &nodes {
+			node.tx_broadcaster.txn_broadcast();
+		}
 		let contribution = SpliceContribution::SpliceOut {
 			outputs: vec![TxOut {
 				value: Amount::from_sat(1_000),
 				script_pubkey: nodes[0].wallet_source.get_change_script().unwrap(),
 			}],
 		};
-		let script = complete_splice_handshake(&nodes[0], &nodes[1], channel_id, contribution.clone());
+		let script =
+			complete_splice_handshake(&nodes[0], &nodes[1], channel_id, contribution.clone());
 		assert_eq!(script, old_funding_script);
 		let commitment = complete_interactive_funding_negotiation(
-			&nodes[0], &nodes[1], channel_id, contribution, script,
+			&nodes[0],
+			&nodes[1],
+			channel_id,
+			contribution,
+			script,
 		);
-		let (second_splice, locked) = sign_interactive_funding_tx(&nodes[0], &nodes[1], commitment, true);
+		let (second_splice, locked) =
+			sign_interactive_funding_tx(&nodes[0], &nodes[1], commitment, true);
 		expect_splice_pending_event(&nodes[0], &phone_id);
 		expect_splice_pending_event(&nodes[1], &primary_id);
 		lock_splice(&nodes[0], &nodes[1], &locked.unwrap().0, true);
@@ -2553,11 +2562,18 @@ fn do_test_remote_splice_depth_on_restored_zero_conf_channel(reuse: bool, closin
 		mine_transaction(&nodes[0], &second_splice);
 		mine_transaction(&nodes[1], &second_splice);
 		send_payment(&nodes[0], &[&nodes[1]], 100_000);
-		for node in &nodes { node.tx_broadcaster.txn_broadcast(); }
+		for node in &nodes {
+			node.tx_broadcaster.txn_broadcast();
+		}
 		let counterparty = nodes[1 - closing_node].node.get_our_node_id();
-		nodes[closing_node].node.force_close_broadcasting_latest_txn(
-			&channel_id, &counterparty, "funding key reuse regression".to_owned(),
-		).unwrap();
+		nodes[closing_node]
+			.node
+			.force_close_broadcasting_latest_txn(
+				&channel_id,
+				&counterparty,
+				"funding key reuse regression".to_owned(),
+			)
+			.unwrap();
 		check_added_monitors(&nodes[closing_node], 1);
 		let transactions = nodes[closing_node].tx_broadcaster.txn_broadcast();
 		assert_eq!(transactions.len(), 1);
@@ -2566,7 +2582,6 @@ fn do_test_remote_splice_depth_on_restored_zero_conf_channel(reuse: bool, closin
 		assert!(events.iter().any(|event| matches!(event, Event::ChannelClosed { .. })));
 		nodes[closing_node].node.get_and_clear_pending_msg_events();
 	}
-
 }
 
 #[test]
@@ -2619,5 +2634,190 @@ fn test_invalid_splice_lock_depth_rejected_before_negotiation() {
 		assert_eq!(nodes[1].node.list_channels()[0].funding_txo, old_funding);
 		assert!(nodes[1].node.get_and_clear_pending_events().is_empty());
 		check_added_monitors(&nodes[1], 0);
+	}
+}
+
+#[test]
+fn test_external_splice_depth_and_durable_signing_snapshot() {
+	let chanmon_cfgs = create_chanmon_cfgs(2);
+	let node_cfgs = create_node_cfgs(2, &chanmon_cfgs);
+	let mut config = test_default_channel_config();
+	config.manually_accept_inbound_channels = true;
+	config.channel_handshake_limits.trust_own_funding_0conf = true;
+	let (restored_persister, restored_monitor);
+	let node_chanmgrs = create_node_chanmgrs(2, &node_cfgs, &[Some(config.clone()), Some(config)]);
+	let restored_manager;
+	let mut nodes = create_network(2, &node_cfgs, &node_chanmgrs);
+	let a = nodes[0].node.get_our_node_id();
+	let b = nodes[1].node.get_our_node_id();
+	let mut opening = test_default_channel_config();
+	opening.channel_handshake_config.announce_for_forwarding = false;
+	let (original_funding, channel_id) = open_zero_conf_channel_with_value(
+		&nodes[0],
+		&nodes[1],
+		Some(opening),
+		1_000_000,
+		500_000_000,
+	);
+	mine_transaction(&nodes[0], &original_funding);
+	mine_transaction(&nodes[1], &original_funding);
+	let old_script = nodes[0].node.list_channels()[0].funding_redeem_script.clone().unwrap();
+	let old_outpoint = nodes[0].node.list_channels()[0].funding_txo.unwrap();
+	let coin = provide_anchor_utxo_reserves(&nodes, 1, Amount::from_sat(30_000));
+	let contribution = SpliceContribution::SpliceIn {
+		value: Amount::from_sat(20_000),
+		inputs: vec![FundingTxInput::new_p2wpkh(coin, 0).unwrap()],
+		change_script: Some(nodes[0].wallet_source.get_change_script().unwrap()),
+	};
+	assert!(nodes[0]
+		.node
+		.splice_channel_with_minimum_depth(&channel_id, &b, contribution.clone(), 253, None, 0)
+		.is_err());
+	nodes[0]
+		.node
+		.splice_channel_with_minimum_depth(&channel_id, &b, contribution.clone(), 253, None, 3)
+		.unwrap();
+	let stfu = get_event_msg!(nodes[0], MessageSendEvent::SendStfu, b);
+	nodes[1].node.handle_stfu(a, &stfu);
+	let stfu = get_event_msg!(nodes[1], MessageSendEvent::SendStfu, a);
+	nodes[0].node.handle_stfu(b, &stfu);
+	let init = get_event_msg!(nodes[0], MessageSendEvent::SendSpliceInit, b);
+	assert_eq!(init.lock_depth, Some(3));
+	nodes[1].node.handle_splice_init(a, &init);
+	let ack = get_event_msg!(nodes[1], MessageSendEvent::SendSpliceAck, a);
+	assert_eq!(ack.lock_depth, Some(3));
+	nodes[0].node.handle_splice_ack(b, &ack);
+	let new_script =
+		chan_utils::make_funding_redeemscript(&init.funding_pubkey, &ack.funding_pubkey);
+	let commitment = complete_interactive_funding_negotiation(
+		&nodes[0],
+		&nodes[1],
+		channel_id,
+		contribution,
+		new_script.to_p2wsh(),
+	);
+	assert!(nodes[0].node.funding_signing_details(&channel_id, &b).is_err());
+	nodes[1].node.handle_commitment_signed(a, &commitment);
+	chanmon_cfgs[0].persister.set_update_ret(ChannelMonitorUpdateStatus::InProgress);
+	for event in nodes[1].node.get_and_clear_pending_msg_events() {
+		match event {
+			MessageSendEvent::UpdateHTLCs { updates, .. } => {
+				for signature in updates.commitment_signed {
+					nodes[0].node.handle_commitment_signed(b, &signature);
+				}
+			},
+			MessageSendEvent::SendTxSignatures { msg, .. } => {
+				nodes[0].node.handle_tx_signatures(b, &msg)
+			},
+			other => panic!("Unexpected message: {:?}", other),
+		}
+	}
+	assert!(nodes[0].node.funding_signing_details(&channel_id, &b).is_err());
+	chanmon_cfgs[0].persister.set_update_ret(ChannelMonitorUpdateStatus::Completed);
+	nodes[0].chain_monitor.complete_sole_pending_chan_update(&channel_id);
+	let _ = get_event!(nodes[0], Event::FundingTransactionReadyForSigning);
+	let details = nodes[0].node.funding_signing_details(&channel_id, &b).unwrap();
+	assert_eq!(details.funding_redeem_script, new_script);
+	assert_eq!(details.previous_funding_redeem_script, Some(old_script.clone()));
+	assert!(details.shared_input_index.is_some());
+	assert_eq!(details.prevouts.len(), details.unsigned_transaction.input.len());
+	assert!(!details.local_witnesses_submitted);
+	assert!(nodes[0].node.abandon_splice(&channel_id, &b).is_err());
+	let expected_txid = details.unsigned_transaction.compute_txid();
+	let signed = nodes[0].wallet_source.sign_tx(details.unsigned_transaction).unwrap();
+	nodes[0].node.funding_transaction_signed(&channel_id, &b, signed).unwrap();
+	let signatures = get_event_msg!(nodes[0], MessageSendEvent::SendTxSignatures, b);
+	nodes[1].node.handle_tx_signatures(a, &signatures);
+	assert!(nodes[1].node.get_and_clear_pending_msg_events().is_empty());
+	expect_splice_pending_event(&nodes[0], &b);
+	expect_splice_pending_event(&nodes[1], &a);
+	check_added_monitors(&nodes[0], 1);
+	check_added_monitors(&nodes[1], 1);
+	let tx = nodes[0]
+		.tx_broadcaster
+		.txn_broadcast()
+		.into_iter()
+		.find(|tx| tx.compute_txid() == expected_txid)
+		.unwrap();
+	// Keep both the witness obligation and the required confirmations over process restart.
+	nodes[0].node.peer_disconnected(b);
+	nodes[1].node.peer_disconnected(a);
+	let encoded_monitor = get_monitor!(nodes[0], channel_id).encode();
+	reload_node!(
+		nodes[0],
+		nodes[0].node.encode(),
+		&[&encoded_monitor],
+		restored_persister,
+		restored_monitor,
+		restored_manager
+	);
+	reconnect_nodes(ReconnectArgs::new(&nodes[0], &nodes[1]));
+
+	mine_transaction(&nodes[0], &tx);
+	mine_transaction(&nodes[1], &tx);
+	connect_blocks(&nodes[0], 1);
+	connect_blocks(&nodes[1], 1);
+	assert!(nodes[0].node.get_and_clear_pending_msg_events().is_empty());
+	assert!(nodes[1].node.get_and_clear_pending_msg_events().is_empty());
+	connect_blocks(&nodes[0], 1);
+	connect_blocks(&nodes[1], 1);
+	let locked_a = get_event_msg!(nodes[0], MessageSendEvent::SendSpliceLocked, b);
+	let locked_b = get_event_msg!(nodes[1], MessageSendEvent::SendSpliceLocked, a);
+	nodes[0].node.handle_splice_locked(b, &locked_b);
+	nodes[1].node.handle_splice_locked(a, &locked_a);
+	expect_channel_ready_event(&nodes[0], &b);
+	expect_channel_ready_event(&nodes[1], &a);
+	check_added_monitors(&nodes[0], 1);
+	check_added_monitors(&nodes[1], 1);
+	assert_eq!(nodes[0].node.list_channels()[0].channel_value_satoshis, 1_020_000);
+	assert_eq!(nodes[0].node.list_channels()[0].confirmations_required, Some(3));
+	for node in &nodes {
+		node.chain_source.remove_watched_txn_and_outputs(old_outpoint, old_script.to_p2wsh());
+	}
+}
+
+#[test]
+fn test_external_splice_requires_depth_ack_and_can_abandon_before_commitments() {
+	let chanmon_cfgs = create_chanmon_cfgs(2);
+	let node_cfgs = create_node_cfgs(2, &chanmon_cfgs);
+	let node_chanmgrs = create_node_chanmgrs(2, &node_cfgs, &[None, None]);
+	let nodes = create_network(2, &node_cfgs, &node_chanmgrs);
+	let a = nodes[0].node.get_our_node_id();
+	let b = nodes[1].node.get_our_node_id();
+	let (_, _, channel_id, _) = create_announced_chan_between_nodes(&nodes, 0, 1);
+	send_payment(&nodes[0], &[&nodes[1]], 100_000);
+	let old_funding = nodes[0].node.list_channels()[0].funding_txo;
+	let contribution = SpliceContribution::SpliceIn {
+		value: Amount::from_sat(20_000),
+		inputs: create_dual_funding_utxos_with_prev_txs(&nodes[0], &[30_000]),
+		change_script: Some(nodes[0].wallet_source.get_change_script().unwrap()),
+	};
+	nodes[0]
+		.node
+		.splice_channel_with_minimum_depth(&channel_id, &b, contribution, 253, None, 3)
+		.unwrap();
+	let stfu = get_event_msg!(nodes[0], MessageSendEvent::SendStfu, b);
+	nodes[1].node.handle_stfu(a, &stfu);
+	let stfu = get_event_msg!(nodes[1], MessageSendEvent::SendStfu, a);
+	nodes[0].node.handle_stfu(b, &stfu);
+	let init = get_event_msg!(nodes[0], MessageSendEvent::SendSpliceInit, b);
+	nodes[1].node.handle_splice_init(a, &init);
+	let mut ack = get_event_msg!(nodes[1], MessageSendEvent::SendSpliceAck, a);
+	ack.lock_depth = None;
+	nodes[0].node.handle_splice_ack(b, &ack);
+	let messages = nodes[0].node.get_and_clear_pending_msg_events();
+	assert_eq!(messages.len(), 1);
+	assert!(matches!(messages[0], MessageSendEvent::HandleError { .. }));
+	assert!(nodes[0].node.funding_signing_details(&channel_id, &b).is_err());
+	assert_eq!(nodes[0].node.list_channels()[0].funding_txo, old_funding);
+	nodes[0].node.abandon_splice(&channel_id, &b).unwrap();
+	let abort = get_event_msg!(nodes[0], MessageSendEvent::SendTxAbort, b);
+	nodes[1].node.handle_tx_abort(a, &abort);
+	let abort = get_event_msg!(nodes[1], MessageSendEvent::SendTxAbort, a);
+	nodes[0].node.handle_tx_abort(b, &abort);
+	for node in &nodes {
+		let _ = node.node.get_and_clear_pending_events();
+		assert!(!node.node.has_pending_funding_operation());
+		check_added_monitors(node, 0);
 	}
 }

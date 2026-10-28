@@ -14,7 +14,8 @@ LDK Node is a self-custodial Lightning node in library form. Its central goal is
 
 This local branch adds opt-in native Beignet protocol support behind the
 `chicory` feature, including JIT funding, direct funding, offline receiving and
-peer backup recovery. Read the [running guide](docs/chicory-running.md) and
+peer backup recovery. Native clients can also [send and receive `bgnq` payments](docs/direct-funding.md).
+Read the [running guide](docs/chicory-running.md) and
 [compatibility and test record](docs/chicory-primary.md) before enabling it.
 The local native dependency patches must be retained by consuming applications.
 

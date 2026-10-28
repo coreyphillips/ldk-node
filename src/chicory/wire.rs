@@ -269,9 +269,15 @@ impl JitQuote {
 	pub fn decode(bytes: &[u8]) -> Result<Self, WireError> {
 		bounded(bytes, MAX_PAYLOAD)?;
 		let mut reader = Reader::new(bytes);
+		let request_id = reader.array()?;
+		let accepted = match reader.u8()? {
+			0 => false,
+			1 => true,
+			_ => return Err(WireError("invalid quote acceptance flag")),
+		};
 		Ok(Self {
-			request_id: reader.array()?,
-			accepted: reader.u8()? == 1,
+			request_id,
+			accepted,
 			flat_fee_sat: reader.u64()?,
 			fee_ppm: reader.u32()?,
 			max_client_funding_sats: reader.u64()?,

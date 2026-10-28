@@ -350,6 +350,8 @@ interface BuilderInterface {
 
     fun `setPathfindingScoresSource`(`url`: kotlin.String)
 
+    fun `setPrimaryNode`(`nodeId`: PublicKey)
+
     fun `setScoringDecayParams`(`params`: ScoringDecayParameters)
 
     fun `setScoringFeeParams`(`params`: ScoringFeeParameters)
@@ -434,6 +436,9 @@ interface NodeInterface {
     fun `bolt12Payment`(): Bolt12Payment
 
     @Throws(NodeException::class)
+    fun `checkPrimaryConnection`(`nodeId`: PublicKey)
+
+    @Throws(NodeException::class)
     fun `closeChannel`(`userChannelId`: UserChannelId, `counterpartyNodeId`: PublicKey)
 
     fun `config`(): Config
@@ -441,10 +446,18 @@ interface NodeInterface {
     @Throws(NodeException::class)
     fun `connect`(`nodeId`: PublicKey, `address`: SocketAddress, `persist`: kotlin.Boolean)
 
+    @Throws(DirectFundingException::class)
+    fun `createDirectFundingRequest`(`amountSats`: kotlin.ULong?, `expirySecs`: kotlin.UInt): DirectFundingRequestDetails
+
     fun `currentSyncIntervals`(): RuntimeSyncIntervals
+
+    @Throws(DirectFundingException::class)
+    fun `decodeDirectFundingRequest`(`request`: kotlin.String): DirectFundingRequestDetails
 
     @Throws(NodeException::class)
     fun `disconnect`(`nodeId`: PublicKey)
+
+    fun `estimatedFeeRates`(): OnchainFeeRates
 
     @Throws(NodeException::class)
     fun `eventHandled`()
@@ -454,6 +467,12 @@ interface NodeInterface {
 
     @Throws(NodeException::class)
     fun `exportPathfindingScores`(): kotlin.ByteArray
+
+    @Throws(NodeException::class)
+    fun `fetchTransactionDetails`(`txid`: Txid): TransactionDetails
+
+    @Throws(NodeException::class)
+    fun `fetchTransactionStatus`(`txid`: Txid): ConfirmationStatus
 
     @Throws(NodeException::class)
     fun `forceCloseChannel`(`userChannelId`: UserChannelId, `counterpartyNodeId`: PublicKey, `reason`: kotlin.String?)
@@ -469,9 +488,16 @@ interface NodeInterface {
 
     fun `getTransactionDetails`(`txid`: Txid): TransactionDetails?
 
+    fun `hasPendingFundingOperation`(): kotlin.Boolean
+
+    @Throws(DirectFundingException::class)
+    fun `invalidateDirectFundingRequest`(`requestId`: kotlin.String)
+
     fun `listBalances`(): BalanceDetails
 
     fun `listChannels`(): List<ChannelDetails>
+
+    fun `listDirectFundingPayments`(): List<DirectFundingPaymentDetails>
 
     fun `listMonitoredAddressTypes`(): List<AddressType>
 
@@ -503,7 +529,19 @@ interface NodeInterface {
     @Throws(NodeException::class)
     fun `openChannel`(`nodeId`: PublicKey, `address`: SocketAddress, `channelAmountSats`: kotlin.ULong, `pushToCounterpartyMsat`: kotlin.ULong?, `channelConfig`: ChannelConfig?): UserChannelId
 
+    @Throws(NodeException::class)
+    fun `openChannelWithUserChannelId`(`nodeId`: PublicKey, `address`: SocketAddress, `channelAmountSats`: kotlin.ULong, `pushToCounterpartyMsat`: kotlin.ULong?, `channelConfig`: ChannelConfig?, `userChannelId`: UserChannelId): UserChannelId
+
     fun `payment`(`paymentId`: PaymentId): PaymentDetails?
+
+    @Throws(DirectFundingException::class)
+    fun `prepareDirectFunding`(`request`: kotlin.String, `amountSats`: kotlin.ULong?): DirectFundingRequestDetails
+
+    @Throws(NodeException::class)
+    fun `quotePrimaryReceive`(`nodeId`: PublicKey, `amountMsat`: kotlin.ULong, `targetInboundSats`: kotlin.ULong): PrimaryReceiveQuote
+
+    @Throws(NodeException::class)
+    fun `receiveViaPrimary`(`nodeId`: PublicKey, `amountMsat`: kotlin.ULong, `description`: Bolt11InvoiceDescription, `expirySecs`: kotlin.UInt, `maxFeeMsat`: kotlin.ULong, `targetInboundSats`: kotlin.ULong): Bolt11Invoice
 
     @Throws(NodeException::class)
     fun `removeAddressTypeFromMonitor`(`addressType`: AddressType)
@@ -513,6 +551,9 @@ interface NodeInterface {
 
     @Throws(NodeException::class)
     fun `removePayment`(`paymentId`: PaymentId)
+
+    @Throws(DirectFundingException::class)
+    fun `sendDirectFunding`(`request`: kotlin.String, `amountSats`: kotlin.ULong?, `maxFeeSats`: kotlin.ULong): DirectFundingPaymentDetails
 
     @Throws(NodeException::class)
     fun `setPrimaryAddressType`(`addressType`: AddressType, `seedBytes`: List<kotlin.UByte>)
@@ -527,6 +568,9 @@ interface NodeInterface {
 
     @Throws(NodeException::class)
     fun `spliceOut`(`userChannelId`: UserChannelId, `counterpartyNodeId`: PublicKey, `address`: Address, `spliceAmountSats`: kotlin.ULong)
+
+    @Throws(NodeException::class)
+    fun `spliceOutWithFeeRate`(`userChannelId`: UserChannelId, `counterpartyNodeId`: PublicKey, `address`: Address, `spliceAmountSats`: kotlin.ULong, `feeRateSatPerVbyte`: kotlin.ULong)
 
     fun `spontaneousPayment`(): SpontaneousPayment
 
@@ -934,6 +978,7 @@ data class Config (
     val `announcementAddresses`: List<SocketAddress>?,
     val `nodeAlias`: NodeAlias?,
     val `trustedPeers0conf`: List<PublicKey>,
+    val `primaryNodeId`: PublicKey?,
     val `probingLiquidityLimitMultiplier`: kotlin.ULong,
     val `anchorChannelsConfig`: AnchorChannelsConfig?,
     val `routeParameters`: RouteParametersConfig?,
@@ -953,6 +998,36 @@ data class Config (
 data class CustomTlvRecord (
     val `typeNum`: kotlin.ULong,
     val `value`: List<kotlin.UByte>
+) {
+    companion object
+}
+
+
+
+@kotlinx.serialization.Serializable
+data class DirectFundingPaymentDetails (
+    val `requestId`: kotlin.String,
+    val `paymentHash`: kotlin.String,
+    val `amountSats`: kotlin.ULong,
+    val `feeSats`: kotlin.ULong?,
+    val `fundingTxid`: kotlin.String?,
+    val `status`: DirectFundingPaymentStatus,
+    val `isOutbound`: kotlin.Boolean,
+    val `createdAt`: kotlin.ULong
+) {
+    companion object
+}
+
+
+
+@kotlinx.serialization.Serializable
+data class DirectFundingRequestDetails (
+    val `request`: kotlin.String,
+    val `requestId`: kotlin.String,
+    val `paymentHash`: kotlin.String,
+    val `receiverNodeId`: kotlin.String,
+    val `amountSats`: kotlin.ULong?,
+    val `expiresAt`: kotlin.ULong
 ) {
     companion object
 }
@@ -1171,6 +1246,18 @@ data class NodeStatus (
 
 
 @kotlinx.serialization.Serializable
+data class OnchainFeeRates (
+    val `fastSatPerVbyte`: kotlin.ULong,
+    val `normalSatPerVbyte`: kotlin.ULong,
+    val `slowSatPerVbyte`: kotlin.ULong,
+    val `channelFundingSatPerVbyte`: kotlin.ULong
+) {
+    companion object
+}
+
+
+
+@kotlinx.serialization.Serializable
 data class OnchainWalletAccount (
     val `addressType`: AddressType,
     val `accountIndex`: kotlin.UInt
@@ -1222,6 +1309,17 @@ data class PeerDetails (
     val `address`: SocketAddress,
     val `isPersisted`: kotlin.Boolean,
     val `isConnected`: kotlin.Boolean
+) {
+    companion object
+}
+
+
+
+@kotlinx.serialization.Serializable
+data class PrimaryReceiveQuote (
+    val `amountMsat`: kotlin.ULong,
+    val `feeMsat`: kotlin.ULong,
+    val `fundingSats`: kotlin.ULong
 ) {
     companion object
 }
@@ -1592,6 +1690,60 @@ enum class Currency {
     REGTEST,
     SIMNET,
     SIGNET;
+    companion object
+}
+
+
+
+
+
+
+
+sealed class DirectFundingException(message: String): kotlin.Exception(message) {
+
+    class InvalidRequest(message: String) : DirectFundingException(message)
+
+    class Expired(message: String) : DirectFundingException(message)
+
+    class WrongNetwork(message: String) : DirectFundingException(message)
+
+    class AmountRequired(message: String) : DirectFundingException(message)
+
+    class AmountMismatch(message: String) : DirectFundingException(message)
+
+    class InsufficientFunds(message: String) : DirectFundingException(message)
+
+    class Unavailable(message: String) : DirectFundingException(message)
+
+    class Declined(message: String) : DirectFundingException(message)
+
+    class InvalidFunding(message: String) : DirectFundingException(message)
+
+    class PersistenceFailed(message: String) : DirectFundingException(message)
+
+    class NotRunning(message: String) : DirectFundingException(message)
+
+    class ChainUnavailable(message: String) : DirectFundingException(message)
+
+    class Timeout(message: String) : DirectFundingException(message)
+
+    class Busy(message: String) : DirectFundingException(message)
+
+}
+
+
+
+
+
+@kotlinx.serialization.Serializable
+enum class DirectFundingPaymentStatus {
+
+    OFFERED,
+    SIGNED_PENDING,
+    MEMPOOL_SEEN,
+    CONFIRMED,
+    ABORTED,
+    FAILED;
     companion object
 }
 
@@ -2056,6 +2208,14 @@ sealed class NodeException(message: String): kotlin.Exception(message) {
 
     class InvalidSeedBytes(message: String) : NodeException(message)
 
+    class LiquiditySourceInsufficientFunds(message: String) : NodeException(message)
+
+    class LiquidityRequestRejected(message: String) : NodeException(message)
+
+    class LiquidityRequestTimedOut(message: String) : NodeException(message)
+
+    class LiquidityReceiveAmountTooSmall(message: String) : NodeException(message)
+
 }
 
 
@@ -2320,6 +2480,8 @@ enum class WordCount {
     WORDS24;
     companion object
 }
+
+
 
 
 

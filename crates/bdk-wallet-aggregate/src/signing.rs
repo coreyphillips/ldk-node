@@ -42,8 +42,32 @@ where
 /// splice, an anchor or an HTLC output) are left unsigned for the caller to
 /// sign. Fails if an input one of our wallets owns remains unsigned.
 pub fn sign_psbt_all_wallets<K, P>(
-	mut psbt: Psbt, wallets: &mut HashMap<K, PersistedWallet<P>>,
+	psbt: Psbt, wallets: &mut HashMap<K, PersistedWallet<P>>,
 ) -> Result<Transaction, Error>
+where
+	K: Eq + Hash + Copy + Debug,
+	P: WalletPersister,
+{
+	let psbt = sign_wallet_inputs(psbt, wallets)?;
+	match psbt.extract_tx() {
+		Ok(tx) => Ok(tx),
+		Err(psbt::ExtractTxError::MissingInputValue { tx }) => {
+			log::warn!(
+				"extract_tx could not verify fee (MissingInputValue) for txid {}",
+				tx.compute_txid()
+			);
+			Ok(tx)
+		},
+		Err(e) => {
+			log::error!("Failed to extract signed transaction: {}", e);
+			Err(Error::OnchainTxSigningFailed)
+		},
+	}
+}
+
+pub(crate) fn sign_wallet_inputs<K, P>(
+	mut psbt: Psbt, wallets: &mut HashMap<K, PersistedWallet<P>>,
+) -> Result<Psbt, Error>
 where
 	K: Eq + Hash + Copy + Debug,
 	P: WalletPersister,
@@ -80,20 +104,7 @@ where
 		return Err(Error::OnchainTxSigningFailed);
 	}
 
-	match psbt.extract_tx() {
-		Ok(tx) => Ok(tx),
-		Err(psbt::ExtractTxError::MissingInputValue { tx }) => {
-			log::warn!(
-				"extract_tx could not verify fee (MissingInputValue) for txid {}",
-				tx.compute_txid()
-			);
-			Ok(tx)
-		},
-		Err(e) => {
-			log::error!("Failed to extract signed transaction: {}", e);
-			Err(Error::OnchainTxSigningFailed)
-		},
-	}
+	Ok(psbt)
 }
 
 /// Whether one of our wallets owns the output spent by PSBT input `index`.

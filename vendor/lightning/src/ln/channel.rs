@@ -1525,6 +1525,14 @@ where
 		}
 	}
 
+	pub fn as_unfunded_v2_mut(&mut self) -> Option<&mut PendingV2Channel<SP>> {
+		if let ChannelPhase::UnfundedV2(channel) = &mut self.phase {
+			Some(channel)
+		} else {
+			None
+		}
+	}
+
 	pub fn as_unfunded_outbound_v1_mut(&mut self) -> Option<&mut OutboundV1Channel<SP>> {
 		if let ChannelPhase::UnfundedOutboundV1(channel) = &mut self.phase {
 			Some(channel)
@@ -1545,7 +1553,7 @@ where
 	///
 	/// If this method returns true, [`Self::into_unfunded_outbound_v1`] will also succeed.
 	pub fn ready_to_fund(&self) -> bool {
-		if !self.funding().is_outbound() {
+		if !matches!(self.phase, ChannelPhase::UnfundedOutboundV1(_)) {
 			return false;
 		}
 		match self.context().channel_state {
@@ -2251,6 +2259,43 @@ where
 		}
 	}
 
+	pub fn funding_signing_details(&self) -> Option<crate::ln::funding::FundingSigningDetails> {
+		let context = self.context();
+		if context.channel_state.is_monitor_update_in_progress() {
+			return None;
+		}
+		let session = context.interactive_tx_signing_session.as_ref()?;
+		if !session.has_received_commitment_signed() {
+			return None;
+		}
+		let previous = self
+			.as_funded()
+			.and_then(|channel| channel.pending_splice.as_ref())
+			.and_then(|pending| {
+				pending
+					.funding_negotiation
+					.as_ref()
+					.and_then(FundingNegotiation::as_funding)
+					.or_else(|| {
+						pending.negotiated_candidates.iter().find(|funding| {
+							funding.get_funding_txid() == Some(session.unsigned_tx().compute_txid())
+						})
+					})
+			});
+		let funding = previous.unwrap_or_else(|| self.funding());
+		let tx = session.unsigned_tx();
+		Some(crate::ln::funding::FundingSigningDetails {
+			unsigned_transaction: tx.tx().clone(),
+			prevouts: tx.input_metadata().map(|input| input.prev_output().clone()).collect(),
+			shared_input_index: tx.shared_input_index(),
+			funding_output_index: tx.funding_outpoint().index,
+			funding_redeem_script: funding.get_funding_redeemscript(),
+			previous_funding_redeem_script: previous
+				.map(|_| self.funding().get_funding_redeemscript()),
+			local_witnesses_submitted: session.holder_tx_signatures().is_some(),
+		})
+	}
+
 	pub fn minimum_depth(&self) -> Option<u32> {
 		self.context().minimum_depth(self.funding())
 	}
@@ -2723,6 +2768,7 @@ struct PendingFunding {
 
 	/// The funding txid used in the `splice_locked` received from the counterparty.
 	received_funding_txid: Option<Txid>,
+	requested_minimum_depth: Option<u16>,
 }
 
 impl_writeable_tlv_based!(PendingFunding, {
@@ -2730,6 +2776,7 @@ impl_writeable_tlv_based!(PendingFunding, {
 	(3, negotiated_candidates, required_vec),
 	(5, sent_funding_txid, option),
 	(7, received_funding_txid, option),
+	(9, requested_minimum_depth, option),
 });
 
 enum FundingNegotiation {
@@ -2818,6 +2865,7 @@ pub(crate) struct SpliceInstructions {
 	change_script: Option<ScriptBuf>,
 	funding_feerate_per_kw: u32,
 	locktime: u32,
+	minimum_depth: Option<u16>,
 }
 
 impl SpliceInstructions {
@@ -2836,6 +2884,7 @@ impl_writeable_tlv_based!(SpliceInstructions, {
 	(7, change_script, option),
 	(9, funding_feerate_per_kw, required),
 	(11, locktime, required),
+	(13, minimum_depth, option),
 });
 
 pub(crate) enum QuiescentAction {
@@ -2899,6 +2948,8 @@ where
 	prev_config: Option<(ChannelConfig, usize)>,
 
 	inbound_handshake_limits_override: Option<ChannelHandshakeLimits>,
+	// Needed only until accept_channel; the negotiated numeric limit is persisted afterward.
+	retain_counterparty_htlc_limit_for_splicing: bool,
 
 	user_id: u128,
 
@@ -3663,6 +3714,7 @@ where
 			prev_config: None,
 
 			inbound_handshake_limits_override: None,
+			retain_counterparty_htlc_limit_for_splicing: false,
 
 			temporary_channel_id: Some(open_channel_fields.temporary_channel_id),
 			channel_id: open_channel_fields.temporary_channel_id,
@@ -3717,7 +3769,7 @@ where
 			feerate_per_kw: open_channel_fields.commitment_feerate_sat_per_1000_weight,
 			counterparty_dust_limit_satoshis: open_channel_fields.dust_limit_satoshis,
 			holder_dust_limit_satoshis: MIN_CHAN_DUST_LIMIT_SATOSHIS,
-			counterparty_max_htlc_value_in_flight_msat: cmp::min(open_channel_fields.max_htlc_value_in_flight_msat, channel_value_satoshis * 1000),
+			counterparty_max_htlc_value_in_flight_msat: negotiated_counterparty_htlc_limit(open_channel_fields.max_htlc_value_in_flight_msat, channel_value_satoshis, config.channel_handshake_config.retain_counterparty_htlc_limit_for_splicing && !announce_for_forwarding),
 			holder_max_htlc_value_in_flight_msat: get_holder_max_htlc_value_in_flight_msat(channel_value_satoshis, &config.channel_handshake_config),
 			counterparty_htlc_minimum_msat: open_channel_fields.htlc_minimum_msat,
 			holder_htlc_minimum_msat: if config.channel_handshake_config.our_htlc_minimum_msat == 0 { 1 } else { config.channel_handshake_config.our_htlc_minimum_msat },
@@ -3923,6 +3975,7 @@ where
 			prev_config: None,
 
 			inbound_handshake_limits_override: Some(config.channel_handshake_limits.clone()),
+			retain_counterparty_htlc_limit_for_splicing: config.channel_handshake_config.retain_counterparty_htlc_limit_for_splicing,
 
 			channel_id: temporary_channel_id,
 			temporary_channel_id: Some(temporary_channel_id),
@@ -4345,7 +4398,7 @@ where
 		} else { None };
 
 		self.counterparty_dust_limit_satoshis = common_fields.dust_limit_satoshis;
-		self.counterparty_max_htlc_value_in_flight_msat = cmp::min(common_fields.max_htlc_value_in_flight_msat, funding.get_value_satoshis() * 1000);
+		self.counterparty_max_htlc_value_in_flight_msat = negotiated_counterparty_htlc_limit(common_fields.max_htlc_value_in_flight_msat, funding.get_value_satoshis(), self.retain_counterparty_htlc_limit_for_splicing && !self.config.announce_for_forwarding);
 		funding.counterparty_selected_channel_reserve_satoshis = Some(channel_reserve_satoshis);
 		self.counterparty_htlc_minimum_msat = common_fields.htlc_minimum_msat;
 		self.counterparty_max_accepted_htlcs = common_fields.max_accepted_htlcs;
@@ -4388,6 +4441,11 @@ where
 	/// Allowed in any state (including after shutdown)
 	pub fn get_holder_htlc_minimum_msat(&self) -> u64 {
 		self.holder_htlc_minimum_msat
+	}
+
+	/// The aggregate inbound limit agreed at channel negotiation, independent of live capacity.
+	pub fn get_holder_inflight_htlc_limit_msat(&self) -> u64 {
+		self.holder_max_htlc_value_in_flight_msat
 	}
 
 	/// Allowed in any state (including after shutdown), but will return none before TheirInitSent
@@ -5680,7 +5738,9 @@ where
 	fn get_available_balances_for_scope<F: Deref>(
 		&self, funding: &FundingScope, fee_estimator: &LowerBoundedFeeEstimator<F>,
 	) -> AvailableBalances
-	where F::Target: FeeEstimator {
+	where
+		F::Target: FeeEstimator,
+	{
 		self.get_available_balances_with_extra_local_capacity(funding, fee_estimator, 0)
 	}
 
@@ -6480,6 +6540,11 @@ where
 
 // Internal utility functions for channels
 
+// Retain only explicit private-splice opt-ins. Live funding/balance limits remain separate.
+fn negotiated_counterparty_htlc_limit(advertised: u64, opening_sats: u64, retain: bool) -> u64 {
+	cmp::min(advertised, if retain { msgs::MAX_VALUE_MSAT } else { opening_sats * 1000 })
+}
+
 /// Returns the value to use for `holder_max_htlc_value_in_flight_msat` as a percentage of the
 /// `channel_value_satoshis` in msat, set through
 /// [`ChannelHandshakeConfig::max_inbound_htlc_value_in_flight_percent_of_channel`]
@@ -6490,6 +6555,9 @@ where
 fn get_holder_max_htlc_value_in_flight_msat(
 	channel_value_satoshis: u64, config: &ChannelHandshakeConfig,
 ) -> u64 {
+	if let Some(limit) = config.max_inbound_htlc_value_in_flight_msat {
+		return limit.clamp(1, msgs::MAX_VALUE_MSAT);
+	}
 	let configured_percent = if config.max_inbound_htlc_value_in_flight_percent_of_channel < 1 {
 		1
 	} else if config.max_inbound_htlc_value_in_flight_percent_of_channel > 100 {
@@ -6681,6 +6749,7 @@ fn check_v2_funding_inputs_sufficient(
 }
 
 /// Context for negotiating channels (dual-funded V2 open, splicing)
+#[derive(Clone)]
 pub(super) struct FundingNegotiationContext {
 	/// Whether we initiated the funding negotiation.
 	pub is_initiator: bool,
@@ -8134,9 +8203,13 @@ where
 			})?;
 
 		match &update {
-			ChannelMonitorUpdateStep::LatestHolderCommitmentTXInfo { commitment_tx, .. } => self.validate_ffor_voucher_subset(commitment_tx, true)?,
+			ChannelMonitorUpdateStep::LatestHolderCommitmentTXInfo { commitment_tx, .. } => {
+				self.validate_ffor_voucher_subset(commitment_tx, true)?
+			},
 			ChannelMonitorUpdateStep::LatestHolderCommitment { commitment_txs, .. } => {
-				for tx in commitment_txs { self.validate_ffor_voucher_subset(tx, true)?; }
+				for tx in commitment_txs {
+					self.validate_ffor_voucher_subset(tx, true)?;
+				}
 			},
 			_ => unreachable!(),
 		}
@@ -8217,9 +8290,13 @@ where
 			claimed_htlcs: Vec::new(),
 		};
 		match &update {
-			ChannelMonitorUpdateStep::LatestHolderCommitmentTXInfo { commitment_tx, .. } => self.validate_ffor_voucher_subset(commitment_tx, true)?,
+			ChannelMonitorUpdateStep::LatestHolderCommitmentTXInfo { commitment_tx, .. } => {
+				self.validate_ffor_voucher_subset(commitment_tx, true)?
+			},
 			ChannelMonitorUpdateStep::LatestHolderCommitment { commitment_txs, .. } => {
-				for tx in commitment_txs { self.validate_ffor_voucher_subset(tx, true)?; }
+				for tx in commitment_txs {
+					self.validate_ffor_voucher_subset(tx, true)?;
+				}
 			},
 			_ => unreachable!(),
 		}
@@ -10472,7 +10549,11 @@ where
 		(Option<msgs::Shutdown>, Option<ChannelMonitorUpdate>, Vec<(HTLCSource, PaymentHash)>),
 		ChannelError,
 	> {
-		if self.ffor_book_live() { return Err(ChannelError::WarnAndDisconnect("Cannot cooperatively close while an FFOR voucher book is live".to_owned())); }
+		if self.ffor_book_live() {
+			return Err(ChannelError::WarnAndDisconnect(
+				"Cannot cooperatively close while an FFOR voucher book is live".to_owned(),
+			));
+		}
 
 		if self.context.channel_state.is_peer_disconnected() {
 			return Err(ChannelError::close(
@@ -12011,7 +12092,27 @@ where
 	where
 		L::Target: Logger,
 	{
-		if self.ffor_book_live() { return Err(APIError::APIMisuseError { err: "Cannot splice while an FFOR voucher book is live".to_owned() }); }
+		self.splice_channel_with_minimum_depth(
+			contribution,
+			funding_feerate_per_kw,
+			locktime,
+			None,
+			logger,
+		)
+	}
+
+	pub fn splice_channel_with_minimum_depth<L: Deref>(
+		&mut self, contribution: SpliceContribution, funding_feerate_per_kw: u32, locktime: u32,
+		minimum_depth: Option<u16>, logger: &L,
+	) -> Result<Option<msgs::Stfu>, APIError>
+	where
+		L::Target: Logger,
+	{
+		if self.ffor_book_live() {
+			return Err(APIError::APIMisuseError {
+				err: "Cannot splice while an FFOR voucher book is live".to_owned(),
+			});
+		}
 		if self.holder_commitment_point.current_point().is_none() {
 			return Err(APIError::APIMisuseError {
 				err: format!(
@@ -12108,6 +12209,7 @@ where
 			change_script,
 			funding_feerate_per_kw,
 			locktime,
+			minimum_depth,
 		});
 		self.propose_quiescence(logger, action)
 			.map_err(|e| APIError::APIMisuseError { err: e.to_owned() })
@@ -12123,6 +12225,7 @@ where
 			change_script,
 			funding_feerate_per_kw,
 			locktime,
+			minimum_depth,
 		} = instructions;
 
 		let prev_funding_input = self.funding.to_splice_funding_input();
@@ -12162,6 +12265,7 @@ where
 			negotiated_candidates: vec![],
 			sent_funding_txid: None,
 			received_funding_txid: None,
+			requested_minimum_depth: minimum_depth,
 		});
 
 		msgs::SpliceInit {
@@ -12171,11 +12275,10 @@ where
 			locktime,
 			funding_pubkey,
 			require_confirmed_inputs: None,
-			lock_depth: None,
+			lock_depth: minimum_depth,
 		}
 	}
 
-	#[cfg(test)]
 	pub fn abandon_splice(
 		&mut self,
 	) -> Result<(msgs::TxAbort, Option<SpliceFundingFailed>), APIError> {
@@ -12206,7 +12309,11 @@ where
 		&self, msg: &msgs::SpliceInit, our_funding_contribution: SignedAmount,
 		minimum_inbound_splice_depth: Option<u32>,
 	) -> Result<FundingScope, ChannelError> {
-		if self.ffor_book_live() { return Err(ChannelError::WarnAndDisconnect("Cannot splice while an FFOR voucher book is live".to_owned())); }
+		if self.ffor_book_live() {
+			return Err(ChannelError::WarnAndDisconnect(
+				"Cannot splice while an FFOR voucher book is live".to_owned(),
+			));
+		}
 
 		if msg.lock_depth.map_or(false, |depth| depth == 0 || depth > 6) {
 			return Err(ChannelError::WarnAndDisconnect(
@@ -12290,7 +12397,9 @@ where
 				// Never extend trust in our original zero-conf funding to a
 				// remotely constructed splice, including a splice-out.
 				funding.minimum_depth_override = Some(
-					self.context.minimum_depth(&self.funding).unwrap_or(1)
+					self.context
+						.minimum_depth(&self.funding)
+						.unwrap_or(1)
 						.max(minimum_inbound_splice_depth.unwrap_or(1).max(1))
 						.max(u32::from(msg.lock_depth.unwrap_or(1))),
 				);
@@ -12408,15 +12517,16 @@ where
 
 	pub(crate) fn splice_init<ES: Deref, L: Deref>(
 		&mut self, msg: &msgs::SpliceInit, our_funding_contribution_satoshis: i64,
-		minimum_inbound_splice_depth: Option<u32>,
-		signer_provider: &SP, entropy_source: &ES, holder_node_id: &PublicKey, logger: &L,
+		minimum_inbound_splice_depth: Option<u32>, signer_provider: &SP, entropy_source: &ES,
+		holder_node_id: &PublicKey, logger: &L,
 	) -> Result<msgs::SpliceAck, ChannelError>
 	where
 		ES::Target: EntropySource,
 		L::Target: Logger,
 	{
 		let our_funding_contribution = SignedAmount::from_sat(our_funding_contribution_satoshis);
-		let splice_funding = self.validate_splice_init(msg, our_funding_contribution, minimum_inbound_splice_depth)?;
+		let splice_funding =
+			self.validate_splice_init(msg, our_funding_contribution, minimum_inbound_splice_depth)?;
 
 		log_info!(
 			logger,
@@ -12467,6 +12577,7 @@ where
 			}),
 			negotiated_candidates: Vec::new(),
 			received_funding_txid: None,
+			requested_minimum_depth: None,
 			sent_funding_txid: None,
 		});
 
@@ -12567,6 +12678,14 @@ where
 			},
 		};
 
+		if pending_splice.requested_minimum_depth.is_some()
+			&& msg.lock_depth != pending_splice.requested_minimum_depth
+		{
+			return Err(ChannelError::WarnAndDisconnect(
+				"Peer did not acknowledge requested splice lock depth".to_owned(),
+			));
+		}
+
 		let our_funding_contribution = funding_negotiation_context.our_funding_contribution;
 		let their_funding_contribution = SignedAmount::from_sat(msg.funding_contribution_satoshis);
 		self.validate_splice_contributions(our_funding_contribution, their_funding_contribution)
@@ -12575,7 +12694,7 @@ where
 		let mut new_keys = self.funding.get_holder_pubkeys().clone();
 		new_keys.funding_pubkey = *new_holder_funding_key;
 
-		FundingScope::for_splice(
+		let mut funding = FundingScope::for_splice(
 			&self.funding,
 			&self.context,
 			our_funding_contribution,
@@ -12583,7 +12702,12 @@ where
 			msg.funding_pubkey,
 			new_keys,
 		)
-		.map_err(|e| ChannelError::WarnAndDisconnect(e))
+		.map_err(|e| ChannelError::WarnAndDisconnect(e))?;
+		if let Some(depth) = pending_splice.requested_minimum_depth {
+			funding.minimum_depth_override =
+				Some(self.context.minimum_depth(&self.funding).unwrap_or(1).max(u32::from(depth)));
+		}
+		Ok(funding)
 	}
 
 	fn get_holder_counterparty_balances_floor_incl_fee(
@@ -12758,24 +12882,43 @@ where
 		}
 
 		if self.ffor_journal.is_none() && matches!(&source, HTLCSource::FforVoucher { .. }) {
-			return Err((LocalHTLCFailureReason::TemporaryChannelFailure, "FFOR voucher has no custody journal".to_owned()));
+			return Err((
+				LocalHTLCFailureReason::TemporaryChannelFailure,
+				"FFOR voucher has no custody journal".to_owned(),
+			));
 		}
 		if let Some(journal) = &self.ffor_journal {
 			use crate::ln::ffor::Phase;
 			let voucher = match &source {
-				HTLCSource::FforVoucher { channel_id, epoch_id, slot } => *channel_id == self.context.channel_id()
-					&& *epoch_id == journal.epoch.epoch_id && journal.epoch.phase == Phase::Negotiating
-					&& journal.epoch.slots.iter().any(|entry| entry.entry.slot == *slot
-						&& entry.entry.payment_hash == payment_hash.0 && entry.entry.amount_msat == amount_msat
-						&& entry.entry.expiry == cltv_expiry),
+				HTLCSource::FforVoucher { channel_id, epoch_id, slot } => {
+					*channel_id == self.context.channel_id()
+						&& *epoch_id == journal.epoch.epoch_id
+						&& journal.epoch.phase == Phase::Negotiating
+						&& journal.epoch.slots.iter().any(|entry| {
+							entry.entry.slot == *slot
+								&& entry.entry.payment_hash == payment_hash.0
+								&& entry.entry.amount_msat == amount_msat
+								&& entry.entry.expiry == cltv_expiry
+						})
+				},
 				_ => false,
 			};
-			let blocked = !voucher && (matches!(&source, HTLCSource::FforVoucher { .. })
-				|| matches!(journal.epoch.phase, Phase::Negotiating | Phase::VouchersCommitted)
-				|| journal.epoch.activation_ack_pending || journal.epoch.capability_hold || journal.epoch.activation_mismatch
-				|| journal.contains_payment_hash(&payment_hash.0));
-			if blocked { return Err((LocalHTLCFailureReason::TemporaryChannelFailure,
-				"FFOR reserves this HTLC identity or temporarily holds new origination".to_owned())); }
+			let blocked = !voucher
+				&& (matches!(&source, HTLCSource::FforVoucher { .. })
+					|| matches!(
+						journal.epoch.phase,
+						Phase::Negotiating | Phase::VouchersCommitted
+					) || journal.epoch.activation_ack_pending
+					|| journal.epoch.capability_hold
+					|| journal.epoch.activation_mismatch
+					|| journal.contains_payment_hash(&payment_hash.0));
+			if blocked {
+				return Err((
+					LocalHTLCFailureReason::TemporaryChannelFailure,
+					"FFOR reserves this HTLC identity or temporarily holds new origination"
+						.to_owned(),
+				));
+			}
 		}
 		if amount_msat == 0 {
 			return Err((LocalHTLCFailureReason::ZeroAmount, "Cannot send 0-msat HTLC".to_owned()));
@@ -12874,92 +13017,166 @@ where
 	}
 
 	pub(super) fn is_peer_initiated_quiescence(&self) -> bool {
-		self.context.is_live() && self.context.channel_state.is_quiescent()
+		self.context.is_live()
+			&& self.context.channel_state.is_quiescent()
 			&& self.quiescence_initiator_is_holder == Some(false)
 	}
 
-	pub(super) fn splice_conflict_records(&self) -> &[crate::ln::splice_conflict::SpliceConflictRecord] {
+	pub(super) fn splice_conflict_records(
+		&self,
+	) -> &[crate::ln::splice_conflict::SpliceConflictRecord] {
 		&self.splice_conflict_records
 	}
 
-	pub(super) fn splice_conflict_candidate(&self, txid: Txid) -> Result<Transaction, ChannelError> {
-		let invalid = || ChannelError::Ignore("Splice conflict request has no eligible candidate".to_owned());
-		if !self.is_peer_initiated_quiescence() || self.is_shutdown() || self.quiescent_action.is_some()
+	pub(super) fn splice_conflict_candidate(
+		&self, txid: Txid,
+	) -> Result<Transaction, ChannelError> {
+		let invalid =
+			|| ChannelError::Ignore("Splice conflict request has no eligible candidate".to_owned());
+		if !self.is_peer_initiated_quiescence()
+			|| self.is_shutdown()
+			|| self.quiescent_action.is_some()
 			|| self.context.channel_state.is_awaiting_remote_revoke()
 			|| self.context.channel_state.is_monitor_update_in_progress()
 			|| !self.context.blocked_monitor_updates.is_empty()
-			|| self.context.interactive_tx_signing_session.as_ref().is_some_and(|session|
-				!session.has_received_commitment_signed() || !session.has_received_tx_signatures()
-					|| session.holder_tx_signatures().is_none() || session.unsigned_tx().compute_txid() != txid)
-			|| self.splice_conflict_records.len() >= crate::ln::splice_conflict::MAX_RETIRED_SPLICES { return Err(invalid()); }
+			|| self.context.interactive_tx_signing_session.as_ref().is_some_and(|session| {
+				!session.has_received_commitment_signed()
+					|| !session.has_received_tx_signatures()
+					|| session.holder_tx_signatures().is_none()
+					|| session.unsigned_tx().compute_txid() != txid
+			}) || self.splice_conflict_records.len()
+			>= crate::ln::splice_conflict::MAX_RETIRED_SPLICES
+		{
+			return Err(invalid());
+		}
 		let pending = self.pending_splice.as_ref().ok_or_else(invalid)?;
-		if pending.funding_negotiation.is_some() || pending.sent_funding_txid.is_some() || pending.received_funding_txid.is_some()
-			|| pending.negotiated_candidates.len() != 1 { return Err(invalid()); }
+		if pending.funding_negotiation.is_some()
+			|| pending.sent_funding_txid.is_some()
+			|| pending.received_funding_txid.is_some()
+			|| pending.negotiated_candidates.len() != 1
+		{
+			return Err(invalid());
+		}
 		let candidate = &pending.negotiated_candidates[0];
-		if candidate.get_funding_txid() != Some(txid) || candidate.funding_tx_confirmation_height != 0
-			|| candidate.funding_tx_confirmed_in.is_some() { return Err(invalid()); }
+		if candidate.get_funding_txid() != Some(txid)
+			|| candidate.funding_tx_confirmation_height != 0
+			|| candidate.funding_tx_confirmed_in.is_some()
+		{
+			return Err(invalid());
+		}
 		candidate.funding_transaction.clone().ok_or_else(invalid)
 	}
 
-	pub(super) fn retire_conflicted_splice<L: Deref>(&mut self, mut record: crate::ln::splice_conflict::SpliceConflictRecord,
-		conflict_transaction: Transaction, logger: &L)
-		-> Result<(Option<ChannelMonitorUpdate>, crate::ln::splice_conflict::SpliceConflictRecord), ChannelError>
-	where L::Target: Logger {
+	pub(super) fn retire_conflicted_splice<L: Deref>(
+		&mut self, mut record: crate::ln::splice_conflict::SpliceConflictRecord,
+		conflict_transaction: Transaction, logger: &L,
+	) -> Result<
+		(Option<ChannelMonitorUpdate>, crate::ln::splice_conflict::SpliceConflictRecord),
+		ChannelError,
+	>
+	where
+		L::Target: Logger,
+	{
 		let candidate_transaction = self.splice_conflict_candidate(record.splice_txid)?;
 		let invalid = || ChannelError::Ignore("Invalid confirmed splice conflict proof".to_owned());
-		if record.channel_id != self.context.channel_id() || record.counterparty_node_id != self.context.get_counterparty_node_id()
-			|| record.validate(&candidate_transaction, &conflict_transaction,
-				self.funding.get_funding_txo().ok_or_else(invalid)?.into_bitcoin_outpoint()).is_err() { return Err(invalid()); }
+		if record.channel_id != self.context.channel_id()
+			|| record.counterparty_node_id != self.context.get_counterparty_node_id()
+			|| record
+				.validate(
+					&candidate_transaction,
+					&conflict_transaction,
+					self.funding.get_funding_txo().ok_or_else(invalid)?.into_bitcoin_outpoint(),
+				)
+				.is_err()
+		{
+			return Err(invalid());
+		}
 		self.bind_splice_conflict_response(record.splice_txid).ok_or_else(invalid)?;
 		self.context.latest_monitor_update_id += 1;
 		record.update_id = self.context.latest_monitor_update_id;
-		let update = ChannelMonitorUpdate { update_id: record.update_id, channel_id: Some(record.channel_id),
-			updates: vec![ChannelMonitorUpdateStep::RetireConflictedFunding { record: record.clone(),
-				candidate_transaction, conflict_transaction }] };
+		let update = ChannelMonitorUpdate {
+			update_id: record.update_id,
+			channel_id: Some(record.channel_id),
+			updates: vec![ChannelMonitorUpdateStep::RetireConflictedFunding {
+				record: record.clone(),
+				candidate_transaction,
+				conflict_transaction,
+			}],
+		};
 		self.pending_splice = None;
 		self.context.interactive_tx_signing_session = None;
 		self.splice_conflict_records.push(record.clone());
 		// The original funding, channel balances and commitment sequence are unchanged.
 		// Remain quiescent until the persisted receipt has entered the outbound queue.
 		self.monitor_updating_paused(false, false, false, Vec::new(), Vec::new(), Vec::new());
-		log_info!(logger, "Retiring confirmed conflicting splice candidate with original funding retained");
+		log_info!(
+			logger,
+			"Retiring confirmed conflicting splice candidate with original funding retained"
+		);
 		Ok((Some(update), record))
 	}
 
 	pub(super) fn bind_splice_conflict_response(&mut self, txid: Txid) -> Option<u64> {
-		if !self.is_peer_initiated_quiescence() { return None; }
-		if self.pending_splice_conflict_response.is_some_and(|(pending, generation)|
-			pending != txid || generation != self.quiescence_generation) { return None; }
+		if !self.is_peer_initiated_quiescence() {
+			return None;
+		}
+		if self.pending_splice_conflict_response.is_some_and(|(pending, generation)| {
+			pending != txid || generation != self.quiescence_generation
+		}) {
+			return None;
+		}
 		self.pending_splice_conflict_response = Some((txid, self.quiescence_generation));
 		Some(self.quiescence_generation)
 	}
 
 	pub(super) fn splice_conflict_response_generation(&self, txid: Txid) -> Option<u64> {
-		self.pending_splice_conflict_response.filter(|(pending, generation)|
-			*pending == txid && *generation == self.quiescence_generation).map(|(_, generation)| generation)
+		self.pending_splice_conflict_response
+			.filter(|(pending, generation)| {
+				*pending == txid && *generation == self.quiescence_generation
+			})
+			.map(|(_, generation)| generation)
 	}
 
-	pub(super) fn complete_splice_conflict_response(&mut self, txid: Txid, generation: u64) -> bool {
-		if self.is_peer_initiated_quiescence() && !self.context.channel_state.is_monitor_update_in_progress()
+	pub(super) fn complete_splice_conflict_response(
+		&mut self, txid: Txid, generation: u64,
+	) -> bool {
+		if self.is_peer_initiated_quiescence()
+			&& !self.context.channel_state.is_monitor_update_in_progress()
 			&& self.context.blocked_monitor_updates.is_empty()
-			&& self.pending_splice_conflict_response == Some((txid, generation)) && generation == self.quiescence_generation {
+			&& self.pending_splice_conflict_response == Some((txid, generation))
+			&& generation == self.quiescence_generation
+		{
 			self.exit_quiescence();
 			true
-		} else { false }
+		} else {
+			false
+		}
 	}
 
-	pub(super) fn request_ffor_quiescence<L: Deref>(&mut self, logger: &L) -> Result<Option<msgs::Stfu>, ChannelError>
-	where L::Target: Logger {
-		if !self.context.is_usable() || self.pending_splice.is_some()
-			|| matches!(self.quiescent_action, Some(QuiescentAction::Splice(_))) {
+	pub(super) fn request_ffor_quiescence<L: Deref>(
+		&mut self, logger: &L,
+	) -> Result<Option<msgs::Stfu>, ChannelError>
+	where
+		L::Target: Logger,
+	{
+		if !self.context.is_usable()
+			|| self.pending_splice.is_some()
+			|| matches!(self.quiescent_action, Some(QuiescentAction::Splice(_)))
+		{
 			return Err(ChannelError::Ignore("Channel cannot enter FFOR quiescence".to_owned()));
 		}
-		if self.context.channel_state.is_quiescent() { return Ok(None); }
-		if matches!(self.quiescent_action, Some(QuiescentAction::Ffor)) { return Ok(None); }
+		if self.context.channel_state.is_quiescent() {
+			return Ok(None);
+		}
+		if matches!(self.quiescent_action, Some(QuiescentAction::Ffor)) {
+			return Ok(None);
+		}
 		self.propose_quiescence(logger, QuiescentAction::Ffor)
 			.map_err(|reason| ChannelError::Ignore(reason.to_owned()))
 	}
-	pub(super) fn is_ffor_quiescent(&self) -> bool { self.context.channel_state.is_quiescent() }
+	pub(super) fn is_ffor_quiescent(&self) -> bool {
+		self.context.channel_state.is_quiescent()
+	}
 
 	pub(super) fn ffor_journal(&self) -> Option<&crate::ln::ffor_monitor::FforJournal> {
 		self.ffor_journal.as_ref()
@@ -12968,63 +13185,114 @@ where
 	/// A native setup guard. The caller additionally verifies the negotiated FFOR
 	/// feature profile and budget policy before preparing any signed response.
 	pub(super) fn can_setup_ffor(&self) -> bool {
-		self.context.is_live() && !self.is_shutdown() && self.pending_splice.is_none()
-			&& self.quiescent_action.is_none() && !self.context.channel_state.is_quiescent()
+		self.context.is_live()
+			&& !self.is_shutdown()
+			&& self.pending_splice.is_none()
+			&& self.quiescent_action.is_none()
+			&& !self.context.channel_state.is_quiescent()
 			&& !self.context.channel_state.is_awaiting_quiescence()
 			&& !self.context.channel_state.is_remote_stfu_sent()
 			&& !self.context.channel_state.is_awaiting_remote_revoke()
 			&& !self.context.channel_state.is_monitor_update_in_progress()
 			&& self.context.blocked_monitor_updates.is_empty()
-			&& self.context.pending_inbound_htlcs.is_empty() && self.context.pending_outbound_htlcs.is_empty()
-			&& self.context.holding_cell_htlc_updates.is_empty() && self.context.pending_update_fee.is_none()
+			&& self.context.pending_inbound_htlcs.is_empty()
+			&& self.context.pending_outbound_htlcs.is_empty()
+			&& self.context.holding_cell_htlc_updates.is_empty()
+			&& self.context.pending_update_fee.is_none()
 			&& self.context.holding_cell_update_fee.is_none()
 			&& self.funding.get_channel_type().supports_anchors_zero_fee_htlc_tx()
 	}
 
-	pub(super) fn ffor_next_voucher_htlc_id(&self) -> u64 { self.context.next_holder_htlc_id }
+	pub(super) fn ffor_next_voucher_htlc_id(&self) -> u64 {
+		self.context.next_holder_htlc_id
+	}
 
-	pub(super) fn ffor_setup_context<F: Deref>(&self, height: u32, concurrent_features_negotiated: bool,
-		count: usize, fee_estimator: &LowerBoundedFeeEstimator<F>) -> crate::ln::ffor::SetupContext
-	where F::Target: FeeEstimator {
+	pub(super) fn ffor_setup_context<F: Deref>(
+		&self, height: u32, concurrent_features_negotiated: bool, count: usize,
+		fee_estimator: &LowerBoundedFeeEstimator<F>,
+	) -> crate::ln::ffor::SetupContext
+	where
+		F::Target: FeeEstimator,
+	{
 		let capacity = self.get_available_balances(fee_estimator);
-		let fee = chan_utils::commit_tx_fee_sat(self.context.feerate_per_kw.saturating_mul(2), count.min(crate::ln::ffor::MAX_SLOTS),
-			self.funding.get_channel_type()).saturating_mul(1000);
+		let fee = chan_utils::commit_tx_fee_sat(
+			self.context.feerate_per_kw.saturating_mul(2),
+			count.min(crate::ln::ffor::MAX_SLOTS),
+			self.funding.get_channel_type(),
+		)
+		.saturating_mul(1000);
 		let available = if self.funding.is_outbound() {
 			capacity.outbound_capacity_msat.saturating_sub(fee)
-		} else if capacity.inbound_capacity_msat >= fee { capacity.outbound_capacity_msat } else { 0 };
+		} else if capacity.inbound_capacity_msat >= fee {
+			capacity.outbound_capacity_msat
+		} else {
+			0
+		};
 		crate::ln::ffor::SetupContext {
-			channel_id: self.context.channel_id().0, remote_node: self.context.get_counterparty_node_id(),
-			usable_anchor_channel: self.context.is_live() && self.funding.get_channel_type().supports_anchors_zero_fee_htlc_tx(),
-			concurrent_features_negotiated, idle_without_splice: self.can_setup_ffor() && count > 0 && count <= crate::ln::ffor::MAX_SLOTS, current_height: height,
+			channel_id: self.context.channel_id().0,
+			remote_node: self.context.get_counterparty_node_id(),
+			usable_anchor_channel: self.context.is_live()
+				&& self.funding.get_channel_type().supports_anchors_zero_fee_htlc_tx(),
+			concurrent_features_negotiated,
+			idle_without_splice: self.can_setup_ffor()
+				&& count > 0 && count <= crate::ln::ffor::MAX_SLOTS,
+			current_height: height,
 			next_local_htlc_id: self.context.next_holder_htlc_id,
-			local_commitment_number: INITIAL_COMMITMENT_NUMBER - self.get_cur_holder_commitment_transaction_number(),
+			local_commitment_number: INITIAL_COMMITMENT_NUMBER
+				- self.get_cur_holder_commitment_transaction_number(),
 			max_accepted_htlcs: self.context.counterparty_max_accepted_htlcs,
 			max_in_flight_msat: self.context.counterparty_max_htlc_value_in_flight_msat,
 			minimum_htlc_msat: self.context.counterparty_htlc_minimum_msat,
-			minimum_untrimmed_msat: cmp::max(self.context.holder_dust_limit_satoshis, self.context.counterparty_dust_limit_satoshis) * 1000,
+			minimum_untrimmed_msat: cmp::max(
+				self.context.holder_dust_limit_satoshis,
+				self.context.counterparty_dust_limit_satoshis,
+			) * 1000,
 			available_after_reserves_and_fee_msat: available,
 		}
 	}
 
 	/// Queue a complete native voucher book after its custody update is durable.
 	/// The only wire data supplied by the caller are the ordinary one-hop onions.
-	pub(super) fn queue_ffor_vouchers<F: Deref, L: Deref>(&mut self, onions: Vec<msgs::OnionPacket>,
-		fee_estimator: &LowerBoundedFeeEstimator<F>, logger: &L) -> Result<(), ChannelError>
-	where F::Target: FeeEstimator, L::Target: Logger {
+	pub(super) fn queue_ffor_vouchers<F: Deref, L: Deref>(
+		&mut self, onions: Vec<msgs::OnionPacket>, fee_estimator: &LowerBoundedFeeEstimator<F>,
+		logger: &L,
+	) -> Result<(), ChannelError>
+	where
+		F::Target: FeeEstimator,
+		L::Target: Logger,
+	{
 		let invalid = || ChannelError::Ignore("FFOR voucher book is not ready to offer".to_owned());
 		let journal = self.ffor_journal.as_ref().ok_or_else(invalid)?.clone();
-		if journal.epoch.phase != crate::ln::ffor::Phase::Negotiating || onions.len() != journal.epoch.slots.len()
-			|| !self.context.pending_outbound_htlcs.is_empty() || !self.context.pending_inbound_htlcs.is_empty()
-			|| !self.context.holding_cell_htlc_updates.is_empty() || self.context.pending_update_fee.is_some()
-			|| self.context.channel_state.is_monitor_update_in_progress() || !self.context.blocked_monitor_updates.is_empty()
-			|| journal.epoch.slots.first().map(|slot| slot.entry.htlc_id) != Some(self.context.next_holder_htlc_id) {
+		if journal.epoch.phase != crate::ln::ffor::Phase::Negotiating
+			|| onions.len() != journal.epoch.slots.len()
+			|| !self.context.pending_outbound_htlcs.is_empty()
+			|| !self.context.pending_inbound_htlcs.is_empty()
+			|| !self.context.holding_cell_htlc_updates.is_empty()
+			|| self.context.pending_update_fee.is_some()
+			|| self.context.channel_state.is_monitor_update_in_progress()
+			|| !self.context.blocked_monitor_updates.is_empty()
+			|| journal.epoch.slots.first().map(|slot| slot.entry.htlc_id)
+				!= Some(self.context.next_holder_htlc_id)
+		{
 			return Err(invalid());
 		}
 		for (slot, onion) in journal.epoch.slots.iter().zip(onions) {
-			let source = HTLCSource::FforVoucher { channel_id: self.context.channel_id(),
-				epoch_id: journal.epoch.epoch_id, slot: slot.entry.slot };
-			if let Err((_, reason)) = self.queue_add_htlc(slot.entry.amount_msat, PaymentHash(slot.entry.payment_hash),
-				slot.entry.expiry, source, onion, None, None, fee_estimator, logger) {
+			let source = HTLCSource::FforVoucher {
+				channel_id: self.context.channel_id(),
+				epoch_id: journal.epoch.epoch_id,
+				slot: slot.entry.slot,
+			};
+			if let Err((_, reason)) = self.queue_add_htlc(
+				slot.entry.amount_msat,
+				PaymentHash(slot.entry.payment_hash),
+				slot.entry.expiry,
+				source,
+				onion,
+				None,
+				None,
+				fee_estimator,
+				logger,
+			) {
 				// All entries remain in the holding cell until this method returns.
 				// Nothing has been signed or assigned an id, so atomic rollback is safe.
 				self.context.holding_cell_htlc_updates.clear();
@@ -13034,29 +13302,38 @@ where
 		Ok(())
 	}
 
-
 	/// Discard only unassigned setup offers after their abort is durable. Already
 	/// committed vouchers remain normal outbound HTLCs until the peer removes them.
 	pub(super) fn cancel_ffor_setup_vouchers(&mut self) -> Result<(), ChannelError> {
-		let journal = self.ffor_journal.as_ref().ok_or_else(||
-			ChannelError::Ignore("No FFOR setup to cancel".to_owned()))?;
+		let journal = self
+			.ffor_journal
+			.as_ref()
+			.ok_or_else(|| ChannelError::Ignore("No FFOR setup to cancel".to_owned()))?;
 		if journal.epoch.phase != crate::ln::ffor::Phase::Aborted {
 			return Err(ChannelError::Ignore("Cannot cancel a live FFOR book".to_owned()));
 		}
 		let epoch_id = journal.epoch.epoch_id;
 		let channel_id = self.context.channel_id();
-		self.context.holding_cell_htlc_updates.retain(|update| !matches!(update,
+		self.context.holding_cell_htlc_updates.retain(|update| {
+			!matches!(update,
 			HTLCUpdateAwaitingACK::AddHTLC { source: HTLCSource::FforVoucher {
 				channel_id: source_channel, epoch_id: source_epoch, .. }, .. }
-				if *source_channel == channel_id && *source_epoch == epoch_id));
-		if self.context.channel_state.is_quiescent() { self.exit_quiescence(); }
+				if *source_channel == channel_id && *source_epoch == epoch_id)
+		});
+		if self.context.channel_state.is_quiescent() {
+			self.exit_quiescence();
+		}
 		Ok(())
 	}
 
 	/// Two-view irrevocable removal evidence. A chain resolution must use separate
 	/// evidence; it cannot be represented by invented commitment counters.
-	pub(super) fn ffor_voucher_removal<L: Deref>(&self, slot_id: u16, fulfilled: bool,
-		logger: &L) -> Option<crate::ln::ffor::Removal> where L::Target: Logger {
+	pub(super) fn ffor_voucher_removal<L: Deref>(
+		&self, slot_id: u16, fulfilled: bool, logger: &L,
+	) -> Option<crate::ln::ffor::Removal>
+	where
+		L::Target: Logger,
+	{
 		let journal = self.ffor_journal.as_ref()?;
 		let slot = journal.epoch.slots.iter().find(|slot| slot.entry.slot == slot_id)?;
 		if self.context.channel_state.is_awaiting_remote_revoke()
@@ -13067,125 +13344,257 @@ where
 				HTLCUpdateAwaitingACK::AddHTLC { payment_hash, .. } if payment_hash.0 == slot.entry.payment_hash)) {
 			return None;
 		}
-		if fulfilled && !slot.redeemed { return None; }
-		if !fulfilled && journal.epoch.phase != crate::ln::ffor::Phase::Aborted { return None; }
+		if fulfilled && !slot.redeemed {
+			return None;
+		}
+		if !fulfilled && journal.epoch.phase != crate::ln::ffor::Phase::Aborted {
+			return None;
+		}
 		let local_number = self.get_cur_holder_commitment_transaction_number();
 		let remote_number = self.get_cur_counterparty_commitment_transaction_number();
-		let holder = self.context.build_commitment_transaction(&self.funding, local_number,
-			&self.holder_commitment_point.current_point()?, true, false, logger);
-		let remote = self.context.build_commitment_transaction(&self.funding, remote_number,
-			&self.context.counterparty_current_commitment_point?, false, true, logger);
-		if holder.tx.nondust_htlcs().iter().chain(remote.tx.nondust_htlcs())
-			.any(|htlc| htlc.payment_hash.0 == slot.entry.payment_hash) { return None; }
-		Some(crate::ln::ffor::Removal { fulfilled,
+		let holder = self.context.build_commitment_transaction(
+			&self.funding,
+			local_number,
+			&self.holder_commitment_point.current_point()?,
+			true,
+			false,
+			logger,
+		);
+		let remote = self.context.build_commitment_transaction(
+			&self.funding,
+			remote_number,
+			&self.context.counterparty_current_commitment_point?,
+			false,
+			true,
+			logger,
+		);
+		if holder
+			.tx
+			.nondust_htlcs()
+			.iter()
+			.chain(remote.tx.nondust_htlcs())
+			.any(|htlc| htlc.payment_hash.0 == slot.entry.payment_hash)
+		{
+			return None;
+		}
+		Some(crate::ln::ffor::Removal {
+			fulfilled,
 			local_commitment: INITIAL_COMMITMENT_NUMBER - local_number,
-			remote_commitment: INITIAL_COMMITMENT_NUMBER - remote_number })
+			remote_commitment: INITIAL_COMMITMENT_NUMBER - remote_number,
+		})
 	}
 
 	fn ffor_book_live(&self) -> bool {
-		self.ffor_journal.as_ref().is_some_and(|j| !matches!(j.epoch.phase,
-			crate::ln::ffor::Phase::Aborted | crate::ln::ffor::Phase::Closed))
+		self.ffor_journal.as_ref().is_some_and(|j| {
+			!matches!(
+				j.epoch.phase,
+				crate::ln::ffor::Phase::Aborted | crate::ln::ffor::Phase::Closed
+			)
+		})
 	}
 
-	fn validate_ffor_voucher_subset(&self, tx: &CommitmentTransaction, local: bool) -> Result<(), ChannelError> {
+	fn validate_ffor_voucher_subset(
+		&self, tx: &CommitmentTransaction, local: bool,
+	) -> Result<(), ChannelError> {
 		use crate::ln::ffor::Phase;
-		let Some(journal) = self.ffor_journal.as_ref() else { return Ok(()); };
-		if !matches!(journal.epoch.phase, Phase::Active | Phase::Draining) { return Ok(()); }
+		let Some(journal) = self.ffor_journal.as_ref() else {
+			return Ok(());
+		};
+		if !matches!(journal.epoch.phase, Phase::Active | Phase::Draining) {
+			return Ok(());
+		}
 		for slot in &journal.epoch.slots {
 			let entry = &slot.entry;
-			let pending = self.context.pending_outbound_htlcs.iter().find(|htlc| htlc.htlc_id == entry.htlc_id);
-			let invalid = || ChannelError::close("Native commitment does not preserve a reserved FFOR voucher".to_owned());
+			let pending = self
+				.context
+				.pending_outbound_htlcs
+				.iter()
+				.find(|htlc| htlc.htlc_id == entry.htlc_id);
+			let invalid = || {
+				ChannelError::close(
+					"Native commitment does not preserve a reserved FFOR voucher".to_owned(),
+				)
+			};
 			let Some(pending) = pending else {
-				if slot.redeemed || slot.removal.as_ref().is_some_and(|r| r.fulfilled) { continue; }
+				if slot.redeemed || slot.removal.as_ref().is_some_and(|r| r.fulfilled) {
+					continue;
+				}
 				return Err(invalid());
 			};
-			if pending.payment_hash.0 != entry.payment_hash || pending.amount_msat != entry.amount_msat
-				|| pending.cltv_expiry != entry.expiry { return Err(invalid()); }
+			if pending.payment_hash.0 != entry.payment_hash
+				|| pending.amount_msat != entry.amount_msat
+				|| pending.cltv_expiry != entry.expiry
+			{
+				return Err(invalid());
+			}
 			match &pending.state {
 				OutboundHTLCState::Committed => {
-					if !tx.nondust_htlcs().iter().any(|h| h.offered == local && h.payment_hash.0 == entry.payment_hash
-						&& h.amount_msat == entry.amount_msat && h.cltv_expiry == entry.expiry
-						&& h.transaction_output_index.is_some()) { return Err(invalid()); }
+					if !tx.nondust_htlcs().iter().any(|h| {
+						h.offered == local
+							&& h.payment_hash.0 == entry.payment_hash
+							&& h.amount_msat == entry.amount_msat
+							&& h.cltv_expiry == entry.expiry
+							&& h.transaction_output_index.is_some()
+					}) {
+						return Err(invalid());
+					}
 				},
 				OutboundHTLCState::RemoteRemoved(OutboundHTLCOutcome::Success(..))
-				| OutboundHTLCState::AwaitingRemoteRevokeToRemove(OutboundHTLCOutcome::Success(..))
-				| OutboundHTLCState::AwaitingRemovedRemoteRevoke(OutboundHTLCOutcome::Success(..)) => {},
+				| OutboundHTLCState::AwaitingRemoteRevokeToRemove(OutboundHTLCOutcome::Success(
+					..,
+				))
+				| OutboundHTLCState::AwaitingRemovedRemoteRevoke(OutboundHTLCOutcome::Success(
+					..,
+				)) => {},
 				_ => return Err(invalid()),
 			}
 		}
 		Ok(())
 	}
 
-
-	pub(super) fn ffor_commitment_snapshot<L: Deref>(&self, epoch: &crate::ln::ffor::SettlerEpoch,
-		logger: &L) -> Result<crate::ln::ffor_monitor::CommitmentSnapshot, ChannelError>
-	where L::Target: Logger {
+	pub(super) fn ffor_commitment_snapshot<L: Deref>(
+		&self, epoch: &crate::ln::ffor::SettlerEpoch, logger: &L,
+	) -> Result<crate::ln::ffor_monitor::CommitmentSnapshot, ChannelError>
+	where
+		L::Target: Logger,
+	{
 		use crate::ln::ffor_monitor::{CommitmentSnapshot, VoucherOutput};
-		let invalid = || ChannelError::Ignore("FFOR requires an irrevocable quiescent voucher book".to_owned());
-		if epoch.channel_id != self.context.channel_id().0 || epoch.remote_node != self.context.get_counterparty_node_id()
-			|| !self.context.is_live() || self.is_shutdown() || self.pending_splice.is_some()
-			|| self.quiescent_action.is_some() || !self.context.channel_state.is_quiescent()
+		let invalid = || {
+			ChannelError::Ignore("FFOR requires an irrevocable quiescent voucher book".to_owned())
+		};
+		if epoch.channel_id != self.context.channel_id().0
+			|| epoch.remote_node != self.context.get_counterparty_node_id()
+			|| !self.context.is_live()
+			|| self.is_shutdown()
+			|| self.pending_splice.is_some()
+			|| self.quiescent_action.is_some()
+			|| !self.context.channel_state.is_quiescent()
 			|| self.context.channel_state.is_awaiting_remote_revoke()
 			|| self.context.channel_state.is_monitor_update_in_progress()
-			|| !self.context.blocked_monitor_updates.is_empty() || !self.context.pending_inbound_htlcs.is_empty()
-			|| !self.context.holding_cell_htlc_updates.is_empty() || self.context.pending_update_fee.is_some()
+			|| !self.context.blocked_monitor_updates.is_empty()
+			|| !self.context.pending_inbound_htlcs.is_empty()
+			|| !self.context.holding_cell_htlc_updates.is_empty()
+			|| self.context.pending_update_fee.is_some()
 			|| self.context.holding_cell_update_fee.is_some()
-			|| self.context.pending_outbound_htlcs.len() != epoch.slots.len() { return Err(invalid()); }
+			|| self.context.pending_outbound_htlcs.len() != epoch.slots.len()
+		{
+			return Err(invalid());
+		}
 		for slot in &epoch.slots {
-			if !self.context.pending_outbound_htlcs.iter().any(|htlc|
-				htlc.htlc_id == slot.entry.htlc_id && htlc.payment_hash.0 == slot.entry.payment_hash
-					&& htlc.amount_msat == slot.entry.amount_msat && htlc.cltv_expiry == slot.entry.expiry
-					&& matches!(htlc.state, OutboundHTLCState::Committed)) { return Err(invalid()); }
+			if !self.context.pending_outbound_htlcs.iter().any(|htlc| {
+				htlc.htlc_id == slot.entry.htlc_id
+					&& htlc.payment_hash.0 == slot.entry.payment_hash
+					&& htlc.amount_msat == slot.entry.amount_msat
+					&& htlc.cltv_expiry == slot.entry.expiry
+					&& matches!(htlc.state, OutboundHTLCState::Committed)
+			}) {
+				return Err(invalid());
+			}
 		}
 		let local_number = self.get_cur_holder_commitment_transaction_number();
 		let remote_number = self.get_cur_counterparty_commitment_transaction_number();
-		let holder = self.context.build_commitment_transaction(&self.funding, local_number,
-			&self.holder_commitment_point.current_point().ok_or_else(invalid)?, true, false, logger);
-		let remote = self.context.build_commitment_transaction(&self.funding, remote_number,
-			&self.context.counterparty_current_commitment_point.ok_or_else(invalid)?, false, true, logger);
-		if holder.tx.nondust_htlcs().len() != epoch.slots.len() || remote.tx.nondust_htlcs().len() != epoch.slots.len() {
+		let holder = self.context.build_commitment_transaction(
+			&self.funding,
+			local_number,
+			&self.holder_commitment_point.current_point().ok_or_else(invalid)?,
+			true,
+			false,
+			logger,
+		);
+		let remote = self.context.build_commitment_transaction(
+			&self.funding,
+			remote_number,
+			&self.context.counterparty_current_commitment_point.ok_or_else(invalid)?,
+			false,
+			true,
+			logger,
+		);
+		if holder.tx.nondust_htlcs().len() != epoch.slots.len()
+			|| remote.tx.nondust_htlcs().len() != epoch.slots.len()
+		{
 			return Err(invalid());
 		}
 		let mut outputs = Vec::with_capacity(epoch.slots.len());
 		for slot in &epoch.slots {
-			let find = |htlc: &&HTLCOutputInCommitment| htlc.payment_hash.0 == slot.entry.payment_hash
-				&& htlc.amount_msat == slot.entry.amount_msat && htlc.cltv_expiry == slot.entry.expiry;
+			let find = |htlc: &&HTLCOutputInCommitment| {
+				htlc.payment_hash.0 == slot.entry.payment_hash
+					&& htlc.amount_msat == slot.entry.amount_msat
+					&& htlc.cltv_expiry == slot.entry.expiry
+			};
 			let local = holder.tx.nondust_htlcs().iter().find(find).ok_or_else(invalid)?;
 			let peer = remote.tx.nondust_htlcs().iter().find(find).ok_or_else(invalid)?;
-			outputs.push(VoucherOutput { entry: slot.entry.clone(),
+			outputs.push(VoucherOutput {
+				entry: slot.entry.clone(),
 				settler_output_index: local.transaction_output_index.ok_or_else(invalid)?,
-				receiver_output_index: peer.transaction_output_index.ok_or_else(invalid)?, });
+				receiver_output_index: peer.transaction_output_index.ok_or_else(invalid)?,
+			});
 		}
-		Ok(CommitmentSnapshot { funding_txo: self.funding.channel_transaction_parameters.funding_outpoint.ok_or_else(invalid)?,
-			settler_number: INITIAL_COMMITMENT_NUMBER - local_number, settler_txid: holder.tx.trust().txid(),
-			receiver_number: INITIAL_COMMITMENT_NUMBER - remote_number, receiver_txid: remote.tx.trust().txid(), outputs })
+		Ok(CommitmentSnapshot {
+			funding_txo: self
+				.funding
+				.channel_transaction_parameters
+				.funding_outpoint
+				.ok_or_else(invalid)?,
+			settler_number: INITIAL_COMMITMENT_NUMBER - local_number,
+			settler_txid: holder.tx.trust().txid(),
+			receiver_number: INITIAL_COMMITMENT_NUMBER - remote_number,
+			receiver_txid: remote.tx.trust().txid(),
+			outputs,
+		})
 	}
 
 	/// The caller must register the completion token before passing this update to
 	/// its monitor. No signed response or voucher may be sent before completion.
-	pub(super) fn persist_ffor_journal<L: Deref>(&mut self, journal: crate::ln::ffor_monitor::FforJournal,
-		logger: &L) -> Result<(Option<ChannelMonitorUpdate>, crate::ln::ffor_monitor::FforPersistenceToken), ChannelError>
-	where L::Target: Logger {
+	pub(super) fn persist_ffor_journal<L: Deref>(
+		&mut self, journal: crate::ln::ffor_monitor::FforJournal, logger: &L,
+	) -> Result<
+		(Option<ChannelMonitorUpdate>, crate::ln::ffor_monitor::FforPersistenceToken),
+		ChannelError,
+	>
+	where
+		L::Target: Logger,
+	{
 		use crate::ln::ffor::Phase;
 		let invalid = || ChannelError::Ignore("Invalid native FFOR custody transition".to_owned());
 		journal.validate_transition(self.ffor_journal.as_ref()).map_err(|_| invalid())?;
 		if journal.epoch.channel_id != self.context.channel_id().0
-			|| journal.epoch.remote_node != self.context.get_counterparty_node_id() { return Err(invalid()); }
-		if self.ffor_journal.as_ref().map_or(true, |old| old.epoch.epoch_id != journal.epoch.epoch_id)
-			&& (!self.can_setup_ffor() || journal.epoch.slots.first().map(|slot| slot.entry.htlc_id)
-				!= Some(self.context.next_holder_htlc_id)) { return Err(invalid()); }
+			|| journal.epoch.remote_node != self.context.get_counterparty_node_id()
+		{
+			return Err(invalid());
+		}
+		if self
+			.ffor_journal
+			.as_ref()
+			.map_or(true, |old| old.epoch.epoch_id != journal.epoch.epoch_id)
+			&& (!self.can_setup_ffor()
+				|| journal.epoch.slots.first().map(|slot| slot.entry.htlc_id)
+					!= Some(self.context.next_holder_htlc_id))
+		{
+			return Err(invalid());
+		}
 		if let Some(snapshot) = &journal.activation_snapshot {
-			if self.ffor_journal.as_ref().map_or(true, |old| old.activation_snapshot.is_none()
-				|| old.epoch.phase != Phase::Active && journal.epoch.phase == Phase::Active) {
-				if &self.ffor_commitment_snapshot(&journal.epoch, logger)? != snapshot { return Err(invalid()); }
+			if self.ffor_journal.as_ref().map_or(true, |old| {
+				old.activation_snapshot.is_none()
+					|| old.epoch.phase != Phase::Active && journal.epoch.phase == Phase::Active
+			}) {
+				if &self.ffor_commitment_snapshot(&journal.epoch, logger)? != snapshot {
+					return Err(invalid());
+				}
 			}
 		}
 		self.context.latest_monitor_update_id += 1;
-		let token = crate::ln::ffor_monitor::FforPersistenceToken { channel_id: self.context.channel_id(),
-			epoch_id: journal.epoch.epoch_id, revision: journal.revision, update_id: self.context.latest_monitor_update_id };
+		let token = crate::ln::ffor_monitor::FforPersistenceToken {
+			channel_id: self.context.channel_id(),
+			epoch_id: journal.epoch.epoch_id,
+			revision: journal.revision,
+			update_id: self.context.latest_monitor_update_id,
+		};
 		self.ffor_journal = Some(journal.clone());
-		let update = ChannelMonitorUpdate { update_id: token.update_id, channel_id: Some(token.channel_id),
-			updates: vec![ChannelMonitorUpdateStep::FforJournal { journal }] };
+		let update = ChannelMonitorUpdate {
+			update_id: token.update_id,
+			channel_id: Some(token.channel_id),
+			updates: vec![ChannelMonitorUpdateStep::FforJournal { journal }],
+		};
 		self.monitor_updating_paused(false, false, false, Vec::new(), Vec::new(), Vec::new());
 		Ok((self.push_ret_blockable_mon_update(update), token))
 	}
@@ -13193,7 +13602,8 @@ where
 	/// Whether a funding transition still requires resolution before another wallet
 	/// funding operation may start. Disconnection alone is not a funding transition.
 	pub(super) fn has_pending_funding_operation(&self) -> bool {
-		self.pending_splice.is_some() || self.quiescent_action.is_some()
+		self.pending_splice.is_some()
+			|| self.quiescent_action.is_some()
 			|| self.context.channel_state.is_awaiting_quiescence()
 			|| self.context.channel_state.is_quiescent()
 			|| self.context.channel_state.is_remote_stfu_sent()
@@ -13205,25 +13615,35 @@ where
 	pub(super) fn can_intercept_liquidity_shortfall<F: Deref>(
 		&self, amount_msat: u64, fee_estimator: &LowerBoundedFeeEstimator<F>,
 	) -> bool
-	where F::Target: FeeEstimator {
-		if !self.context.is_live() || self.is_shutdown() || self.pending_splice.is_some()
-			|| self.quiescent_action.is_some() || self.context.channel_state.is_awaiting_quiescence()
-			|| self.context.channel_state.is_quiescent() || self.context.channel_state.is_remote_stfu_sent()
-			|| amount_msat == 0 || amount_msat >= TOTAL_BITCOIN_SUPPLY_SATOSHIS * 1000
+	where
+		F::Target: FeeEstimator,
+	{
+		if !self.context.is_live()
+			|| self.is_shutdown()
+			|| self.pending_splice.is_some()
+			|| self.quiescent_action.is_some()
+			|| self.context.channel_state.is_awaiting_quiescence()
+			|| self.context.channel_state.is_quiescent()
+			|| self.context.channel_state.is_remote_stfu_sent()
+			|| amount_msat == 0
+			|| amount_msat >= TOTAL_BITCOIN_SUPPLY_SATOSHIS * 1000
 		{
 			return false;
 		}
 		let current = self.get_available_balances(fee_estimator);
 		// Deliberately exclude fee-only shortages for the initial policy.
 		if amount_msat <= current.outbound_capacity_msat
-			|| amount_msat < self.context.counterparty_htlc_minimum_msat {
+			|| amount_msat < self.context.counterparty_htlc_minimum_msat
+		{
 			return false;
 		}
 		// Use the exact existing fee, dust, HTLC count and in-flight calculations
 		// with only local liquidity lifted. In particular, the remote funder's
 		// inability to pay commitment fees is not repaired by this simulation.
 		let funded = self.context.get_available_balances_with_extra_local_capacity(
-			&self.funding, fee_estimator, TOTAL_BITCOIN_SUPPLY_SATOSHIS * 1000,
+			&self.funding,
+			fee_estimator,
+			TOTAL_BITCOIN_SUPPLY_SATOSHIS * 1000,
 		);
 		amount_msat >= funded.next_outbound_htlc_minimum_msat
 			&& amount_msat <= funded.next_outbound_htlc_limit_msat
@@ -13506,7 +13926,11 @@ where
 		(msgs::Shutdown, Option<ChannelMonitorUpdate>, Vec<(HTLCSource, PaymentHash)>),
 		APIError,
 	> {
-		if self.ffor_book_live() { return Err(APIError::APIMisuseError { err: "Cannot cooperatively close while an FFOR voucher book is live".to_owned() }); }
+		if self.ffor_book_live() {
+			return Err(APIError::APIMisuseError {
+				err: "Cannot cooperatively close while an FFOR voucher book is live".to_owned(),
+			});
+		}
 
 		if self.context.channel_state.is_local_stfu_sent()
 			|| self.context.channel_state.is_remote_stfu_sent()
@@ -14651,6 +15075,82 @@ where
 		Ok(chan)
 	}
 
+	pub fn set_external_funding_parameters(
+		&mut self, change_script: ScriptBuf, funding_feerate_per_kw: u32,
+	) -> Result<(), APIError> {
+		if funding_feerate_per_kw < 253 || change_script.is_empty() || change_script.len() > 520 {
+			return Err(APIError::APIMisuseError {
+				err: "Invalid external funding fee rate or change script".to_owned(),
+			});
+		}
+		check_v2_funding_inputs_sufficient(
+			self.funding_negotiation_context.our_funding_contribution.to_sat(),
+			&self.funding_negotiation_context.our_funding_inputs,
+			true,
+			false,
+			funding_feerate_per_kw,
+		)
+		.map_err(|err| APIError::APIMisuseError { err })?;
+		self.funding_negotiation_context.change_script = Some(change_script);
+		self.funding_negotiation_context.funding_feerate_sat_per_1000_weight =
+			funding_feerate_per_kw;
+		Ok(())
+	}
+
+	pub fn accept_channel_v2<ES: Deref>(
+		&mut self, msg: &msgs::AcceptChannelV2, limits: &ChannelHandshakeLimits,
+		their_features: &InitFeatures, signer_provider: &SP, entropy_source: &ES,
+		holder_node_id: PublicKey,
+	) -> Result<InteractiveTxMessageSend, ChannelError>
+	where
+		ES::Target: EntropySource,
+	{
+		// This explicit external-funding API contributes the complete channel amount. Admitting a
+		// second contribution needs separate amount and input policy and is deliberately refused.
+		if msg.funding_satoshis != 0 || msg.common_fields.minimum_depth == 0 {
+			return Err(ChannelError::close(
+				"External v2 funding requires a non-contributing confirmed peer".to_owned(),
+			));
+		}
+		self.funding.holder_selected_channel_reserve_satoshis = get_v2_channel_reserve_satoshis(
+			self.funding.get_value_satoshis(),
+			msg.common_fields.dust_limit_satoshis,
+		)
+		.map_err(|_| ChannelError::close("Peer dust limit exceeds channel value".to_owned()))?;
+		let their_reserve = get_v2_channel_reserve_satoshis(
+			self.funding.get_value_satoshis(),
+			self.context.holder_dust_limit_satoshis,
+		)
+		.map_err(|_| ChannelError::close("Channel value is below its reserve".to_owned()))?;
+		self.context.do_accept_channel_checks(
+			&mut self.funding,
+			limits,
+			their_features,
+			&msg.common_fields,
+			their_reserve,
+		)?;
+		self.context.channel_id = ChannelId::v2_from_revocation_basepoints(
+			&self.funding.get_holder_pubkeys().revocation_basepoint,
+			&self.funding.get_counterparty_pubkeys().revocation_basepoint,
+		);
+		let mut constructor = self
+			.funding_negotiation_context
+			.clone()
+			.into_interactive_tx_constructor(
+				&self.context,
+				&self.funding,
+				signer_provider,
+				entropy_source,
+				holder_node_id,
+			)
+			.map_err(|error| ChannelError::close(error.reason.to_string()))?;
+		let first = constructor
+			.take_initiator_first_message()
+			.ok_or_else(|| ChannelError::close("Missing first funding message".to_owned()))?;
+		self.interactive_tx_constructor = Some(constructor);
+		Ok(first)
+	}
+
 	/// If we receive an error message, it may only be a rejection of the channel type we tried,
 	/// not of our ability to open any channel at all. Thus, on error, we should first call this
 	/// and see if we get a new `OpenChannelV2` message, otherwise the channel is failed.
@@ -14718,7 +15218,7 @@ where
 				}),
 				channel_type: Some(self.funding.get_channel_type().clone()),
 			},
-			funding_feerate_sat_per_1000_weight: self.context.feerate_per_kw,
+			funding_feerate_sat_per_1000_weight: self.funding_negotiation_context.funding_feerate_sat_per_1000_weight,
 			second_per_commitment_point,
 			locktime: self.funding_negotiation_context.funding_tx_locktime.to_consensus_u32(),
 			require_confirmed_inputs: None,
@@ -15846,7 +16346,9 @@ where
 		let mut pending_splice: Option<PendingFunding> = None;
 		let mut quiescent_action = None;
 		let mut ffor_journal: Option<crate::ln::ffor_monitor::FforJournal> = None;
-		let mut splice_conflict_records: Option<Vec<crate::ln::splice_conflict::SpliceConflictRecord>> = None;
+		let mut splice_conflict_records: Option<
+			Vec<crate::ln::splice_conflict::SpliceConflictRecord>,
+		> = None;
 
 		let mut pending_outbound_held_htlc_flags_opt: Option<Vec<Option<()>>> = None;
 		let mut holding_cell_held_htlc_flags_opt: Option<Vec<Option<()>>> = None;
@@ -15902,12 +16404,16 @@ where
 		});
 
 		if let Some(journal) = &ffor_journal {
-			if journal.epoch.channel_id != channel_id.0 || journal.epoch.remote_node != counterparty_node_id {
+			if journal.epoch.channel_id != channel_id.0
+				|| journal.epoch.remote_node != counterparty_node_id
+			{
 				return Err(DecodeError::InvalidValue);
 			}
 		}
 		let holder_signer = signer_provider.derive_channel_signer(channel_keys_id);
-		if channel_parameters.reuse_funding_key_on_splice && !holder_signer.supports_funding_key_reuse() {
+		if channel_parameters.reuse_funding_key_on_splice
+			&& !holder_signer.supports_funding_key_reuse()
+		{
 			return Err(DecodeError::InvalidValue);
 		}
 
@@ -16164,9 +16670,11 @@ where
 
 		if let Some(records) = &splice_conflict_records {
 			if records.len() > crate::ln::splice_conflict::MAX_RETIRED_SPLICES
-				|| records.iter().enumerate().any(|(index, record)| record.channel_id != channel_id
-					|| record.counterparty_node_id != counterparty_node_id
-					|| records[..index].iter().any(|old| old.splice_txid == record.splice_txid)) {
+				|| records.iter().enumerate().any(|(index, record)| {
+					record.channel_id != channel_id
+						|| record.counterparty_node_id != counterparty_node_id
+						|| records[..index].iter().any(|old| old.splice_txid == record.splice_txid)
+				}) {
 				return Err(DecodeError::InvalidValue);
 			}
 		}
@@ -16205,6 +16713,7 @@ where
 				// Note that we don't care about serializing handshake limits as we only ever serialize
 				// channel data after the handshake has completed.
 				inbound_handshake_limits_override: None,
+				retain_counterparty_htlc_limit_for_splicing: false,
 
 				channel_id,
 				temporary_channel_id,
@@ -16395,8 +16904,6 @@ mod tests {
 	use bitcoin::{ScriptBuf, WPubkeyHash, WitnessProgram, WitnessVersion};
 	use std::cmp;
 
-
-
 	#[test]
 	fn test_ffor_active_vouchers_allow_payments_and_guard_funding() {
 		use crate::ln::channelmanager::ffor_manager::tests::activate_native_book;
@@ -16407,13 +16914,17 @@ mod tests {
 		let node_cfgs = create_node_cfgs(2, &chanmon_cfgs);
 		let mut config = test_default_anchors_channel_config();
 		config.channel_handshake_config.announce_for_forwarding = false;
-		let node_chanmgrs = create_node_chanmgrs(2, &node_cfgs, &[Some(config.clone()), Some(config)]);
+		let node_chanmgrs =
+			create_node_chanmgrs(2, &node_cfgs, &[Some(config.clone()), Some(config)]);
 		for manager in &node_chanmgrs {
 			manager.set_ffor_policy(FforPolicy { enabled: true, ..Default::default() }).unwrap();
 		}
 		let nodes = create_network(2, &node_cfgs, &node_chanmgrs);
-		for node in &nodes { connect_blocks(node, 100); }
-		let (funding, id) = open_zero_conf_channel_with_value(&nodes[0], &nodes[1], None, 100_000, 20_000_000);
+		for node in &nodes {
+			connect_blocks(node, 100);
+		}
+		let (funding, id) =
+			open_zero_conf_channel_with_value(&nodes[0], &nodes[1], None, 100_000, 20_000_000);
 		let journal = activate_native_book(&nodes[0], &nodes[1], id, &[2_000_000, 2_000_000]);
 		let peer_id = nodes[1].node.get_our_node_id();
 		// The receiver keeps its vouchers parked while sending an ordinary payment.
@@ -16421,55 +16932,103 @@ mod tests {
 		send_payment(&nodes[1], &[&nodes[0]], 1_000_000);
 		let fees = LowerBoundedFeeEstimator::new(&chanmon_cfgs[0].fee_estimator);
 		{
-			let peer; let mut state;
-			let chan = get_channel_ref!(nodes[0], nodes[1], peer, state, id).as_funded_mut().unwrap();
+			let peer;
+			let mut state;
+			let chan =
+				get_channel_ref!(nodes[0], nodes[1], peer, state, id).as_funded_mut().unwrap();
 			let number = chan.get_cur_holder_commitment_transaction_number();
-			let build = |chan: &FundedChannel<_>| chan.context.build_commitment_transaction(&chan.funding,
-				number, &chan.holder_commitment_point.current_point().unwrap(), true, false, &nodes[0].logger).tx;
+			let build = |chan: &FundedChannel<_>| {
+				chan.context
+					.build_commitment_transaction(
+						&chan.funding,
+						number,
+						&chan.holder_commitment_point.current_point().unwrap(),
+						true,
+						false,
+						&nodes[0].logger,
+					)
+					.tx
+			};
 			let commitment = build(chan);
 			assert_eq!(commitment.nondust_htlcs().len(), 2);
 			assert!(chan.validate_ffor_voucher_subset(&commitment, true).is_ok());
-			assert_ne!(commitment.trust().txid(), journal.activation_snapshot.as_ref().unwrap().settler_txid);
+			assert_ne!(
+				commitment.trust().txid(),
+				journal.activation_snapshot.as_ref().unwrap().settler_txid
+			);
 			let dust = chan.context.holder_dust_limit_satoshis;
 			chan.context.holder_dust_limit_satoshis = 10_000;
-			assert!(chan.validate_ffor_voucher_subset(&build(chan), true).is_err(),
-				"A native commitment cannot trim a reserved voucher");
+			assert!(
+				chan.validate_ffor_voucher_subset(&build(chan), true).is_err(),
+				"A native commitment cannot trim a reserved voucher"
+			);
 			chan.context.holder_dust_limit_satoshis = dust;
 			let feerate = chan.context.feerate_per_kw;
 			assert!(chan.send_update_fee(feerate + 1000, true, &fees, &nodes[0].logger).is_none());
-			assert!(chan.update_fee(&fees, &msgs::UpdateFee { channel_id: id, feerate_per_kw: feerate + 1000 },
-				&nodes[0].logger).is_err());
+			assert!(chan
+				.update_fee(
+					&fees,
+					&msgs::UpdateFee { channel_id: id, feerate_per_kw: feerate + 1000 },
+					&nodes[0].logger
+				)
+				.is_err());
 			assert_eq!(chan.context.feerate_per_kw, feerate);
 			assert!(chan.context.pending_update_fee.is_none());
-			let splice = msgs::SpliceInit { channel_id: id, funding_contribution_satoshis: 1000,
-				funding_feerate_per_kw: 1000, locktime: 100, funding_pubkey: peer_id,
-				require_confirmed_inputs: None, lock_depth: Some(6) };
-			assert!(chan.validate_splice_init(&splice, bitcoin::SignedAmount::ZERO, Some(6)).is_err());
+			let splice = msgs::SpliceInit {
+				channel_id: id,
+				funding_contribution_satoshis: 1000,
+				funding_feerate_per_kw: 1000,
+				locktime: 100,
+				funding_pubkey: peer_id,
+				require_confirmed_inputs: None,
+				lock_depth: Some(6),
+			};
+			assert!(chan
+				.validate_splice_init(&splice, bitcoin::SignedAmount::ZERO, Some(6))
+				.is_err());
 			assert!(chan.pending_splice.is_none());
 		}
 		assert!(nodes[0].node.close_channel(&id, &peer_id).is_err());
 		nodes[0].node.peer_disconnected(peer_id);
 		nodes[1].node.peer_disconnected(nodes[0].node.get_our_node_id());
 		{
-			let peer; let mut state;
-			let chan = get_channel_ref!(nodes[0], nodes[1], peer, state, id).as_funded_mut().unwrap();
+			let peer;
+			let mut state;
+			let chan =
+				get_channel_ref!(nodes[0], nodes[1], peer, state, id).as_funded_mut().unwrap();
 			assert!(chan.ffor_book_live());
-			assert!(!chan.ffor_journal().unwrap().epoch.capability_hold,
-				"Ordinary offline operation must retain delegated admission");
+			assert!(
+				!chan.ffor_journal().unwrap().epoch.capability_hold,
+				"Ordinary offline operation must retain delegated admission"
+			);
 			assert!(chan.send_update_fee(5000, true, &fees, &nodes[0].logger).is_none());
 			assert!(chan.cancel_ffor_setup_vouchers().is_err());
 		}
-		nodes[0].node.force_close_broadcasting_latest_txn(&id, &peer_id, "Native custody regression".to_owned()).unwrap();
+		nodes[0]
+			.node
+			.force_close_broadcasting_latest_txn(
+				&id,
+				&peer_id,
+				"Native custody regression".to_owned(),
+			)
+			.unwrap();
 		check_added_monitors!(nodes[0], 1);
 		let monitor = get_monitor!(nodes[0], id);
 		let commitments = monitor.unsafe_get_latest_holder_commitment_txn(&nodes[0].logger);
 		check_spends!(&commitments[0], funding);
 		let durable = monitor.get_ffor_journal().unwrap();
 		assert_eq!(durable.epoch.epoch_id, journal.epoch.epoch_id);
-		assert!(durable.epoch.slots.iter().all(|slot| slot.state == crate::ln::ffor::SlotState::Unused));
-		let (_, restored) = <(bitcoin::BlockHash, crate::chain::channelmonitor::ChannelMonitor<_>)>::read(
-			&mut crate::io::Cursor::new(monitor.encode()),
-			(&nodes[0].keys_manager.backing, &nodes[0].keys_manager.backing)).unwrap();
+		assert!(durable
+			.epoch
+			.slots
+			.iter()
+			.all(|slot| slot.state == crate::ln::ffor::SlotState::Unused));
+		let (_, restored) =
+			<(bitcoin::BlockHash, crate::chain::channelmonitor::ChannelMonitor<_>)>::read(
+				&mut crate::io::Cursor::new(monitor.encode()),
+				(&nodes[0].keys_manager.backing, &nodes[0].keys_manager.backing),
+			)
+			.unwrap();
 		assert_eq!(restored.get_ffor_journal(), Some(durable));
 		drop(monitor);
 		nodes[0].node.get_and_clear_pending_events();
@@ -16486,13 +17045,16 @@ mod tests {
 		let mut config = test_default_channel_config();
 		config.manually_accept_inbound_channels = true;
 		config.channel_handshake_config.negotiate_anchors_zero_fee_htlc_tx = true;
-		let node_chanmgrs = create_node_chanmgrs(2, &node_cfgs, &[Some(config.clone()), Some(config)]);
+		let node_chanmgrs =
+			create_node_chanmgrs(2, &node_cfgs, &[Some(config.clone()), Some(config)]);
 		let nodes = create_network(2, &node_cfgs, &node_chanmgrs);
 		let id = create_announced_chan_between_nodes(&nodes, 0, 1).2;
 		let fees = LowerBoundedFeeEstimator::new(&chanmon_cfgs[0].fee_estimator);
 		{
-			let peer; let mut state;
-			let chan = get_channel_ref!(nodes[0], nodes[1], peer, state, id).as_funded_mut().unwrap();
+			let peer;
+			let mut state;
+			let chan =
+				get_channel_ref!(nodes[0], nodes[1], peer, state, id).as_funded_mut().unwrap();
 			assert!(chan.can_setup_ffor());
 			chan.context.channel_state.set_awaiting_quiescence();
 			assert!(!chan.can_setup_ffor());
@@ -16500,24 +17062,51 @@ mod tests {
 			assert!(chan.can_setup_ffor());
 			let signer = crate::sign::KeysManager::new(&nodes[0].node_seed, 0, 0, true);
 			let receiver = crate::sign::KeysManager::new(&nodes[1].node_seed, 0, 0, true);
-			let init = ffor::tests::init_for(id.0, [49; 32], &receiver.get_node_secret_key(),
-				100, &[2_000_000, 2_000_000], 0, 0);
+			let init = ffor::tests::init_for(
+				id.0,
+				[49; 32],
+				&receiver.get_node_secret_key(),
+				100,
+				&[2_000_000, 2_000_000],
+				0,
+				0,
+			);
 			let context = chan.ffor_setup_context(100, true, 2, &fees);
-			let policy = ffor::Policy { max_slots: 2, max_budget_msat: 4_000_000,
-				max_epoch_blocks: 2000, min_fee_base_msat: 0, min_fee_ppm: 0 };
-			let setup = ffor::prepare_setup(None, init, &context, &policy, &signer, &signer).unwrap();
-			let (update, _) = chan.persist_ffor_journal(setup.journal.clone(), &nodes[0].logger).unwrap();
-			assert_eq!(nodes[0].chain_monitor.update_channel(id, &update.unwrap()),
-				crate::chain::ChannelMonitorUpdateStatus::Completed);
-				chan.monitor_updating_restored(&nodes[0].logger, &nodes[0].keys_manager,
-					ChainHash::using_genesis_block(Network::Testnet), &nodes[0].node.get_current_config(),
-					nodes[0].best_block_info().1, |_| panic!("Unexpected blinded release path"));
-			let onion = msgs::OnionPacket { version: 0, public_key: Ok(test_utils::pubkey(1)),
-				hop_data: [0; 1300], hmac: [0; 32] };
+			let policy = ffor::Policy {
+				max_slots: 2,
+				max_budget_msat: 4_000_000,
+				max_epoch_blocks: 2000,
+				min_fee_base_msat: 0,
+				min_fee_ppm: 0,
+			};
+			let setup =
+				ffor::prepare_setup(None, init, &context, &policy, &signer, &signer).unwrap();
+			let (update, _) =
+				chan.persist_ffor_journal(setup.journal.clone(), &nodes[0].logger).unwrap();
+			assert_eq!(
+				nodes[0].chain_monitor.update_channel(id, &update.unwrap()),
+				crate::chain::ChannelMonitorUpdateStatus::Completed
+			);
+			chan.monitor_updating_restored(
+				&nodes[0].logger,
+				&nodes[0].keys_manager,
+				ChainHash::using_genesis_block(Network::Testnet),
+				&nodes[0].node.get_current_config(),
+				nodes[0].best_block_info().1,
+				|_| panic!("Unexpected blinded release path"),
+			);
+			let onion = msgs::OnionPacket {
+				version: 0,
+				public_key: Ok(test_utils::pubkey(1)),
+				hop_data: [0; 1300],
+				hmac: [0; 32],
+			};
 			let first_id = chan.ffor_next_voucher_htlc_id();
 			let limit = chan.context.counterparty_max_accepted_htlcs;
 			chan.context.counterparty_max_accepted_htlcs = 1;
-			assert!(chan.queue_ffor_vouchers(vec![onion.clone(), onion.clone()], &fees, &nodes[0].logger).is_err());
+			assert!(chan
+				.queue_ffor_vouchers(vec![onion.clone(), onion.clone()], &fees, &nodes[0].logger)
+				.is_err());
 			assert!(chan.context.holding_cell_htlc_updates.is_empty());
 			assert_eq!(chan.ffor_next_voucher_htlc_id(), first_id);
 			chan.context.counterparty_max_accepted_htlcs = limit;
@@ -16528,11 +17117,18 @@ mod tests {
 			assert!(chan.ffor_commitment_snapshot(&setup.journal.epoch, &nodes[0].logger).is_err());
 			let abort = ffor::prepare_abort(&setup.journal, 1, &signer).unwrap();
 			let (update, _) = chan.persist_ffor_journal(abort.journal, &nodes[0].logger).unwrap();
-			assert_eq!(nodes[0].chain_monitor.update_channel(id, &update.unwrap()),
-				crate::chain::ChannelMonitorUpdateStatus::Completed);
-				chan.monitor_updating_restored(&nodes[0].logger, &nodes[0].keys_manager,
-					ChainHash::using_genesis_block(Network::Testnet), &nodes[0].node.get_current_config(),
-					nodes[0].best_block_info().1, |_| panic!("Unexpected blinded release path"));
+			assert_eq!(
+				nodes[0].chain_monitor.update_channel(id, &update.unwrap()),
+				crate::chain::ChannelMonitorUpdateStatus::Completed
+			);
+			chan.monitor_updating_restored(
+				&nodes[0].logger,
+				&nodes[0].keys_manager,
+				ChainHash::using_genesis_block(Network::Testnet),
+				&nodes[0].node.get_current_config(),
+				nodes[0].best_block_info().1,
+				|_| panic!("Unexpected blinded release path"),
+			);
 			chan.cancel_ffor_setup_vouchers().unwrap();
 			assert!(chan.context.holding_cell_htlc_updates.is_empty());
 			assert_eq!(chan.ffor_next_voucher_htlc_id(), first_id);
@@ -16541,18 +17137,31 @@ mod tests {
 			for slot in 1..=2 {
 				let removal = chan.ffor_voucher_removal(slot, false, &nodes[0].logger).unwrap();
 				let prior = chan.ffor_journal().unwrap().clone();
-				let removed = ffor::prepare_voucher_result(&prior, slot, None, Some(removal)).unwrap();
-				let (update, _) = chan.persist_ffor_journal(removed.journal, &nodes[0].logger).unwrap();
-				assert_eq!(nodes[0].chain_monitor.update_channel(id, &update.unwrap()),
-					crate::chain::ChannelMonitorUpdateStatus::Completed);
-				chan.monitor_updating_restored(&nodes[0].logger, &nodes[0].keys_manager,
-					ChainHash::using_genesis_block(Network::Testnet), &nodes[0].node.get_current_config(),
-					nodes[0].best_block_info().1, |_| panic!("Unexpected blinded release path"));
+				let removed =
+					ffor::prepare_voucher_result(&prior, slot, None, Some(removal)).unwrap();
+				let (update, _) =
+					chan.persist_ffor_journal(removed.journal, &nodes[0].logger).unwrap();
+				assert_eq!(
+					nodes[0].chain_monitor.update_channel(id, &update.unwrap()),
+					crate::chain::ChannelMonitorUpdateStatus::Completed
+				);
+				chan.monitor_updating_restored(
+					&nodes[0].logger,
+					&nodes[0].keys_manager,
+					ChainHash::using_genesis_block(Network::Testnet),
+					&nodes[0].node.get_current_config(),
+					nodes[0].best_block_info().1,
+					|_| panic!("Unexpected blinded release path"),
+				);
 			}
 		}
 		{
-			let peer; let mut state;
-			get_channel_ref!(nodes[1], nodes[0], peer, state, id).as_funded_mut().unwrap().exit_quiescence();
+			let peer;
+			let mut state;
+			get_channel_ref!(nodes[1], nodes[0], peer, state, id)
+				.as_funded_mut()
+				.unwrap()
+				.exit_quiescence();
 		}
 		check_added_monitors!(nodes[0], 4);
 	}
@@ -16565,13 +17174,17 @@ mod tests {
 		let node_cfgs = create_node_cfgs(2, &chanmon_cfgs);
 		let mut config = test_default_channel_config();
 		config.channel_handshake_config.max_inbound_htlc_value_in_flight_percent_of_channel = 100;
-		let node_chanmgrs = create_node_chanmgrs(2, &node_cfgs, &[Some(config.clone()), Some(config)]);
+		let node_chanmgrs =
+			create_node_chanmgrs(2, &node_cfgs, &[Some(config.clone()), Some(config)]);
 		let nodes = create_network(2, &node_cfgs, &node_chanmgrs);
-		let (_, _, id, _) = create_announced_chan_between_nodes_with_value(&nodes, 0, 1, 1_000_000, 900_000_000);
+		let (_, _, id, _) =
+			create_announced_chan_between_nodes_with_value(&nodes, 0, 1, 1_000_000, 900_000_000);
 		let fees = LowerBoundedFeeEstimator::new(&chanmon_cfgs[0].fee_estimator);
 		let per_peer_lock;
 		let mut peer_state_lock;
-		let chan = get_channel_ref!(nodes[0], nodes[1], per_peer_lock, peer_state_lock, id).as_funded_mut().unwrap();
+		let chan = get_channel_ref!(nodes[0], nodes[1], per_peer_lock, peer_state_lock, id)
+			.as_funded_mut()
+			.unwrap();
 		let capacity = chan.get_available_balances(&fees).outbound_capacity_msat;
 		let amount = capacity + 10_000_000;
 		assert!(chan.can_intercept_liquidity_shortfall(amount, &fees));
@@ -16604,7 +17217,8 @@ mod tests {
 		chan.context.channel_state = state;
 		let balance = chan.funding.value_to_self_msat;
 		let dust_limit = chan.context.config.options.max_dust_htlc_exposure;
-		chan.funding.value_to_self_msat = chan.funding.counterparty_selected_channel_reserve_satoshis.unwrap() * 1000;
+		chan.funding.value_to_self_msat =
+			chan.funding.counterparty_selected_channel_reserve_satoshis.unwrap() * 1000;
 		chan.context.config.options.max_dust_htlc_exposure = MaxDustHTLCExposure::FixedLimitMsat(0);
 		assert!(!chan.can_intercept_liquidity_shortfall(100_000, &fees));
 		chan.context.config.options.max_dust_htlc_exposure = dust_limit;
@@ -17195,6 +17809,118 @@ mod tests {
 		assert_eq!(msg.next_local_commitment_number, 1); // now called next_commitment_number
 		assert_eq!(msg.next_remote_commitment_number, 0); // now called next_revocation_number
 		assert_eq!(msg.your_last_per_commitment_secret, [0; 32]);
+	}
+
+	#[test]
+	fn test_private_splice_inflight_limits_and_persistence() {
+		let test_est = TestFeeEstimator::new(253);
+		let feeest = LowerBoundedFeeEstimator::new(&test_est);
+		let logger = TestLogger::new();
+		let secp_ctx = Secp256k1::new();
+		let network = Network::Testnet;
+		let keys_provider = TestKeysInterface::new(&[42; 32], network);
+		let peer = PublicKey::from_secret_key(&secp_ctx, &SecretKey::from_slice(&[7; 32]).unwrap());
+		for (absolute, retain, announced) in [
+			(None, false, false),
+			(Some(MAX_VALUE_MSAT), false, false),
+			(Some(MAX_VALUE_MSAT), true, false),
+			(Some(MAX_VALUE_MSAT), true, true),
+		] {
+			let mut config = UserConfig::default();
+			config.channel_handshake_config.announce_for_forwarding = announced;
+			config.channel_handshake_config.max_inbound_htlc_value_in_flight_msat = absolute;
+			config.channel_handshake_config.retain_counterparty_htlc_limit_for_splicing = retain;
+			let features = channelmanager::provided_init_features(&config);
+			let channel_features = channelmanager::provided_channel_type_features(&config);
+			let mut outbound = OutboundV1Channel::<&TestKeysInterface>::new(
+				&feeest,
+				&&keys_provider,
+				&&keys_provider,
+				peer,
+				&features,
+				48_200,
+				0,
+				42,
+				&config,
+				0,
+				42,
+				None,
+				&logger,
+			)
+			.unwrap();
+			let open = outbound
+				.get_open_channel(ChainHash::using_genesis_block(network), &&logger)
+				.unwrap();
+			let expected_own = absolute.unwrap_or(4_820_000);
+			assert_eq!(open.common_fields.max_htlc_value_in_flight_msat, expected_own);
+			let mut inbound = InboundV1Channel::<&TestKeysInterface>::new(
+				&feeest,
+				&&keys_provider,
+				&&keys_provider,
+				peer,
+				&channel_features,
+				&features,
+				&open,
+				7,
+				&config,
+				0,
+				&&logger,
+				false,
+			)
+			.unwrap();
+			let accept = inbound.accept_inbound_channel(&&logger).unwrap();
+			assert_eq!(accept.common_fields.max_htlc_value_in_flight_msat, expected_own);
+			outbound.accept_channel(&accept, &config.channel_handshake_limits, &features).unwrap();
+			let expected_peer =
+				if retain && !announced { expected_own } else { expected_own.min(48_200_000) };
+			assert_eq!(inbound.context.counterparty_max_htlc_value_in_flight_msat, expected_peer);
+			assert_eq!(outbound.context.counterparty_max_htlc_value_in_flight_msat, expected_peer);
+			let tx = Transaction {
+				version: Version::ONE,
+				lock_time: LockTime::ZERO,
+				input: Vec::new(),
+				output: vec![TxOut {
+					value: Amount::from_sat(48_200),
+					script_pubkey: outbound.funding.get_funding_redeemscript(),
+				}],
+			};
+			let outpoint = OutPoint { txid: tx.compute_txid(), index: 0 };
+			let created = outbound
+				.get_funding_created(tx, outpoint, false, &&logger)
+				.map_err(|_| ())
+				.unwrap()
+				.unwrap();
+			let best_block = BestBlock::from_network(network);
+			let (inbound, signed, _) = inbound
+				.funding_created(&created, best_block, &&keys_provider, &&logger)
+				.map_err(|_| ())
+				.unwrap();
+			let (outbound, _) = outbound
+				.funding_signed(&signed.unwrap(), best_block, &&keys_provider, &&logger)
+				.map_err(|_| ())
+				.unwrap();
+			for channel in [inbound, outbound] {
+				let bytes = channel.encode();
+				let restored: FundedChannel<&TestKeysInterface> = FundedChannel::read(
+					&mut &bytes[..],
+					(&&keys_provider, &&keys_provider, &channel_features),
+				)
+				.unwrap();
+				assert_eq!(restored.context.holder_max_htlc_value_in_flight_msat, expected_own);
+				assert_eq!(
+					restored.context.counterparty_max_htlc_value_in_flight_msat,
+					expected_peer
+				);
+				// The larger negotiated limit never becomes advertised live capacity.
+				assert!(restored.get_announced_htlc_max_msat() <= 48_200_000);
+				assert!(!restored.context.retain_counterparty_htlc_limit_for_splicing);
+			}
+		}
+		let mut config = UserConfig::default().channel_handshake_config;
+		for (input, expected) in [(0, 1), (u64::MAX, MAX_VALUE_MSAT)] {
+			config.max_inbound_htlc_value_in_flight_msat = Some(input);
+			assert_eq!(super::get_holder_max_htlc_value_in_flight_msat(48_200, &config), expected);
+		}
 	}
 
 	#[test]

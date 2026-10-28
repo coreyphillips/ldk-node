@@ -1139,6 +1139,7 @@ where
 	liquidity_source: Option<Arc<LiquiditySource<Arc<Logger>>>>,
 	#[cfg(feature = "chicory")]
 	chicory_service: Option<Arc<crate::chicory::ChicoryService>>,
+	direct_funding: Arc<crate::direct_funding::Service>,
 	payment_store: Arc<PaymentStore>,
 	peer_store: Arc<PeerStore<L>>,
 	runtime: Arc<RuntimeControl>,
@@ -1160,10 +1161,10 @@ where
 		output_sweeper: Arc<Sweeper>, network_graph: Arc<Graph>,
 		liquidity_source: Option<Arc<LiquiditySource<Arc<Logger>>>>,
 		#[cfg(feature = "chicory")] chicory_service: Option<Arc<crate::chicory::ChicoryService>>,
-		payment_store: Arc<PaymentStore>, peer_store: Arc<PeerStore<L>>,
-		static_invoice_store: Option<StaticInvoiceStore>, onion_messenger: Arc<OnionMessenger>,
-		om_mailbox: Option<Arc<OnionMessageMailbox>>, runtime: Arc<RuntimeControl>, logger: L,
-		config: Arc<Config>,
+		direct_funding: Arc<crate::direct_funding::Service>, payment_store: Arc<PaymentStore>,
+		peer_store: Arc<PeerStore<L>>, static_invoice_store: Option<StaticInvoiceStore>,
+		onion_messenger: Arc<OnionMessenger>, om_mailbox: Option<Arc<OnionMessageMailbox>>,
+		runtime: Arc<RuntimeControl>, logger: L, config: Arc<Config>,
 	) -> Self {
 		Self {
 			event_queue,
@@ -1176,6 +1177,7 @@ where
 			liquidity_source,
 			#[cfg(feature = "chicory")]
 			chicory_service,
+			direct_funding,
 			payment_store,
 			peer_store,
 			logger,
@@ -1228,6 +1230,8 @@ where
 					channel_amount,
 					confirmation_target,
 					locktime,
+					(self.config.primary_node_id == Some(counterparty_node_id))
+						.then_some(channel_value_satoshis / 19),
 				) {
 					Ok(final_tx) => {
 						let needs_manual_broadcast =
@@ -1973,11 +1977,12 @@ where
 					matches!(channel_negotiation_type, InboundChannelFunds::PushMsat(_))
 						&& self.config.trusted_peers_0conf.contains(&counterparty_node_id);
 				let mut channel_override_config = None;
-				if let Some((lsp_node_id, _)) = self
-					.liquidity_source
-					.as_ref()
-					.and_then(|ls| ls.as_ref().get_lsps2_lsp_details())
-				{
+				if let Some(lsp_node_id) = self.config.primary_node_id.or_else(|| {
+					self.liquidity_source
+						.as_ref()
+						.and_then(|ls| ls.as_ref().get_lsps2_lsp_details())
+						.map(|(node_id, _)| node_id)
+				}) {
 					if lsp_node_id == counterparty_node_id {
 						// When we're an LSPS2 client, allow claiming underpaying HTLCs as the LSP will skim off some fee. We'll
 						// check that they don't take too much before claiming.
@@ -1988,7 +1993,11 @@ where
 						channel_override_config = Some(ChannelConfigOverrides {
 							handshake_overrides: Some(ChannelHandshakeConfigUpdate {
 								max_inbound_htlc_value_in_flight_percent_of_channel: Some(100),
-								..Default::default()
+								..crate::primary::primary_channel_handshake(
+									&self.config,
+									counterparty_node_id,
+									is_announced,
+								)
 							}),
 							update_overrides: Some(ChannelConfigUpdate {
 								accept_underpaying_htlcs: Some(true),
@@ -1996,6 +2005,20 @@ where
 							}),
 						});
 					}
+				}
+				#[cfg(feature = "chicory")]
+				if let Some(provider_handshake) = self
+					.chicory_service
+					.as_ref()
+					.and_then(|service| service.private_splice_handshake(is_announced))
+				{
+					let overrides = channel_override_config.get_or_insert_with(Default::default);
+					let handshake =
+						overrides.handshake_overrides.get_or_insert_with(Default::default);
+					handshake.max_inbound_htlc_value_in_flight_msat =
+						provider_handshake.max_inbound_htlc_value_in_flight_msat;
+					handshake.retain_counterparty_htlc_limit_for_splicing =
+						provider_handshake.retain_counterparty_htlc_limit_for_splicing;
 				}
 				let res = if allow_0conf {
 					self.channel_manager.accept_inbound_channel_from_trusted_peer_0conf(
@@ -2454,33 +2477,49 @@ where
 				channel_id,
 				counterparty_node_id,
 				unsigned_transaction,
-				..
-			} => match self
-				.wallet
-				.sign_owned_inputs(unsigned_transaction, &self.channel_funding_prevout(&channel_id))
-			{
-				Ok(partially_signed_tx) => {
-					match self.channel_manager.funding_transaction_signed(
-						&channel_id,
-						&counterparty_node_id,
-						partially_signed_tx,
-					) {
-						Ok(()) => {
-							log_info!(
+				user_channel_id,
+			} => {
+				match self.direct_funding.receiver.funding_ready(
+					channel_id,
+					counterparty_node_id,
+					user_channel_id,
+					&unsigned_transaction,
+				) {
+					Ok(true) => return Ok(()),
+					Ok(false) => {},
+					Err(_) => return Err(ReplayEvent()),
+				}
+				match self.wallet.sign_owned_inputs(
+					unsigned_transaction,
+					&self.channel_funding_prevout(&channel_id),
+				) {
+					Ok(partially_signed_tx) => {
+						match self.channel_manager.funding_transaction_signed(
+							&channel_id,
+							&counterparty_node_id,
+							partially_signed_tx,
+						) {
+							Ok(()) => {
+								log_info!(
 								self.logger,
 								"Signed funding transaction for channel {} with counterparty {}",
 								channel_id,
 								counterparty_node_id
 							);
-						},
-						Err(e) => {
-							// TODO(splicing): Abort splice once supported in LDK 0.3
-							debug_assert!(false, "Failed signing funding transaction: {:?}", e);
-							log_error!(self.logger, "Failed signing funding transaction: {:?}", e);
-						},
-					}
-				},
-				Err(()) => log_error!(self.logger, "Failed signing funding transaction"),
+							},
+							Err(e) => {
+								// TODO(splicing): Abort splice once supported in LDK 0.3
+								debug_assert!(false, "Failed signing funding transaction: {:?}", e);
+								log_error!(
+									self.logger,
+									"Failed signing funding transaction: {:?}",
+									e
+								);
+							},
+						}
+					},
+					Err(()) => log_error!(self.logger, "Failed signing funding transaction"),
+				}
 			},
 			LdkEvent::SplicePending {
 				channel_id,
@@ -2629,6 +2668,7 @@ mod tests {
 			Arc::clone(&node.network_graph),
 			node.liquidity_source.clone(),
 			node.chicory_service.clone(),
+			Arc::clone(&node.direct_funding),
 			Arc::clone(&node.payment_store),
 			Arc::clone(&node.peer_store),
 			None,

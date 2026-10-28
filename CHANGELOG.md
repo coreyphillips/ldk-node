@@ -80,6 +80,8 @@
 
 ## Synonym Fork Additions
 
+- Added native Beignet v3 `bgnq` payment requests and payments with confirmed external-input channel opens and splices, bounded authenticated transport, durable witness recovery and wallet coin reservations. Exposed request creation, validation, revocation and payment activity through UniFFI for compatible Android clients. See [direct funding](docs/direct-funding.md).
+
 - Accept incoming payments up to the full channel value, instead of 10% of it, on nodes that cannot announce channels (no node alias or listening addresses), for channels opened after the update.
 - Expose the exact prepared transaction fee so applications can validate the approved total before broadcast.
 - Prevent concurrent prepared payment broadcasts from blocking Tokio worker progress.

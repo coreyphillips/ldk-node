@@ -422,7 +422,7 @@ impl ConstructedTransaction {
 		&self.tx
 	}
 
-	fn input_metadata(&self) -> impl Iterator<Item = &TxInMetadata> {
+	pub(super) fn input_metadata(&self) -> impl Iterator<Item = &TxInMetadata> {
 		self.input_metadata.iter()
 	}
 
@@ -430,7 +430,7 @@ impl ConstructedTransaction {
 		self.tx().compute_txid()
 	}
 
-	fn funding_outpoint(&self) -> OutPoint {
+	pub(super) fn funding_outpoint(&self) -> OutPoint {
 		OutPoint { txid: self.compute_txid(), index: self.shared_output_index }
 	}
 

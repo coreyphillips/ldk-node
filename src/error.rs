@@ -156,6 +156,14 @@ pub enum Error {
 	OnchainWalletAccountNotRegistered,
 	/// The seed bytes or a seed-derived wallet account are invalid.
 	InvalidSeedBytes,
+	/// The primary reports insufficient available funding for the requested receive.
+	LiquiditySourceInsufficientFunds,
+	/// The primary declined the liquidity request for another or unspecified reason.
+	LiquidityRequestRejected,
+	/// The primary did not return a correlated response before the request deadline.
+	LiquidityRequestTimedOut,
+	/// The primary's opening fee would consume the entire receive amount.
+	LiquidityReceiveAmountTooSmall,
 }
 
 impl fmt::Display for Error {
@@ -194,6 +202,18 @@ impl fmt::Display for Error {
 			Self::GossipUpdateFailed => write!(f, "Failed to update gossip data."),
 			Self::GossipUpdateTimeout => write!(f, "Updating gossip data timed out."),
 			Self::LiquidityRequestFailed => write!(f, "Failed to request inbound liquidity."),
+			Self::LiquiditySourceInsufficientFunds => {
+				write!(f, "The primary node has insufficient available funds for this receive.")
+			},
+			Self::LiquidityRequestRejected => {
+				write!(f, "The primary node declined this receive request.")
+			},
+			Self::LiquidityRequestTimedOut => {
+				write!(f, "The primary node did not answer this receive request in time.")
+			},
+			Self::LiquidityReceiveAmountTooSmall => {
+				write!(f, "The receive amount does not exceed the primary node's opening fee.")
+			},
 			Self::UriParameterParsingFailed => write!(f, "Failed to parse a URI parameter."),
 			Self::InvalidAddress => write!(f, "The given address is invalid."),
 			Self::InvalidSocketAddress => write!(f, "The given network address is invalid."),

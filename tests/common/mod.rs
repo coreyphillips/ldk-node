@@ -1210,7 +1210,78 @@ pub(crate) async fn do_channel_full_cycle<E: ElectrumApi>(
 	println!("\nB splices out to pay A");
 	let addr_a = node_a.onchain_payment().new_address().unwrap();
 	let splice_out_sat = funding_amount_sat / 2;
-	node_b.splice_out(&user_channel_id_b, node_a.node_id(), &addr_a, splice_out_sat).unwrap();
+	let channel_before_splice = node_b
+		.list_channels()
+		.into_iter()
+		.find(|channel| channel.user_channel_id == user_channel_id_b)
+		.unwrap();
+	// Splicing may draw from the old reserve when the smaller post-splice reserve is satisfied.
+	assert!(splice_out_sat > channel_before_splice.outbound_capacity_msat / 1000);
+	let reserve_violating_amount_sat =
+		splice_out_sat + channel_before_splice.unspendable_punishment_reserve.unwrap() / 2;
+	for selected_fee_rate in [None, Some(1)] {
+		for (amount_sat, reason) in [
+			(0, "zero amount"),
+			(funding_amount_sat, "insufficient local balance"),
+			(reserve_violating_amount_sat, "insufficient post-splice reserve"),
+			(u64::MAX, "unrepresentable amount"),
+		] {
+			let result = match selected_fee_rate {
+				Some(fee_rate) => node_b.splice_out_with_fee_rate(
+					&user_channel_id_b,
+					node_a.node_id(),
+					&addr_a,
+					amount_sat,
+					fee_rate,
+				),
+				None => {
+					node_b.splice_out(&user_channel_id_b, node_a.node_id(), &addr_a, amount_sat)
+				},
+			};
+			assert_eq!(
+				result,
+				Err(NodeError::ChannelSplicingFailed),
+				"{reason}, fee={selected_fee_rate:?}"
+			);
+		}
+	}
+	// The amount is affordable at an ordinary rate, but not once the excessive fee is included.
+	assert_eq!(
+		node_b.splice_out_with_fee_rate(
+			&user_channel_id_b,
+			node_a.node_id(),
+			&addr_a,
+			splice_out_sat,
+			10_000,
+		),
+		Err(NodeError::ChannelSplicingFailed)
+	);
+	let channel_after_rejections = node_b
+		.list_channels()
+		.into_iter()
+		.find(|channel| channel.user_channel_id == user_channel_id_b)
+		.unwrap();
+	assert_eq!(channel_after_rejections.channel_id, channel_before_splice.channel_id);
+	assert_eq!(channel_after_rejections.funding_txo, channel_before_splice.funding_txo);
+	assert_eq!(
+		channel_after_rejections.channel_value_sats,
+		channel_before_splice.channel_value_sats
+	);
+	assert!(channel_after_rejections.is_usable);
+	// Successful negotiation also proves the rejected attempts did not leave a pending splice.
+	if allow_0conf {
+		node_b
+			.splice_out_with_fee_rate(
+				&user_channel_id_b,
+				node_a.node_id(),
+				&addr_a,
+				splice_out_sat,
+				1,
+			)
+			.unwrap();
+	} else {
+		node_b.splice_out(&user_channel_id_b, node_a.node_id(), &addr_a, splice_out_sat).unwrap();
+	}
 
 	expect_splice_pending_event!(node_a, node_b.node_id());
 	expect_splice_pending_event!(node_b, node_a.node_id());

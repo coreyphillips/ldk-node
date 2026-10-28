@@ -13,6 +13,7 @@ dictionary Config {
 	sequence<SocketAddress>? announcement_addresses;
 	NodeAlias? node_alias;
 	sequence<PublicKey> trusted_peers_0conf;
+	PublicKey? primary_node_id;
 	u64 probing_liquidity_limit_multiplier;
 	AnchorChannelsConfig? anchor_channels_config;
 	RouteParametersConfig? route_parameters;
@@ -164,6 +165,7 @@ interface Builder {
 	void set_pathfinding_scores_source(string url);
 	void set_scoring_fee_params(ScoringFeeParameters params);
 	void set_scoring_decay_params(ScoringDecayParameters params);
+	void set_primary_node(PublicKey node_id);
 	void set_liquidity_source_lsps1(PublicKey node_id, SocketAddress address, string? token);
 	void set_liquidity_source_lsps2(PublicKey node_id, SocketAddress address, string? token);
 	void set_storage_dir_path(string storage_dir_path);
@@ -194,6 +196,17 @@ interface Builder {
 };
 
 interface Node {
+	[Throws=DirectFundingError]
+	DirectFundingRequestDetails create_direct_funding_request(u64? amount_sats, u32 expiry_secs);
+	[Throws=DirectFundingError]
+	DirectFundingRequestDetails decode_direct_funding_request(string request);
+	[Throws=DirectFundingError]
+	void invalidate_direct_funding_request(string request_id);
+	[Throws=DirectFundingError]
+	DirectFundingRequestDetails prepare_direct_funding(string request, u64? amount_sats);
+	[Throws=DirectFundingError]
+	DirectFundingPaymentDetails send_direct_funding(string request, u64? amount_sats, u64 max_fee_sats);
+	sequence<DirectFundingPaymentDetails> list_direct_funding_payments();
 	[Throws=NodeError]
 	void start();
 	[Throws=NodeError]
@@ -210,6 +223,18 @@ interface Node {
 	sequence<SocketAddress>? listening_addresses();
 	sequence<SocketAddress>? announcement_addresses();
 	NodeAlias? node_alias();
+	OnchainFeeRates estimated_fee_rates();
+	boolean has_pending_funding_operation();
+	[Throws=NodeError]
+	TransactionDetails fetch_transaction_details([ByRef]Txid txid);
+	[Throws=NodeError]
+	ConfirmationStatus fetch_transaction_status([ByRef]Txid txid);
+	[Throws=NodeError]
+	void check_primary_connection(PublicKey node_id);
+	[Throws=NodeError]
+	PrimaryReceiveQuote quote_primary_receive(PublicKey node_id, u64 amount_msat, u64 target_inbound_sats);
+	[Throws=NodeError]
+	Bolt11Invoice receive_via_primary(PublicKey node_id, u64 amount_msat, [ByRef]Bolt11InvoiceDescription description, u32 expiry_secs, u64 max_fee_msat, u64 target_inbound_sats);
 	Bolt11Payment bolt11_payment();
 	Bolt12Payment bolt12_payment();
 	SpontaneousPayment spontaneous_payment();
@@ -226,11 +251,15 @@ interface Node {
 	[Throws=NodeError]
 	UserChannelId open_channel(PublicKey node_id, SocketAddress address, u64 channel_amount_sats, u64? push_to_counterparty_msat, ChannelConfig? channel_config);
 	[Throws=NodeError]
+	UserChannelId open_channel_with_user_channel_id(PublicKey node_id, SocketAddress address, u64 channel_amount_sats, u64? push_to_counterparty_msat, ChannelConfig? channel_config, [ByRef] UserChannelId user_channel_id);
+	[Throws=NodeError]
 	UserChannelId open_announced_channel(PublicKey node_id, SocketAddress address, u64 channel_amount_sats, u64? push_to_counterparty_msat, ChannelConfig? channel_config);
 	[Throws=NodeError]
 	void splice_in([ByRef]UserChannelId user_channel_id, PublicKey counterparty_node_id, u64 splice_amount_sats);
 	[Throws=NodeError]
 	void splice_out([ByRef]UserChannelId user_channel_id, PublicKey counterparty_node_id, [ByRef]Address address, u64 splice_amount_sats);
+	[Throws=NodeError]
+	void splice_out_with_fee_rate([ByRef]UserChannelId user_channel_id, PublicKey counterparty_node_id, [ByRef]Address address, u64 splice_amount_sats, u64 fee_rate_sat_per_vbyte);
 	[Throws=NodeError]
 	void close_channel([ByRef]UserChannelId user_channel_id, PublicKey counterparty_node_id);
 	[Throws=NodeError]
@@ -276,6 +305,37 @@ interface Node {
 	[Throws=NodeError]
 	void update_sync_intervals(RuntimeSyncIntervals intervals);
 	RuntimeSyncIntervals current_sync_intervals();
+};
+
+dictionary DirectFundingRequestDetails {
+	string request;
+	string request_id;
+	string payment_hash;
+	string receiver_node_id;
+	u64? amount_sats;
+	u64 expires_at;
+};
+
+dictionary DirectFundingPaymentDetails {
+	string request_id;
+	string payment_hash;
+	u64 amount_sats;
+	u64? fee_sats;
+	string? funding_txid;
+	DirectFundingPaymentStatus status;
+	boolean is_outbound;
+	u64 created_at;
+};
+
+enum DirectFundingPaymentStatus {
+	"Offered", "SignedPending", "MempoolSeen", "Confirmed", "Aborted", "Failed"
+};
+
+[Error]
+enum DirectFundingError {
+	"InvalidRequest", "Expired", "WrongNetwork", "AmountRequired", "AmountMismatch",
+	"InsufficientFunds", "Unavailable", "Declined", "InvalidFunding", "PersistenceFailed",
+	"NotRunning", "ChainUnavailable", "Timeout", "Busy"
 };
 
 [Enum]
@@ -519,6 +579,10 @@ enum NodeError {
     "AddressTypeNotMonitored",
     "OnchainWalletAccountNotRegistered",
     "InvalidSeedBytes",
+	"LiquiditySourceInsufficientFunds",
+	"LiquidityRequestRejected",
+	"LiquidityRequestTimedOut",
+	"LiquidityReceiveAmountTooSmall",
 };
 
 dictionary NodeStatus {
@@ -1134,4 +1198,18 @@ interface PreparedOnchainSend {
     u64 mining_fee_sats();
     [Throws=NodeError]
     OnchainSendResult broadcast();
+};
+
+
+dictionary PrimaryReceiveQuote {
+	u64 amount_msat;
+	u64 fee_msat;
+	u64 funding_sats;
+};
+
+dictionary OnchainFeeRates {
+	u64 fast_sat_per_vbyte;
+	u64 normal_sat_per_vbyte;
+	u64 slow_sat_per_vbyte;
+	u64 channel_funding_sat_per_vbyte;
 };

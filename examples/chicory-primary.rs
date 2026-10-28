@@ -13,6 +13,7 @@ use std::sync::Arc;
 use ldk_node::bitcoin::Network;
 use ldk_node::chicory::{JitServiceConfig, OfflineReceiveConfig};
 use ldk_node::lightning_invoice::{Bolt11Invoice, Bolt11InvoiceDescription, Description};
+use ldk_node::payment::ConfirmationStatus;
 use ldk_node::{Builder, Event, Node};
 use serde_json::{json, Value};
 
@@ -26,6 +27,15 @@ fn amount(request: &Value) -> Result<u64, Box<dyn Error>> {
 
 fn handle(node: &Node, request: &Value) -> Result<Value, Box<dyn Error>> {
 	match field(request, "method")? {
+		"direct_funding_request" => {
+			let result = node.create_direct_funding_request(request.get("amountSats").and_then(Value::as_u64), 600)?;
+			Ok(json!({"request": result.request, "requestId": result.request_id, "paymentHash": result.payment_hash, "expiresAt": result.expires_at}))
+		},
+		"direct_funding_send" => {
+			let result = node.send_direct_funding(field(request, "request")?.to_owned(), request.get("amountSats").and_then(Value::as_u64), request.get("maxFeeSats").and_then(Value::as_u64).unwrap_or(10_000))?;
+			Ok(direct_payment(result))
+		},
+		"direct_funding_payments" => Ok(json!(node.list_direct_funding_payments().into_iter().map(direct_payment).collect::<Vec<_>>())),
 		"sync" => {
 			node.sync_wallets()?;
 			Ok(json!(true))
@@ -41,6 +51,7 @@ fn handle(node: &Node, request: &Value) -> Result<Value, Box<dyn Error>> {
 			.into_iter()
 			.map(|channel| json!({
 				"channelId": channel.channel_id.to_string(),
+				"userChannelId": channel.user_channel_id.0.to_string(),
 				"counterpartyNodeId": channel.counterparty_node_id.to_string(),
 				"isChannelReady": channel.is_channel_ready,
 				"isUsable": channel.is_usable,
@@ -51,6 +62,44 @@ fn handle(node: &Node, request: &Value) -> Result<Value, Box<dyn Error>> {
 				"fundingOutputIndex": channel.funding_txo.map(|outpoint| outpoint.vout),
 			}))
 			.collect::<Vec<_>>())),
+		"check_primary" => {
+			node.check_primary_connection(field(request, "nodeId")?.parse()?)?;
+			Ok(json!({ "connected": true }))
+		},
+		"quote_primary" => {
+			let quote = node.quote_primary_receive(field(request, "nodeId")?.parse()?, amount(request)?.checked_mul(1000).ok_or("amount overflow")?, 10_000)?;
+			Ok(json!({"amountMsat": quote.amount_msat, "feeMsat": quote.fee_msat, "fundingSats": quote.funding_sats}))
+		},
+		"receive_primary" => {
+			let description = Bolt11InvoiceDescription::Direct(Description::new("primary regtest".into())?);
+			#[cfg(feature = "uniffi")]
+			let description = description.into();
+			let invoice = node.receive_via_primary(field(request, "nodeId")?.parse()?, amount(request)?.checked_mul(1000).ok_or("amount overflow")?, &description, 3600, request.get("maxFeeMsat").and_then(Value::as_u64).unwrap_or(500_000), 10_000)?;
+			Ok(json!({"bolt11": invoice.to_string()}))
+		},
+		"payments" => Ok(json!(node.list_payments().into_iter().map(|payment| json!({"id": format!("{:?}", payment.id), "amountMsat": payment.amount_msat, "status": format!("{:?}", payment.status), "direction": format!("{:?}", payment.direction)})).collect::<Vec<_>>())),
+		"connect" => {
+			node.connect(field(request, "nodeId")?.parse()?, field(request, "address")?.parse()?, true)?;
+			Ok(json!(true))
+		},
+		"transaction" => {
+			let transaction = node.fetch_transaction_details(&field(request, "txid")?.parse()?)?;
+			Ok(json!({"inputs": transaction.inputs.iter().map(|input| json!({"txid":input.txid.to_string(),"vout":input.vout})).collect::<Vec<_>>(), "outputs": transaction.outputs.iter().map(|output| json!({"valueSats":output.value,"address":output.scriptpubkey_address})).collect::<Vec<_>>()}))
+		},
+		"transaction_status" => {
+			Ok(match node.fetch_transaction_status(&field(request, "txid")?.parse()?)? {
+				ConfirmationStatus::Unconfirmed => json!({"confirmed": false}),
+				ConfirmationStatus::Confirmed { block_hash, height, timestamp } => json!({
+					"confirmed": true, "blockHash": block_hash.to_string(), "height": height, "timestamp": timestamp
+				}),
+			})
+		},
+		"splice_out" => {
+			let channel_id = field(request, "channelId")?;
+			let channel = node.list_channels().into_iter().find(|channel| channel.channel_id.to_string() == channel_id).ok_or("unknown channel")?;
+			node.splice_out_with_fee_rate(&channel.user_channel_id, channel.counterparty_node_id, &field(request, "address")?.parse::<ldk_node::bitcoin::Address<_>>()?.require_network(Network::Regtest)?, amount(request)?, request.get("feeRate").and_then(Value::as_u64).unwrap_or(2))?;
+			Ok(json!(true))
+		},
 		"invoice" => {
 			let description =
 				request.get("description").and_then(Value::as_str).unwrap_or("regtest");
@@ -70,14 +119,12 @@ fn handle(node: &Node, request: &Value) -> Result<Value, Box<dyn Error>> {
 			Ok(json!({"paymentId": format!("{:?}", id)}))
 		},
 		"open" => {
-			let id = node.open_channel(
-				field(request, "nodeId")?.parse()?,
-				field(request, "address")?.parse()?,
-				amount(request)?,
-				None,
-				None,
-			)?;
-			Ok(json!({"userChannelId": id.to_string()}))
+			let id = if let Some(value) = request.get("userChannelId").and_then(Value::as_str) {
+				node.open_channel_with_user_channel_id(field(request, "nodeId")?.parse()?, field(request, "address")?.parse()?, amount(request)?, None, None, &ldk_node::UserChannelId(value.parse()?))?
+			} else {
+				node.open_channel(field(request, "nodeId")?.parse()?, field(request, "address")?.parse()?, amount(request)?, None, None)?
+			};
+			Ok(json!({"userChannelId": id.0.to_string()}))
 		},
 		"splice_in" => {
 			let channel_id = field(request, "channelId")?;
@@ -127,6 +174,10 @@ fn handle(node: &Node, request: &Value) -> Result<Value, Box<dyn Error>> {
 	}
 }
 
+fn direct_payment(payment: ldk_node::DirectFundingPaymentDetails) -> Value {
+	json!({"requestId":payment.request_id, "paymentHash":payment.payment_hash, "amountSats":payment.amount_sats, "feeSats":payment.fee_sats, "fundingTxid":payment.funding_txid, "status":format!("{:?}",payment.status), "isOutbound":payment.is_outbound})
+}
+
 fn output(value: Value) -> io::Result<()> {
 	let mut stdout = io::stdout().lock();
 	serde_json::to_writer(&mut stdout, &value)?;
@@ -160,25 +211,35 @@ fn main() -> Result<(), Box<dyn Error>> {
 	} else {
 		builder.set_chain_source_electrum(chain_source, None);
 	}
-	builder.set_chicory_service(JitServiceConfig {
-		enabled: true,
-		offline_receive: OfflineReceiveConfig {
-			enabled: std::env::var("CHICORY_ENABLE_OFFLINE").as_deref() == Ok("1"),
-			..OfflineReceiveConfig::default()
-		},
-		relay_enabled: true,
-		allow_confirmed_v2: true,
-		allow_splice_jit: true,
-		reuse_funding_key_on_splice: true,
-		inbound_splice_minimum_depth: 6,
-		flat_fee_sat: 100,
-		fee_ppm: 1000,
-		max_client_funding_sats: 500_000,
-		max_total_fronted_sats: 2_000_000,
-		..JitServiceConfig::default()
-	})?;
+	let primary_uri = std::env::var("LFBW_PRIMARY_URI").ok();
+	if let Some(uri) = &primary_uri {
+		let (key, _) = uri.split_once('@').ok_or("invalid primary URI")?;
+		builder.set_primary_node(key.parse()?);
+	} else if std::env::var("LFBW_DISABLE_PROVIDER").as_deref() != Ok("1") {
+		builder.set_chicory_service(JitServiceConfig {
+			enabled: true,
+			offline_receive: OfflineReceiveConfig {
+				enabled: std::env::var("CHICORY_ENABLE_OFFLINE").as_deref() == Ok("1"),
+				..OfflineReceiveConfig::default()
+			},
+			relay_enabled: true,
+			allow_confirmed_v2: true,
+			allow_splice_jit: true,
+			reuse_funding_key_on_splice: true,
+			inbound_splice_minimum_depth: 6,
+			flat_fee_sat: 100,
+			fee_ppm: 1000,
+			max_client_funding_sats: 500_000,
+			max_total_fronted_sats: 2_000_000,
+			..JitServiceConfig::default()
+		})?;
+	}
 	let node = builder.build()?;
 	node.start()?;
+	if let Some(uri) = primary_uri {
+		let (key, address) = uri.split_once('@').ok_or("invalid primary URI")?;
+		node.connect(key.parse()?, address.parse()?, true)?;
+	}
 	output(json!({"ready":true,"nodeId":node.node_id().to_string(),
 		"uri":format!("{}@127.0.0.1:{port}",node.node_id()),
 		"address":node.onchain_payment().new_address()?.to_string()}))?;

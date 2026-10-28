@@ -1114,7 +1114,7 @@ impl Wallet {
 	#[allow(deprecated)]
 	pub(crate) fn create_funding_transaction(
 		&self, output_script: ScriptBuf, amount: Amount, confirmation_target: ConfirmationTarget,
-		locktime: LockTime,
+		locktime: LockTime, max_fee_sats: Option<u64>,
 	) -> Result<Transaction, Error> {
 		let fee_rate = self.fee_estimator.estimate_fee_rate(confirmation_target);
 		let mut locked_wallet = self.inner.lock().unwrap();
@@ -1135,6 +1135,18 @@ impl Wallet {
 		} else {
 			locked_wallet.build_and_sign_funding_tx(output_script, amount, fee_rate, locktime)
 		};
+
+		if let (Ok(tx), Some(max_fee)) = (&tx, max_fee_sats) {
+			let confirmed: HashSet<_> =
+				locked_wallet.list_confirmed_unspent().into_iter().map(|u| u.outpoint).collect();
+			let fee = locked_wallet.calculate_tx_fee(tx).map(|fee| fee.to_sat());
+			if tx.input.iter().any(|input| !confirmed.contains(&input.previous_output))
+				|| fee.as_ref().map_or(true, |fee| *fee > max_fee)
+			{
+				locked_wallet.cancel_tx(tx).map_err(|_| Error::PersistenceFailed)?;
+				return Err(Error::OnchainTxCreationFailed);
+			}
+		}
 
 		tx.map_err(|e| {
 			log_error!(self.logger, "Failed to create funding transaction: {}", e);
@@ -1449,7 +1461,12 @@ impl Wallet {
 	) -> Result<Vec<LocalOutput>, Error> {
 		let locked_wallet = self.inner.lock().unwrap();
 
-		let all_utxos: Vec<LocalOutput> = locked_wallet.list_unspent();
+		let reserved: HashSet<_> = locked_wallet.reserved_inputs().into_iter().collect();
+		let all_utxos: Vec<LocalOutput> = locked_wallet
+			.list_unspent()
+			.into_iter()
+			.filter(|u| !reserved.contains(&u.outpoint))
+			.collect();
 		let total_count = all_utxos.len();
 
 		// Filter out channel funding transactions
@@ -1536,7 +1553,12 @@ impl Wallet {
 	> {
 		let mut locked_wallet = self.inner.lock().unwrap();
 
-		let all_utxos = locked_wallet.list_unspent();
+		let reserved_inputs = locked_wallet.reserved_inputs();
+		let all_utxos: Vec<_> = locked_wallet
+			.list_unspent()
+			.into_iter()
+			.filter(|u| !reserved_inputs.contains(&u.outpoint))
+			.collect();
 
 		// Validate and check UTXOs if provided
 		if let Some(ref outpoints) = utxos_to_spend {
@@ -1628,6 +1650,7 @@ impl Wallet {
 			OnchainSendAmount::ExactRetainingReserve { amount_sats, .. } => {
 				let primary = locked_wallet.primary_wallet_mut();
 				let mut tx_builder = primary.build_tx();
+				tx_builder.unspendable(reserved_inputs.clone());
 				let amount = Amount::from_sat(amount_sats);
 				tx_builder.add_recipient(address.script_pubkey(), amount).fee_rate(fee_rate);
 				tx_builder
@@ -1644,6 +1667,7 @@ impl Wallet {
 				let tmp_psbt = {
 					let primary = locked_wallet.primary_wallet_mut();
 					let mut tmp_tx_builder = primary.build_tx();
+					tmp_tx_builder.unspendable(reserved_inputs.clone());
 					tmp_tx_builder
 						.drain_wallet()
 						.drain_to(address.script_pubkey())
@@ -1718,6 +1742,7 @@ impl Wallet {
 
 				let primary = locked_wallet.primary_wallet_mut();
 				let mut tx_builder = primary.build_tx();
+				tx_builder.unspendable(reserved_inputs.clone());
 				tx_builder
 					.add_recipient(address.script_pubkey(), estimated_spendable_amount)
 					.fee_absolute(estimated_tx_fee);
@@ -1727,6 +1752,7 @@ impl Wallet {
 			| OnchainSendAmount::AllRetainingReserve { cur_anchor_reserve_sats: _ } => {
 				let primary = locked_wallet.primary_wallet_mut();
 				let mut tx_builder = primary.build_tx();
+				tx_builder.unspendable(reserved_inputs.clone());
 				tx_builder.drain_wallet().drain_to(address.script_pubkey()).fee_rate(fee_rate);
 				tx_builder
 			},
@@ -1989,8 +2015,16 @@ impl Wallet {
 		Ok(tx)
 	}
 
+	#[cfg(feature = "chicory")]
 	pub(crate) fn select_confirmed_utxos(
 		&self, must_spend: Vec<Input>, must_pay_to: &[TxOut], fee_rate: FeeRate,
+	) -> Result<Vec<FundingTxInput>, ()> {
+		self.select_confirmed_utxos_with_max_fee(must_spend, must_pay_to, fee_rate, None)
+	}
+
+	pub(crate) fn select_confirmed_utxos_with_max_fee(
+		&self, must_spend: Vec<Input>, must_pay_to: &[TxOut], fee_rate: FeeRate,
+		max_fee_sats: Option<u64>,
 	) -> Result<Vec<FundingTxInput>, ()> {
 		let mut locked_wallet = self.inner.lock().unwrap();
 
@@ -2004,7 +2038,9 @@ impl Wallet {
 			return Err(());
 		}
 
+		let reserved = locked_wallet.reserved_inputs();
 		let mut tx_builder = locked_wallet.build_tx();
+		tx_builder.unspendable(reserved);
 		tx_builder.only_witness_utxo();
 
 		for input in &must_spend {
@@ -2026,6 +2062,13 @@ impl Wallet {
 		let psbt = tx_builder.finish().map_err(|e| {
 			log_error!(self.logger, "Failed to select confirmed UTXOs: {}", e);
 		})?;
+
+		if let Some(max_fee) = max_fee_sats {
+			if psbt.fee().map_or(true, |fee| fee.to_sat() > max_fee) {
+				locked_wallet.cancel_dry_run_tx(&psbt.unsigned_tx);
+				return Err(());
+			}
+		}
 
 		let result = psbt
 			.unsigned_tx
@@ -2061,7 +2104,12 @@ impl Wallet {
 		let locked_wallet = self.inner.lock().unwrap();
 		let mut utxos = Vec::new();
 
-		for u in locked_wallet.list_confirmed_unspent() {
+		let reserved = locked_wallet.reserved_inputs();
+		for u in locked_wallet
+			.list_confirmed_unspent()
+			.into_iter()
+			.filter(|u| !reserved.contains(&u.outpoint))
+		{
 			let script_pubkey = u.txout.script_pubkey.clone();
 			match script_pubkey.witness_version() {
 				Some(version @ WitnessVersion::V0) => {
@@ -2187,6 +2235,114 @@ impl Wallet {
 			}
 		}
 		self.sign_psbt_inner(psbt)
+	}
+
+	/// Acquire one confirmed native SegWit coin for a durable direct-funding request. The
+	/// reservation lives under the same mutex as every wallet signing path.
+	pub(crate) fn reserve_direct_funding_coin(
+		&self, owner: &str, required_sats: u64, anchor_reserve_sats: u64,
+	) -> Result<(LocalOutput, ScriptBuf), Error> {
+		let mut wallet = self.inner.lock().unwrap();
+		let mut coins: Vec<_> = wallet
+			.list_confirmed_unspent()
+			.into_iter()
+			.filter(|coin| wallet.input_is_available(&coin.outpoint))
+			.collect();
+		let total = coins
+			.iter()
+			.try_fold(0u64, |total, coin| total.checked_add(coin.txout.value.to_sat()))
+			.ok_or(Error::InvalidAmount)?;
+		coins.retain(|coin| {
+			(coin.txout.script_pubkey.is_p2wpkh() || coin.txout.script_pubkey.is_p2tr())
+				&& coin.txout.value.to_sat() >= required_sats
+				&& total.saturating_sub(coin.txout.value.to_sat()) >= anchor_reserve_sats
+		});
+		coins.sort_by_key(|coin| coin.txout.value);
+		let coin = coins.into_iter().next().ok_or(Error::InsufficientFunds)?;
+		let change = wallet
+			.new_internal_address()
+			.map_err(|_| Error::WalletOperationFailed)?
+			.script_pubkey();
+		wallet.persist_all().map_err(|_| Error::PersistenceFailed)?;
+		if !wallet.reserve_input(coin.outpoint, owner) {
+			return Err(Error::WalletOperationFailed);
+		}
+		Ok((coin, change))
+	}
+
+	/// Reinstate a durable direct-funding reservation before the node starts.
+	pub(crate) fn restore_direct_funding_reservation(
+		&self, owner: &str, outpoint: OutPoint,
+	) -> bool {
+		self.inner.lock().unwrap().reserve_input(outpoint, owner)
+	}
+
+	/// Release only the matching request's reservation after a proven terminal outcome.
+	pub(crate) fn release_direct_funding_reservation(&self, owner: &str, outpoint: OutPoint) {
+		self.inner.lock().unwrap().release_input(outpoint, owner);
+	}
+
+	/// Check whether any loaded wallet controls an outpoint, including already-spent coins.
+	pub(crate) fn owns_direct_funding_input(&self, outpoint: OutPoint) -> bool {
+		let wallet = self.inner.lock().unwrap();
+		wallet.wallets().values().any(|w| {
+			w.get_tx(outpoint.txid)
+				.and_then(|tx| tx.tx_node.tx.output.get(outpoint.vout as usize).cloned())
+				.is_some_and(|out| w.is_mine(out.script_pubkey))
+		})
+	}
+
+	/// Sign one reserved input while retaining its reservation. The caller validates all peer
+	/// supplied transaction bytes first; no second owned input may be signed by this method.
+	pub(crate) fn sign_direct_funding_input(
+		&self, owner: &str, outpoint: OutPoint, mut tx: Transaction, prevouts: &[TxOut],
+	) -> Result<bitcoin::Witness, Error> {
+		if tx.input.len() != prevouts.len() {
+			return Err(Error::OnchainTxSigningFailed);
+		}
+		let index = tx
+			.input
+			.iter()
+			.position(|input| input.previous_output == outpoint)
+			.ok_or(Error::OnchainTxSigningFailed)?;
+		// A splice request may already carry the channel parties' shared-input
+		// witness. PSBT requires a transaction without witnesses; removing them
+		// does not alter the txid or the signature commitments. Only our newly
+		// signed donor witness is returned, never these peer-provided signatures.
+		for input in &mut tx.input {
+			input.witness.clear();
+		}
+		let mut psbt = Psbt::from_unsigned_tx(tx).map_err(|_| Error::OnchainTxSigningFailed)?;
+		for (input, prevout) in psbt.inputs.iter_mut().zip(prevouts) {
+			input.witness_utxo = Some(prevout.clone());
+		}
+		self.inner
+			.lock()
+			.unwrap()
+			.sign_reserved_input(psbt, owner, outpoint)
+			.map(|signed| signed.input[index].witness.clone())
+			.map_err(|_| Error::OnchainTxSigningFailed)
+	}
+
+	/// Current canonical chain evidence for an offered coin. Unknown or unconfirmed conflicts
+	/// never authorize a reservation release.
+	pub(crate) fn direct_funding_chain_state(
+		&self, outpoint: OutPoint, funding: Option<Txid>,
+	) -> (bool, bool, bool) {
+		let wallet = self.inner.lock().unwrap();
+		let confirmed = funding.is_some_and(|txid| wallet.is_tx_confirmed(&txid));
+		let known = funding.is_some_and(|txid| wallet.all_txids().contains(&txid));
+		let conflict = wallet.cached_txs().iter().any(|tx| {
+			Some(tx.compute_txid()) != funding
+				&& wallet.is_tx_confirmed(&tx.compute_txid())
+				&& tx.input.iter().any(|i| i.previous_output == outpoint)
+		});
+		(known, confirmed, conflict)
+	}
+
+	/// Chain height against which a direct-funding sender bounds transaction locktime.
+	pub(crate) fn direct_funding_height(&self) -> u32 {
+		self.inner.lock().unwrap().current_best_block().1
 	}
 
 	fn sign_psbt_inner(&self, psbt: Psbt) -> Result<Transaction, ()> {

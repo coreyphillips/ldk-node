@@ -216,11 +216,29 @@ fn main() -> Result<(), Box<dyn Error>> {
 		let (key, _) = uri.split_once('@').ok_or("invalid primary URI")?;
 		builder.set_primary_node(key.parse()?);
 	} else if std::env::var("LFBW_DISABLE_PROVIDER").as_deref() != Ok("1") {
+		let trusted_splice_peer_pubkeys = std::env::var("CHICORY_TEST_TRUSTED_SPLICE_PEERS")
+			.ok()
+			.map(|value| -> Result<Vec<_>, Box<dyn Error>> {
+				serde_json::from_str::<Vec<String>>(&value)?
+					.into_iter()
+					.map(|key| {
+						if key.len() != 66 || !(key.starts_with("02") || key.starts_with("03")) {
+							return Err(
+								"trusted splice peer must be a compressed public key".into()
+							);
+						}
+						Ok(key.parse()?)
+					})
+					.collect()
+			})
+			.transpose()?
+			.unwrap_or_default();
 		builder.set_chicory_service(JitServiceConfig {
 			enabled: true,
 			relay_enabled: true,
 			allow_confirmed_v2: true,
 			allow_splice_jit: true,
+			trusted_splice_peer_pubkeys,
 			reuse_funding_key_on_splice: true,
 			inbound_splice_minimum_depth: 6,
 			flat_fee_sat: 100,

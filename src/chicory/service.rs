@@ -72,6 +72,12 @@ pub struct JitServiceConfig {
 	/// that additional local balance resolves the shortage. A pending splice,
 	/// channel policy limit or disconnect may still fail the payment safely.
 	pub allow_splice_jit: bool,
+	/// Explicitly trusted clients whose entirely locally funded JIT splices may lock before
+	/// confirmation. Empty by default. These peers must not broadcast an old commitment that
+	/// conflicts with the splice; doing so can cause loss of newly forwarded funds. Pairing alone
+	/// does not grant this trust. Third-party funding and peer-initiated splices still require
+	/// confirmations. Removing a peer affects future attempts, not a signed in-flight candidate.
+	pub trusted_splice_peer_pubkeys: Vec<PublicKey>,
 	/// Relay sealed direct-funding frames between connected peers. This does not
 	/// implement direct funding or authorize any channel operation. Fixed limits
 	/// allow at most 32 messages and 128 KiB per peer per second, plus global limits.
@@ -121,6 +127,7 @@ impl Default for JitServiceConfig {
 		Self {
 			enabled: false,
 			allow_splice_jit: false,
+			trusted_splice_peer_pubkeys: Vec::new(),
 			relay_enabled: false,
 			allow_confirmed_v2: false,
 			inbound_splice_minimum_depth: 6,
@@ -154,6 +161,10 @@ impl fmt::Display for JitConfigError {
 impl std::error::Error for JitConfigError {}
 
 impl JitServiceConfig {
+	fn trusts_splice_peer(&self, peer: &PublicKey) -> bool {
+		self.enabled && self.allow_splice_jit && self.trusted_splice_peer_pubkeys.contains(peer)
+	}
+
 	fn private_splice_handshake(&self, announced: bool) -> Option<ChannelHandshakeConfigUpdate> {
 		(self.enabled && self.allow_splice_jit && !announced)
 			.then(crate::primary::splice_channel_handshake)
@@ -162,6 +173,9 @@ impl JitServiceConfig {
 	/// Validate bounded provider limits before enabling peer requests.
 	pub fn validate(&self) -> Result<(), JitConfigError> {
 		if self.max_live_intents == 0
+			|| self.trusted_splice_peer_pubkeys.len() > 128
+			|| self.trusted_splice_peer_pubkeys.iter().collect::<HashSet<_>>().len()
+				!= self.trusted_splice_peer_pubkeys.len()
 			|| !(1..=144).contains(&self.inbound_splice_minimum_depth)
 			|| self.max_live_intents > 1024
 			|| self.max_live_intents_per_peer == 0
@@ -350,12 +364,17 @@ struct DurableState {
 	funding_lease: Option<FundingLease>,
 }
 
-/// Accumulate one authenticated native intercept. The caller persists the
-/// binding and hold together before funding or accepting another part.
-fn append_part(
-	state: &mut DurableState, policy: &JitServiceConfig, scid: u64, intercept: [u8; 32],
+struct PartAdmission {
+	index: usize,
+	deadline: u64,
+	ready: bool,
+}
+
+/// Check the complete admission contract without binding a wildcard or changing a hold.
+fn validate_part(
+	state: &DurableState, policy: &JitServiceConfig, scid: u64, intercept: [u8; 32],
 	hash: [u8; 32], inbound: u64, outbound: u64, now: u64,
-) -> Result<bool, &'static str> {
+) -> Result<PartAdmission, &'static str> {
 	let index = state.intents.iter().position(|i| i.scid == scid).ok_or("unknown registration")?;
 	let intent = &state.intents[index];
 	if intent.consumed || intent.expires_at <= now {
@@ -394,7 +413,38 @@ fn append_part(
 		return Err("payment hold expired");
 	}
 	let ready = intent.expected_msat == 0 || total >= intent.expected_msat;
-	let peer = intent.peer.clone();
+	Ok(PartAdmission { index, deadline, ready })
+}
+
+/// Choose only a registration that can admit this alias-routed part. An earlier receive paid
+/// by another method may leave a wildcard registration whose cap is too small for this payment.
+fn intent_for_alias_part(
+	state: &DurableState, policy: &JitServiceConfig, peer: &str, intercept: [u8; 32],
+	hash: [u8; 32], inbound: u64, outbound: u64, now: u64,
+) -> Option<u64> {
+	state
+		.intents
+		.iter()
+		.filter(|intent| intent.peer == peer)
+		.filter(|intent| {
+			validate_part(state, policy, intent.scid, intercept, hash, inbound, outbound, now)
+				.is_ok()
+		})
+		.min_by_key(|intent| {
+			(intent.payment_hash.is_none(), intent.expected_msat != outbound, intent.expires_at)
+		})
+		.map(|intent| intent.scid)
+}
+
+/// Accumulate one authenticated native intercept. The caller persists the
+/// binding and hold together before funding or accepting another part.
+fn append_part(
+	state: &mut DurableState, policy: &JitServiceConfig, scid: u64, intercept: [u8; 32],
+	hash: [u8; 32], inbound: u64, outbound: u64, now: u64,
+) -> Result<bool, &'static str> {
+	let PartAdmission { index, deadline, ready } =
+		validate_part(state, policy, scid, intercept, hash, inbound, outbound, now)?;
+	let peer = state.intents[index].peer.clone();
 	state.intents[index].payment_hash = Some(hash);
 	state.holds.push(Hold {
 		intercept_id: intercept,
@@ -1111,21 +1161,20 @@ impl ChicoryService {
 		};
 		let scid = if let Some(channel) = &alias_channel {
 			let peer = channel.counterparty.node_id.to_string();
-			let matching = state
-				.durable
-				.intents
-				.iter()
-				.filter(|i| {
-					i.peer == peer
-						&& !i.consumed && i.expires_at > now
-						&& i.payment_hash.is_none_or(|bound| bound == hash.0)
-				})
-				.min_by_key(|i| (i.payment_hash.is_none(), i.expires_at));
-			let Some(intent) = matching else {
+			let Some(scid) = intent_for_alias_part(
+				&state.durable,
+				&self.policy,
+				&peer,
+				intercept.0,
+				hash.0,
+				inbound,
+				outbound,
+				now,
+			) else {
 				fail();
 				return;
 			};
-			intent.scid
+			scid
 		} else {
 			scid
 		};
@@ -1387,11 +1436,26 @@ impl ChicoryService {
 			inputs,
 			change_script: Some(change_script.clone()),
 		};
-		if self
-			.channel_manager
-			.splice_channel(&channel.channel_id, &peer, contribution, rate, None)
-			.is_err()
-		{
+		let result = if self.policy.trusts_splice_peer(&peer) {
+			// Inputs come exclusively from select_confirmed_utxos above. Native construction
+			// independently rejects a hidden peer input before releasing commitment signatures.
+			self.channel_manager.splice_channel_with_trusted_own_funding(
+				&channel.channel_id,
+				&peer,
+				contribution,
+				rate,
+				None,
+			)
+		} else {
+			self.channel_manager.splice_channel(
+				&channel.channel_id,
+				&peer,
+				contribution,
+				rate,
+				None,
+			)
+		};
+		if result.is_err() {
 			let tx = bitcoin::Transaction {
 				version: bitcoin::transaction::Version::TWO,
 				lock_time: bitcoin::absolute::LockTime::ZERO,
@@ -2236,6 +2300,209 @@ mod tests {
 			intent.consumed = true;
 		}
 		assert!(validate_durable(&state).is_err());
+	}
+
+	fn alias_intent(scid: u64, amount_msat: u64, expires_at: u64) -> Intent {
+		let mut value = intent(true);
+		value.scid = scid;
+		value.request_id = scid.to_be_bytes();
+		value.payment_hash = None;
+		value.expected_msat = amount_msat;
+		value.funding_sats = JitServiceConfig::default().funding_amount(amount_msat, 0).unwrap();
+		value.expires_at = expires_at;
+		value.fee_ppm = 1000;
+		value.request = JitAuthorization {
+			request_id: value.request_id,
+			payment_hash: None,
+			max_amount_msat: amount_msat,
+			expected_total_msat: Some(amount_msat),
+			accepts_skimmed_fee: true,
+			..authorization()
+		}
+		.encode();
+		value
+	}
+
+	#[test]
+	fn alias_selection_skips_unused_smaller_direct_funding_receive_after_restart() {
+		let old = alias_intent(1, 15_000_000, 100);
+		let current = alias_intent(2, 100_000_000, 110);
+		let peer = current.peer.clone();
+		let state = DurableState { version: 1, intents: vec![old, current], ..Default::default() };
+		let mut state: DurableState =
+			serde_json::from_slice(&serde_json::to_vec(&state).unwrap()).unwrap();
+		validate_durable(&state).unwrap();
+		let policy = JitServiceConfig::default();
+		let selected = super::intent_for_alias_part(
+			&state,
+			&policy,
+			&peer,
+			[1; 32],
+			[7; 32],
+			100_001_000,
+			100_000_000,
+			1,
+		);
+		assert_eq!(selected, Some(2));
+		assert_eq!(
+			super::append_part(
+				&mut state,
+				&policy,
+				2,
+				[1; 32],
+				[7; 32],
+				100_001_000,
+				100_000_000,
+				1
+			),
+			Ok(true)
+		);
+		assert_eq!(state.intents[0].payment_hash, None);
+		assert!(!state.intents[0].consumed);
+		assert_eq!(state.intents[1].payment_hash, Some([7; 32]));
+		assert_eq!(
+			super::group_forwards(&state.intents[1], &[&state.holds[0]]),
+			Ok(vec![99_800_000])
+		);
+		super::freeze_group(&mut state, 2, None).unwrap();
+		assert!(state.intents[1].consumed);
+		assert_eq!(state.fronted_sats, 0, "Selection does not start or charge a funding attempt");
+		validate_durable(&state).unwrap();
+	}
+
+	#[test]
+	fn alias_selection_preserves_bound_hash_and_aggregate_cap() {
+		let mut bound = alias_intent(1, 100_000_000, 110);
+		bound.payment_hash = Some([7; 32]);
+		let mut authorization = JitAuthorization::decode(&bound.request).unwrap();
+		authorization.payment_hash = bound.payment_hash;
+		bound.request = authorization.encode();
+		let wildcard = alias_intent(2, 500_000_000, 100);
+		let peer = bound.peer.clone();
+		let mut state =
+			DurableState { version: 1, intents: vec![bound, wildcard], ..Default::default() };
+		let policy = JitServiceConfig::default();
+		validate_durable(&state).unwrap();
+		assert_eq!(
+			super::intent_for_alias_part(
+				&state, &policy, &peer, [1; 32], [7; 32], 40_000_000, 40_000_000, 1
+			),
+			Some(1)
+		);
+		assert_eq!(
+			super::append_part(&mut state, &policy, 1, [1; 32], [7; 32], 40_000_000, 40_000_000, 1),
+			Ok(false)
+		);
+		assert_eq!(
+			super::intent_for_alias_part(
+				&state, &policy, &peer, [2; 32], [7; 32], 60_000_000, 60_000_000, 1
+			),
+			Some(1)
+		);
+		// The larger wildcard must not steal a hash already bound to a capped or consumed intent.
+		assert_eq!(
+			super::intent_for_alias_part(
+				&state, &policy, &peer, [2; 32], [7; 32], 60_000_001, 60_000_001, 1
+			),
+			None
+		);
+		state.intents[0].consumed = true;
+		assert_eq!(
+			super::intent_for_alias_part(
+				&state, &policy, &peer, [2; 32], [7; 32], 1_000_000, 1_000_000, 1
+			),
+			None
+		);
+	}
+
+	#[test]
+	fn alias_selection_prefers_new_invoice_hash_over_older_equal_or_larger_wildcards() {
+		let policy = JitServiceConfig::default();
+		for old_amount in [100_000_000, 200_000_000] {
+			let older = alias_intent(1, old_amount, 100);
+			let mut current = alias_intent(2, 100_000_000, 110);
+			let mut authorization = JitAuthorization::decode(&current.request).unwrap();
+			authorization.payment_hash = Some([7; 32]);
+			current.request = authorization.encode();
+			current.payment_hash = authorization.payment_hash;
+			let peer = current.peer.clone();
+			let state =
+				DurableState { version: 1, intents: vec![older, current], ..Default::default() };
+			validate_durable(&state).unwrap();
+			// Both a whole payment and its first partial HTLC must bind to the exact invoice.
+			for amount in [100_000_000, 40_000_000] {
+				assert_eq!(
+					super::intent_for_alias_part(
+						&state, &policy, &peer, [1; 32], [7; 32], amount, amount, 1
+					),
+					Some(2)
+				);
+			}
+		}
+	}
+
+	#[test]
+	fn alias_selection_prefers_complete_exact_target_and_rejects_invalid_parts() {
+		let older = alias_intent(1, 200_000_000, 100);
+		let exact = alias_intent(2, 100_000_000, 110);
+		let peer = exact.peer.clone();
+		let mut state =
+			DurableState { version: 1, intents: vec![older, exact], ..Default::default() };
+		let policy = JitServiceConfig::default();
+		assert_eq!(
+			super::intent_for_alias_part(
+				&state,
+				&policy,
+				&peer,
+				[1; 32],
+				[7; 32],
+				100_000_000,
+				100_000_000,
+				1
+			),
+			Some(2)
+		);
+		assert_eq!(
+			super::intent_for_alias_part(
+				&state,
+				&policy,
+				&peer,
+				[1; 32],
+				[7; 32],
+				99_999_999,
+				100_000_000,
+				1
+			),
+			None
+		);
+		assert_eq!(
+			super::intent_for_alias_part(
+				&state,
+				&policy,
+				"another peer",
+				[1; 32],
+				[7; 32],
+				100_000_000,
+				100_000_000,
+				1
+			),
+			None
+		);
+		state.intents[0].expires_at = 1;
+		state.intents[1].consumed = true;
+		assert_eq!(
+			super::intent_for_alias_part(
+				&state,
+				&policy,
+				&peer,
+				[1; 32],
+				[7; 32],
+				100_000_000,
+				100_000_000,
+				1
+			),
+			None
+		);
 	}
 
 	#[test]
@@ -3187,6 +3454,7 @@ mod tests {
 		let config = JitServiceConfig::default();
 		assert!(!config.enabled);
 		assert!(!config.allow_confirmed_v2);
+		assert!(config.trusted_splice_peer_pubkeys.is_empty());
 		assert_eq!(config.inbound_splice_minimum_depth, 6);
 		assert!(!config.reuse_funding_key_on_splice);
 		assert!(config.validate().is_ok());
@@ -3363,6 +3631,25 @@ mod tests {
 	}
 
 	proptest! {
+		#[test]
+		fn trusted_splice_policy_requires_exact_peer_and_both_switches(
+			seed in 1u8..=250, enabled in any::<bool>(), allow_splice_jit in any::<bool>(), listed in any::<bool>()
+		) {
+			let secp = Secp256k1::new();
+			let peer = PublicKey::from_secret_key(&secp, &SecretKey::from_slice(&[seed; 32]).unwrap());
+			let other = PublicKey::from_secret_key(&secp, &SecretKey::from_slice(&[seed + 1; 32]).unwrap());
+			let mut config = JitServiceConfig {
+				enabled, allow_splice_jit,
+				trusted_splice_peer_pubkeys: if listed { vec![peer] } else { Vec::new() },
+				..Default::default()
+			};
+			prop_assert!(config.validate().is_ok());
+			prop_assert_eq!(config.trusts_splice_peer(&peer), enabled && allow_splice_jit && listed);
+			prop_assert!(!config.trusts_splice_peer(&other));
+			config.trusted_splice_peer_pubkeys = vec![peer, peer];
+			prop_assert!(config.validate().is_err());
+		}
+
 		#[test]
 		fn fees_match_wide_integer_reference(amount in any::<u64>(), flat in any::<u64>(), ppm in any::<u32>()) {
 			let expected = u128::from(flat) * 1000 + u128::from(amount) * u128::from(ppm) / 1_000_000;

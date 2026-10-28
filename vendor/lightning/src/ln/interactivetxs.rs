@@ -2310,6 +2310,17 @@ impl InteractiveTxConstructor {
 		}
 	}
 
+	/// Whether the complete transaction contains only holder-owned nonshared inputs.
+	/// This is deliberately unavailable until both sides have completed negotiation.
+	pub fn has_only_holder_inputs(&self) -> bool {
+		match &self.state_machine {
+			StateMachine::NegotiationComplete(NegotiationComplete(session)) => {
+				session.remote_inputs_count() == 0 && session.local_inputs_count() > 0
+			},
+			_ => false,
+		}
+	}
+
 	pub fn into_signing_session(self) -> InteractiveTxSigningSession {
 		match self.state_machine {
 			StateMachine::NegotiationComplete(s) => s.0,

@@ -1,0 +1,3061 @@
+diff --git a/portable-tests/direct-funding-received.test.cjs b/portable-tests/direct-funding-received.test.cjs
+new file mode 100644
+index 0000000..a0bb120
+--- /dev/null
++++ b/portable-tests/direct-funding-received.test.cjs
+@@ -0,0 +1,209 @@
++const { test } = require('node:test');
++const assert = require('node:assert/strict');
++const { buildSync } = require('esbuild');
++
++// Exercise the selectively backported upstream store and channel methods.
++// The build remains portable; these fixtures need neither a chain nor a peer.
++const source = buildSync({
++  stdin: {
++    contents: `
++      export * from './src/lightning/direct-funding/requests';
++      export { DirectFundingReceiver } from './src/lightning/direct-funding/receiver/engine';
++      export { Channel } from './src/lightning/channel/channel';
++      export { createOpenerState } from './src/lightning/channel/channel-state';
++      export { ChannelState, DEFAULT_CHANNEL_CONFIG } from './src/lightning/channel/types';
++      export { serializeChannelState, deserializeChannelState } from './src/lightning/storage/serialization';
++      export { getPublicKey } from './src/lightning/crypto/ecdh';
++      export { BeignetNode } from './src/cli/beignet-node';`,
++    resolveDir: require('node:path').join(__dirname, '..'), loader: 'ts',
++  },
++  bundle: true, platform: 'node', format: 'cjs', packages: 'external', write: false,
++}).outputFiles[0].text;
++const mod = { exports: {} };
++new Function('module', 'exports', 'require', source)(mod, mod.exports, name =>
++  name === 'better-sqlite3' ? class UnusedDatabase {} : require(name));
++const {
++  DirectFundingRequestStore, DirectFundingReceiver, DF_REQUESTS_STORAGE_KEY,
++  DF_RECEIVED_STORAGE_KEY, DF_RECEIVED_RETENTION_MS, DF_MAX_RECEIVED_RECORDS,
++  Channel, ChannelState, DEFAULT_CHANNEL_CONFIG, createOpenerState,
++  serializeChannelState, deserializeChannelState, getPublicKey, BeignetNode,
++} = mod.exports;
++
++const OFFER = '11'.repeat(16);
++const FUNDING = '22'.repeat(32);
++const CHANNEL = '33'.repeat(32);
++function fixture(rows = new Map(), clock = { now: 1700000000000 }) {
++  const f = { rows, clock, failReceived: false };
++  f.store = new DirectFundingRequestStore({
++    now: () => clock.now,
++    storage: {
++      loadWalletData: key => rows.get(key) ?? null,
++      saveWalletData(key, value) {
++        if (f.failReceived && key === DF_RECEIVED_STORAGE_KEY) throw Error('disk unavailable');
++        rows.set(key, value);
++      },
++    },
++  }, { requestTtlMs: 1000 });
++  return f;
++}
++function bind(f, record, amount = '15000') {
++  assert.equal(f.store.beginAttempt(record.receiptHash, OFFER, f.clock.now + 1000), true);
++  assert.equal(f.store.markAttemptFunding(record.receiptHash, OFFER, {
++    outpoint: '44'.repeat(32) + ':1', channelId: CHANNEL, splice: true,
++    contentHash: '55'.repeat(32), payerEphemeralKey: getPublicKey(Buffer.alloc(32, 6)).toString('hex'),
++    fundingTxid: FUNDING, amountSat: amount,
++  }, f.clock.now + 1000), true);
++}
++function pay(f, record, amount = '15000') {
++  bind(f, record, amount);
++  f.store.markReceiptRevealed(record.receiptHash, {
++    offerIdHex: OFFER, fundingTxidHex: FUNDING, amountSat: amount,
++  });
++  return f.store.receivedFor(record.receiptHash);
++}
++
++test('a signed funding records exact amount and identity without exposing request secrets', () => {
++  const f = fixture(), record = f.store.mint();
++  bind(f, record);
++  assert.deepEqual(f.store.received(), [], 'Negotiation alone cannot report receipt');
++  f.store.markReceiptRevealed(record.receiptHash, { offerIdHex: OFFER, fundingTxidHex: FUNDING });
++  const receipt = f.store.receivedFor(record.receiptHash);
++  assert.deepEqual(receipt, {
++    receiptHash: record.receiptHash, requestId: record.requestId, offerId: OFFER,
++    fundingTxid: FUNDING, channelId: CHANNEL, splice: true, amountSat: '15000',
++    status: 'PAID', paidAt: f.clock.now, updatedAt: f.clock.now,
++  });
++  for (const secret of [record.preimageHex, record.encryptionPrivateKeyHex, record.onionPathSecretHex]) {
++    assert.equal(JSON.stringify(receipt).includes(secret), false);
++  }
++  receipt.amountSat = '1';
++  assert.equal(f.store.receivedFor(record.receiptHash).amountSat, '15000');
++  const api = Object.create(BeignetNode.prototype);
++  api.node = { getDirectFundingRequests: () => f.store };
++  assert.equal(api.listDirectFundingReceived()[0].amountSat, '15000');
++});
++
++test('receiver receipt and lock survive request expiry and restart without duplicate credit', () => {
++  const f = fixture(), record = f.store.mint({ amountSat: 15000n });
++  pay(f, record);
++  assert.equal(f.store.markReceivedLocked(FUNDING), true);
++  const receipt = f.store.receivedFor(record.receiptHash);
++  f.clock.now += 2000;
++  assert.equal(f.store.sweep(), 1);
++  assert.equal(f.store.byRequestId(record.requestId), null);
++  const restarted = fixture(f.rows, f.clock);
++  assert.equal(restarted.store.restore(), 0);
++  assert.deepEqual(restarted.store.received(), [receipt]);
++  assert.equal(restarted.store.markReceivedLocked(FUNDING), false);
++  assert.equal(restarted.store.markReceivedLocked('66'.repeat(32)), false);
++  assert.deepEqual(restarted.store.received(), [receipt]);
++});
++
++test('a failed archive write retains its tombstone until a durable retry or restart backfill', () => {
++  const f = fixture(), record = f.store.mint();
++  bind(f, record);
++  f.failReceived = true;
++  assert.throws(() => f.store.markReceiptRevealed(record.receiptHash, {
++    offerIdHex: OFFER, fundingTxidHex: FUNDING, amountSat: '17000',
++  }));
++  f.clock.now += 2000;
++  assert.equal(f.store.sweep(), 0);
++  assert.equal(JSON.parse(f.rows.get(DF_REQUESTS_STORAGE_KEY)).length, 1);
++  const restarted = fixture(f.rows, f.clock);
++  restarted.store.restore();
++  const received = restarted.store.received();
++  assert.equal(received.length, 1);
++  assert.equal(received[0].amountSat, '17000');
++  assert.equal(received[0].channelId, CHANNEL);
++  assert.deepEqual(JSON.parse(f.rows.get(DF_RECEIVED_STORAGE_KEY)), received);
++});
++
++test('a proven conflict remains reverted across restart even when the receipt had locked', () => {
++  const f = fixture(), record = f.store.mint();
++  pay(f, record);
++  f.store.markReceivedLocked(FUNDING);
++  const lockedAt = f.store.receivedFor(record.receiptHash).lockedAt;
++  f.clock.now++;
++  assert.equal(f.store.markReceivedReverted(FUNDING), 1);
++  assert.equal(f.store.markReceivedLocked(FUNDING), false);
++  const restarted = fixture(f.rows, f.clock);
++  restarted.store.restore();
++  assert.equal(restarted.store.receivedFor(record.receiptHash).status, 'REVERTED');
++  assert.equal(restarted.store.receivedFor(record.receiptHash).lockedAt, lockedAt);
++  assert.equal(restarted.store.markReceivedReverted(FUNDING), 0);
++});
++
++test('receiver startup recovers a lock event missed before receipt tracking or restart', () => {
++  const f = fixture(), record = f.store.mint();
++  pay(f, record);
++  let hasLock = false;
++  const receiver = new DirectFundingReceiver({
++    requests: f.store, now: () => f.clock.now,
++    hasLockedFunding: (channel, txid) => hasLock && channel === CHANNEL && txid === FUNDING,
++    onTxSigsNeeded: () => () => {}, onSpliceTxSigsNeeded: () => () => {},
++  });
++  receiver.start();
++  assert.equal(f.store.receivedFor(record.receiptHash).lockedAt, undefined);
++  receiver.stop();
++  hasLock = true;
++  receiver.start();
++  receiver.stop();
++  assert.equal(f.store.receivedFor(record.receiptHash).lockedAt, f.clock.now);
++});
++
++test('received archive is bounded and rejects malformed restored values', () => {
++  const f = fixture(), record = f.store.mint();
++  const receipt = pay(f, record);
++  f.rows.delete(DF_REQUESTS_STORAGE_KEY);
++  f.rows.set(DF_RECEIVED_STORAGE_KEY, JSON.stringify([
++    receipt, { ...receipt, receiptHash: '77'.repeat(32), lockedAt: '1' },
++    { ...receipt, receiptHash: '88'.repeat(32), amountSat: '-1' },
++  ]));
++  const restarted = fixture(f.rows, f.clock);
++  restarted.store.restore();
++  assert.deepEqual(restarted.store.received(), [receipt]);
++  f.rows.set(DF_RECEIVED_STORAGE_KEY, JSON.stringify(Array.from({ length: DF_MAX_RECEIVED_RECORDS }, (_, i) => ({
++    ...receipt, receiptHash: i.toString(16).padStart(64, '0'), paidAt: f.clock.now - 512 + i,
++    updatedAt: f.clock.now - 512 + i,
++  }))));
++  restarted.store.restore();
++  const next = restarted.store.mint();
++  pay(restarted, next);
++  assert.equal(restarted.store.received().length, DF_MAX_RECEIVED_RECORDS);
++  assert.equal(restarted.store.receivedFor('0'.repeat(64)), null);
++  f.clock.now += DF_RECEIVED_RETENTION_MS + 1;
++  restarted.store.sweep();
++  assert.deepEqual(restarted.store.received(), []);
++});
++
++function channelFixture(overrides) {
++  const pubkey = getPublicKey(Buffer.alloc(32, 7));
++  const state = createOpenerState({
++    temporaryChannelId: Buffer.alloc(32, 8), fundingSatoshis: 50000n, pushMsat: 0n,
++    localConfig: { ...DEFAULT_CHANNEL_CONFIG }, localPerCommitmentSeed: Buffer.alloc(32, 9),
++    localBasepoints: Object.fromEntries(['fundingPubkey', 'revocationBasepoint', 'paymentBasepoint',
++      'delayedPaymentBasepoint', 'htlcBasepoint', 'firstPerCommitmentPoint'].map(key => [key, pubkey])),
++  });
++  Object.assign(state, { fundingTxid: Buffer.from(FUNDING, 'hex').reverse(), ...overrides });
++  return new Channel(state);
++}
++
++test('durable funding locks survive serialization and close without inventing an unready lock', () => {
++  for (const state of [ChannelState.AWAITING_FUNDING_CONFIRMED, ChannelState.AWAITING_CHANNEL_READY, ChannelState.CLOSED]) {
++    const channel = channelFixture({ state, localChannelReady: false, remoteChannelReady: false });
++    assert.equal(channel.backfillLockedFundingTxids(), false);
++    assert.equal(channel.hasLockedFunding(FUNDING), false);
++  }
++  const channel = channelFixture({
++    state: ChannelState.AWAITING_REESTABLISH, preReestablishState: ChannelState.NORMAL,
++    localChannelReady: true, remoteChannelReady: true,
++  });
++  assert.equal(channel.backfillLockedFundingTxids(), true);
++  assert.equal(channel.backfillLockedFundingTxids(), false);
++  const state = deserializeChannelState(serializeChannelState(channel.getFullState()));
++  state.state = ChannelState.CLOSED;
++  const restored = new Channel(state);
++  assert.equal(restored.hasLockedFunding(FUNDING), true);
++  assert.equal(restored.hasLockedFunding('99'.repeat(32)), false);
++  assert.equal(restored.getFullState().lockedFundingTxids.length, 1);
++});
+diff --git a/portable/runtime.ts b/portable/runtime.ts
+index 18676cc..fe165ea 100644
+--- a/portable/runtime.ts
++++ b/portable/runtime.ts
+@@ -1109,6 +1109,8 @@ export async function createPortableRuntime(options: any) {
+ 				return n.getFeeEstimates();
+ 			case 'GET /direct-funding/payments':
+ 				return n.listDirectFundingPayments();
++			case 'GET /direct-funding/received':
++				return n.listDirectFundingReceived();
+ 			case 'GET /direct-funding/config':
+ 				return n.getDirectFundingConfig();
+ 			case 'POST /wallet/refresh':
+diff --git a/src/cli/README.md b/src/cli/README.md
+index f88ce9b..34f54a7 100644
+--- a/src/cli/README.md
++++ b/src/cli/README.md
+@@ -1102,6 +1102,7 @@ interface ChannelInfo {
+   channelId: string;        // 32-byte hex
+   peerPubkey: string;       // 33-byte compressed pubkey hex
+   state: string;            // e.g. 'NORMAL', 'AWAITING_FUNDING_CONFIRMED'
++  preReestablishState?: string;  // the state a disconnect or restart left for AWAITING_REESTABLISH; present exactly while there (issue #1899)
+   localBalanceSats: number;
+   remoteBalanceSats: number;
+   capacitySats: number;
+@@ -1113,6 +1114,7 @@ interface ChannelInfo {
+   pendingSpliceLocalBalanceSats?: number;  // local balance once the in-flight splice locks; present only mid-splice
+   pendingSpliceTxid?: string;              // the in-flight splice's txid, display order; present exactly when pendingSpliceLocalBalanceSats is (issue #1060)
+   previousFundingTxids?: string[];         // fundings retired by adopted splices, oldest first, display order; absent when never spliced (issue #1060)
++  lockedFundingTxids?: string[];           // fundings this channel locked (both channel_ready, or both splice_locked), oldest first, display order; kept through close. Not listed or absent means not known, not never locked: a channel from an earlier version is seeded only with what its stored state proves. On a zero-conf channel a lock comes before confirmation (issue #1899)
+   closeStatus?: {           // present for closing/closed channels
+     closer: 'local' | 'remote' | 'cooperative' | 'unknown';
+     reason?: string;        // 'user' or an automatic close code; absent for peer closes
+@@ -1158,7 +1160,9 @@ interface PaymentInfo {
+   paymentHash: string;      // hex
+   preimage?: string;        // hex, present when settled
+   amountSats: number;       // OUTGOING: what left the node, fees included, rounded up
+-  feeSats?: number;         // routing fee paid, rounded up
++                            // INCOMING: what the node was credited, rounded down
++  feeSats?: number;         // OUTGOING: routing fee paid; INCOMING: a JIT LSP's skim
++                            // (invoice amount less amountSats); rounded up
+   status: 'PENDING' | 'COMPLETED' | 'FAILED';
+   direction: 'OUTGOING' | 'INCOMING';
+   failureCode?: number;     // BOLT 4 failure code
+@@ -2559,6 +2563,7 @@ The matching commands are `wallet sweep-prepare <requestJson|requestFile>`, `wal
+ | POST | `/swaps/cancel` | `{ id }` | Cancel a swap before any funds moved: a reverse swap in CREATED or HELD (closes its hold invoice), a submarine swap before PAYING (the peer refunds its own coins at the refund height). Also ends a stranded reverse swap: EXPOSED, with `strandedHeight` set because this process found its funding absent past the refund height; the operator vouches the funding will not confirm, and spending its inputs makes sure. Answers `{ id, cancelled: true }`; past that a swap resolves on chain by claim or refund (409 `SWAP_NOT_CANCELLABLE`). Admin scope |
+ | POST | `/direct-funding/configure` | `{ lspPubkey?, lspHost?, lspPort?, targetInboundSat?, trusted?, allowSplice?, allowUnpairedSplice?, unpairedSpliceDepth?, minAmountSat? }` | Set the direct-funding policy. A partial MERGE, never a replace: a field the body does not name keeps its value. `trusted` lets an open go zero-conf; `allowSplice` lets a paired payer grow the existing channel with the liquidity peer instead of opening a second one; `allowUnpairedSplice` lets an anonymous payer do the same when its coin is confirmed, with a splice that locks at `unpairedSpliceDepth` confirmations (1..2016, default 3) rather than at broadcast, whatever the channel type (an anonymous payer with an unconfirmed coin still gets a new confirmed channel). While a splice with the liquidity peer is still confirming, every further offer is declined before the payer's witness leaves, so the payer falls back to a plain send. The three switches must be booleans (400 `INVALID_PARAMS` otherwise). `minAmountSat` clamps up to the 5000 sat floor and the response reports the clamped value. Returns the full effective config |
+ | GET | `/direct-funding/config` | -- | Read the effective policy, `allowUnpairedSplice` and `unpairedSpliceDepth` included; `lspPubkey` is null when no liquidity peer is set, in which case no offer is served |
++| GET | `/direct-funding/received` | -- | The payments received against our requests, newest first: `receiptHash` (the request's `paymentHash`), `requestId`, `offerId`, `fundingTxid`, `channelId`, `splice`, `amountSat`, `status` (`PAID`, or `REVERTED` when the splice it went into was undone), `paidAt`, and `lockedAt` once this node saw the funding lock (channel_ready for an open, splice_locked for a splice, both sent and received; issue #1899). `lockedAt` stays after the channel closes; for a lock from before this version it is the first start that recorded it, and on a zero-conf channel it comes before the funding confirms. A direct-funding payment settles no invoice and pays no address, so this is how a client tells its request was paid. Kept 30 days from the payment (or its lock or revert), at most 512, outliving the request itself. Readonly scope |
+ | POST | `/direct-funding/request` | `{ host?, port?, amountSats? }` | Mint a payment request: returns `{ paymentHash, expiresAt, request }`, where `request` is the base64url envelope a payer pays (BIP 21 parameter `bgnq`). `host`/`port` are the address a payer can reach this node on and are used exactly as given |
+ | POST | `/direct-funding/prepare` | `{ request }` | Decode a request and start connecting to the node a send would talk to first, without waiting for the dial. Returns `{ requestId, receiverNodeId, amountSat, expiresAt, connection, peerNodeId? }`, where `connection` is `connected`, `connecting`, `awaiting_receiver` or `none`. Spends nothing and writes no payment record; a later `send` joins a dial still in progress. Admin scope |
+ | POST | `/direct-funding/send` | `{ request, amountSats?, maxTotalFeeSat?, recoverReceipt? }` | Pay a request from one of our coins. Set `recoverReceipt` to ask the receiver to replay a receipt that never arrived (issue #767): it acts only on a post-witness payment with no receipt yet, re-sends the recorded offer with no second coin, signature or freeze, and returns the recorded outcome plus a `caveat` if the receiver cannot be reached. **Rejects only before our witness leaves the device**; after that it resolves with what is known plus a `caveat`, because a client that falls back to a plain on-chain send on any error cannot tell a late rejection from an early one and would pay twice. Idempotent on the request id, sets no deadline of its own, and accepts `feeHeadroomSats` as an alias for `maxTotalFeeSat`. The money leaves for a stranger's channel, so amount + fee ceiling counts against the combined daily spend limit, and a draining node refuses it (both before the exchange opens, and neither for a request that already has an attempt: a duplicate call spends nothing new, and refusing one would be read as "nothing happened") |
+diff --git a/src/cli/beignet-node.ts b/src/cli/beignet-node.ts
+index 8ac0266..bc126a8 100644
+--- a/src/cli/beignet-node.ts
++++ b/src/cli/beignet-node.ts
+@@ -198,6 +198,7 @@ import { getPublicKey } from '../lightning/crypto/ecdh';
+ import type {
+ 	IDfPaymentRecord,
+ 	IDfPrepareResult,
++	IDfReceivedRecord,
+ 	IDfSendResult
+ } from '../lightning/direct-funding';
+ import {
+@@ -1171,28 +1172,33 @@ function sentSats(info: IPaymentInfo): number | undefined {
+ /**
+  * A payment's amount as every public surface reports it (history, proof,
+  * stats): an outgoing amount is what left the node, fees included, rounded
+- * UP; an incoming amount rounds down, as the balance does (issue #1185).
+- * Truncating the outgoing figure let a send paying 20,001.5 sats from a
+- * 50,000 sat balance read 20,001 while the balance fell to 29,998. Rounding
+- * up makes one send agree with the balance when the balance held whole sats
+- * before it; sub-sat remainders across several sends can still differ from
+- * the balance by a sat, which only msat figures reconcile exactly.
++ * UP; an incoming amount is what the node was credited, rounded down, as the
++ * balance does (issue #1185). Truncating the outgoing figure let a send
++ * paying 20,001.5 sats from a 50,000 sat balance read 20,001 while the
++ * balance fell to 29,998. Rounding up makes one send agree with the balance
++ * when the balance held whole sats before it; sub-sat remainders across
++ * several sends can still differ from the balance by a sat, which only msat
++ * figures reconcile exactly.
+  */
+ function paymentAmountSats(info: IPaymentInfo): number {
+ 	return info.direction === PaymentDirection.OUTGOING
+ 		? sentSats(info) ?? spendLimitSats(info.amountMsat)
+-		: Number(info.amountMsat / 1000n);
++		: Number((info.receivedMsat ?? info.amountMsat) / 1000n);
+ }
+ 
+ /**
+- * The routing fee a payment paid, in msat, or undefined when the record does
+- * not say. An MPP record's route is its first part only, so its fee is what
+- * left the node over what the invoice asked (#1008).
++ * The fee a payment paid, in msat, or undefined when the record does not
++ * say. An MPP record's route is its first part only, so its fee is what left
++ * the node over what the invoice asked (#1008). An incoming payment's fee is
++ * a JIT LSP's skim: what the invoice asked over what the node was credited.
+  */
+ function paymentFeeMsat(info: IPaymentInfo): bigint | undefined {
+ 	if (info.sentMsat !== undefined && info.sentMsat >= info.amountMsat) {
+ 		return info.sentMsat - info.amountMsat;
+ 	}
++	if (info.receivedMsat !== undefined && info.receivedMsat < info.amountMsat) {
++		return info.amountMsat - info.receivedMsat;
++	}
+ 	return info.route?.totalFeeMsat;
+ }
+ 
+@@ -9324,6 +9330,12 @@ export class BeignetNode extends TypedEmitter<BeignetNodeEvents> {
+ 		if (!channel) return null;
+ 
+ 		const state = channel.getFullState();
++		// Nothing clears preReestablishState when a marked channel closes, so
++		// it names the earlier state only while the channel is still wrapped.
++		const wrappedState =
++			state.state === ChannelState.AWAITING_REESTABLISH
++				? state.preReestablishState
++				: null;
+ 		// Mid-negotiation v2 channels are keyed by temporary id in the peer map
+ 		// (see buildChannelInfo); fall back so diagnostics name the peer too.
+ 		const peerPubkey =
+@@ -9376,12 +9388,12 @@ export class BeignetNode extends TypedEmitter<BeignetNodeEvents> {
+ 			);
+ 		if (
+ 			state.state !== 'NORMAL' &&
+-			state.preReestablishState !== 'NORMAL' &&
++			wrappedState !== 'NORMAL' &&
+ 			!acceptsNewThrough
+ 		) {
+ 			issues.push(
+ 				`NOT_NORMAL: Channel state is ${state.state} (pre-reestablish: ${
+-					state.preReestablishState || 'none'
++					wrappedState || 'none'
+ 				}). Routing hints require a usable channel.`
+ 			);
+ 		}
+@@ -9406,7 +9418,7 @@ export class BeignetNode extends TypedEmitter<BeignetNodeEvents> {
+ 			channelId,
+ 			peerPubkey,
+ 			state: state.state,
+-			preReestablishState: state.preReestablishState || null,
++			preReestablishState: wrappedState || null,
+ 			isPeerConnected,
+ 			announceChannel: state.announceChannel,
+ 			announcementSigsSent: state.announcementSigsSent || false,
+@@ -9466,6 +9478,7 @@ export class BeignetNode extends TypedEmitter<BeignetNodeEvents> {
+ 		channelId: Buffer;
+ 		peerPubkey: string;
+ 		state: string;
++		preReestablishState?: string;
+ 		localBalanceMsat: bigint;
+ 		spendableOutboundMsat?: bigint;
+ 		remoteBalanceMsat: bigint;
+@@ -9479,6 +9492,7 @@ export class BeignetNode extends TypedEmitter<BeignetNodeEvents> {
+ 		pendingSpliceLocalBalanceMsat?: bigint;
+ 		pendingSpliceTxid?: string;
+ 		previousFundingTxids?: string[];
++		lockedFundingTxids?: string[];
+ 		htlcUsable?: boolean;
+ 		restoreRecencyUnproven?: boolean;
+ 		reestablishRecencyUnproven?: boolean;
+@@ -9525,6 +9539,8 @@ export class BeignetNode extends TypedEmitter<BeignetNodeEvents> {
+ 			capacitySats: Number(ch.fundingSatoshis),
+ 			isAnchor: isAnchorChannel(ch.channelType ?? null)
+ 		};
++		if (ch.preReestablishState)
++			info.preReestablishState = ch.preReestablishState as CS;
+ 		// What the connected peer's init negotiated, read rather than guessed:
+ 		// a client deciding whether to offer splice controls has no other way
+ 		// to know, and reconstructing feature bits client-side is exactly the
+@@ -9555,6 +9571,10 @@ export class BeignetNode extends TypedEmitter<BeignetNodeEvents> {
+ 			info.pendingSpliceTxid = ch.pendingSpliceTxid;
+ 		if (ch.previousFundingTxids && ch.previousFundingTxids.length > 0)
+ 			info.previousFundingTxids = [...ch.previousFundingTxids];
++		// What a wallet counts a funding as locked from once the channel has
++		// closed or its peer is away (issue #1899). Display order already.
++		if (ch.lockedFundingTxids && ch.lockedFundingTxids.length > 0)
++			info.lockedFundingTxids = [...ch.lockedFundingTxids];
+ 		// The dashboard's Send gating reads these off the wire; dropping them
+ 		// here re-parked every mid-splice channel in the UI while the daemon
+ 		// happily paid through the window.
+@@ -10302,6 +10322,17 @@ export class BeignetNode extends TypedEmitter<BeignetNodeEvents> {
+ 		return this.directFundingSender?.payments() ?? [];
+ 	}
+ 
++	/**
++	 * Every payment received against a request this node minted, newest first
++	 * (issue #1893). `receiptHash` is the `paymentHash` the request was minted
++	 * with. Kept after the request itself expires, so a client can still tell
++	 * its request was paid: a direct-funding payment settles no invoice and pays
++	 * no address, and REVERTED means the splice it went into was undone.
++	 */
++	listDirectFundingReceived(): IDfReceivedRecord[] {
++		return this.node.getDirectFundingRequests()?.received() ?? [];
++	}
++
+ 	/**
+ 	 * Map a coded protocol refusal onto the daemon's error vocabulary. The codes
+ 	 * are carried through verbatim: they are what tells the app a refusal to
+@@ -14860,7 +14891,7 @@ export class BeignetNode extends TypedEmitter<BeignetNodeEvents> {
+ 				}
+ 			} else if (p.direction === 'INCOMING' && p.status === 'COMPLETED') {
+ 				received++;
+-				satsReceived += Number(p.amountMsat / 1000n);
++				satsReceived += paymentAmountSats(p);
+ 			} else if (p.status === 'FAILED') {
+ 				failed++;
+ 			}
+diff --git a/src/cli/cli.ts b/src/cli/cli.ts
+index 35dae25..f48be9e 100644
+--- a/src/cli/cli.ts
++++ b/src/cli/cli.ts
+@@ -2127,6 +2127,8 @@ async function handleDirectFunding(): Promise<void> {
+ 		}
+ 		case 'config':
+ 			return outputResult(await httpRequest('GET', '/direct-funding/config'));
++		case 'received':
++			return outputResult(await httpRequest('GET', '/direct-funding/received'));
+ 		case 'request': {
+ 			// host/port are the operator's: they are signed into the request as the
+ 			// address a payer can reach this node on, and the daemon never guesses.
+@@ -2187,7 +2189,7 @@ async function handleDirectFunding(): Promise<void> {
+ 				error: {
+ 					code: 'UNKNOWN_COMMAND',
+ 					message:
+-						'Usage: beignet direct-funding [configure|config|request|prepare|send]'
++						'Usage: beignet direct-funding [configure|config|received|request|prepare|send]'
+ 				}
+ 			});
+ 			process.exitCode = 1;
+@@ -3239,6 +3241,8 @@ Direct funding (a payer's on-chain payment IS this node's channel funding):
+                                          MERGES: a field you do not name keeps
+                                          its value
+   direct-funding config                  Read the effective policy back
++  direct-funding received                List the payments received against
++                                         our requests
+   direct-funding request [sats] [--host H] [--port P]
+                                          Mint a payment request; the receipt
+                                          preimage stays here. --host/--port are
+diff --git a/src/cli/daemon.ts b/src/cli/daemon.ts
+index e62428b..6b05f17 100644
+--- a/src/cli/daemon.ts
++++ b/src/cli/daemon.ts
+@@ -2278,6 +2278,10 @@ async function bootDaemon(
+ 			);
+ 		},
+ 		'GET /direct-funding/config': () => success(node.getDirectFundingConfig()),
++		// What tells a client its request was paid: a direct-funding payment
++		// settles no invoice and pays no address (issue #1893).
++		'GET /direct-funding/received': () =>
++			success(node.listDirectFundingReceived()),
+ 		// Mint a payment request. The receipt preimage stays here; a payer whose
+ 		// funding carries the matching hash is answered with it after broadcast,
+ 		// which is a provable delivery receipt bound to this request.
+diff --git a/src/cli/openapi.ts b/src/cli/openapi.ts
+index 44b2e0b..ad4562f 100644
+--- a/src/cli/openapi.ts
++++ b/src/cli/openapi.ts
+@@ -425,6 +425,22 @@ export function getOpenApiSpec(): Record<string, unknown> {
+ 					}
+ 				}
+ 			},
++			'/direct-funding/received': {
++				get: {
++					summary:
++						"List the payments received against this node's direct-funding requests, newest first. receiptHash is the paymentHash /direct-funding/request returned. A direct-funding payment settles no invoice and pays no address, so this is how a client tells its request was paid. Kept for 30 days from the payment (or its lock or revert), at most 512, outliving the request itself. REVERTED means the splice the payment went into was undone because the payer spent the coin elsewhere. Readonly scope",
++					tags: ['DirectFunding'],
++					responses: {
++						'200': {
++							description: 'Payments received',
++							content: jsonContent({
++								type: 'array',
++								items: { $ref: '#/components/schemas/DirectFundingReceived' }
++							})
++						}
++					}
++				}
++			},
+ 			'/direct-funding/request': {
+ 				post: {
+ 					summary:
+@@ -5353,6 +5369,11 @@ export function getOpenApiSpec(): Record<string, unknown> {
+ 								'ANNOUNCEMENT_READY'
+ 							]
+ 						},
++						preReestablishState: {
++							type: 'string',
++							description:
++								'The state the channel was in when a disconnect, or a restart, put it in AWAITING_REESTABLISH; present exactly while it is there, so a client can tell a channel still opening from one already open while the peer is away (issue #1899)'
++						},
+ 						localBalanceSats: { type: 'integer' },
+ 						maxSendableSats: {
+ 							type: 'integer',
+@@ -5408,6 +5429,12 @@ export function getOpenApiSpec(): Record<string, unknown> {
+ 							description:
+ 								'Funding transaction ids this channel ran on before fundingTxid, oldest first, display byte order, one per adopted splice; absent on a channel that has never been spliced (issue #1060)'
+ 						},
++						lockedFundingTxids: {
++							type: 'array',
++							items: { type: 'string' },
++							description:
++								"Funding transaction ids this channel has locked, oldest first, display byte order: the open's funding once both channel_ready messages crossed, and each splice's funding once both splice_locked messages did. Kept through close, so it still answers after the channel closed or while its peer is away; a force close that adopts a confirmed splice locks nothing. Complete for locks recorded by this version: a channel written by an earlier one is seeded on load with what its stored state proves, so a txid not listed, or an absent field, means not known rather than never locked. On a zero-conf channel a lock comes before the funding confirms, so a listed txid is not proof of confirmation (issue #1899)"
++						},
+ 						htlcUsable: {
+ 							type: 'boolean',
+ 							description:
+@@ -5568,8 +5595,16 @@ export function getOpenApiSpec(): Record<string, unknown> {
+ 						payAll: { $ref: '#/components/schemas/PayAllPayment' },
+ 						paymentHash: { type: 'string' },
+ 						preimage: { type: 'string' },
+-						amountSats: { type: 'integer' },
+-						feeSats: { type: 'integer' },
++						amountSats: {
++							type: 'integer',
++							description:
++								'OUTGOING: what left the node, fees included, rounded up. INCOMING: what the node was credited, rounded down'
++						},
++						feeSats: {
++							type: 'integer',
++							description:
++								"OUTGOING: routing fee paid. INCOMING: a JIT LSP's skim, the invoice amount less what was credited. Rounded up"
++						},
+ 						status: {
+ 							type: 'string',
+ 							enum: ['PENDING', 'COMPLETED', 'FAILED']
+@@ -5869,6 +5904,44 @@ export function getOpenApiSpec(): Record<string, unknown> {
+ 						}
+ 					}
+ 				},
++				DirectFundingReceived: {
++					type: 'object',
++					properties: {
++						receiptHash: {
++							type: 'string',
++							description:
++								'The paymentHash the request was minted with, and the first field of its envelope'
++						},
++						requestId: { type: 'string' },
++						offerId: { type: 'string' },
++						fundingTxid: {
++							type: 'string',
++							description:
++								'The splice or open transaction the payment went into'
++						},
++						channelId: { type: 'string' },
++						splice: {
++							type: 'boolean',
++							description:
++								'A splice into an existing channel rather than a new open'
++						},
++						amountSat: {
++							type: 'string',
++							description: 'Decimal satoshis the payment funded'
++						},
++						status: { type: 'string', enum: ['PAID', 'REVERTED'] },
++						paidAt: {
++							type: 'integer',
++							description: 'When the receipt was revealed, ms since epoch'
++						},
++						lockedAt: {
++							type: 'integer',
++							description:
++								"When this node saw the funding lock, ms since epoch: the channel recorded fundingTxid as locked (channel_ready for an open, splice_locked for a splice, both sent and received). Absent until then; kept within the record's retention after the channel closes, and on a record later marked REVERTED. For a lock from before this version, the first start that recorded it. On a zero-conf channel a lock comes before the funding confirms, so this is not proof of confirmation (issue #1899)"
++						},
++						updatedAt: { type: 'integer' }
++					}
++				},
+ 				DirectFundingPrepareResult: {
+ 					type: 'object',
+ 					properties: {
+diff --git a/src/cli/routes.ts b/src/cli/routes.ts
+index 4002034..0873594 100644
+--- a/src/cli/routes.ts
++++ b/src/cli/routes.ts
+@@ -212,6 +212,8 @@ const ROUTE_TABLE = [
+ 	{ method: 'POST', path: '/direct-funding/request', scopes: ['invoice'] },
+ 	// Policy readback, no secrets in it.
+ 	{ method: 'GET', path: '/direct-funding/config', scopes: ['readonly'] },
++	// Payments received against our requests: amounts and txids, no secrets.
++	{ method: 'GET', path: '/direct-funding/received', scopes: ['readonly'] },
+ 	{ method: 'POST', path: '/invoice/create-hold', scopes: ['invoice'] },
+ 	{ method: 'POST', path: '/invoice/settle-hold', scopes: ['invoice'] },
+ 	{ method: 'POST', path: '/invoice/cancel-hold', scopes: ['invoice'] },
+diff --git a/src/cli/types.ts b/src/cli/types.ts
+index 181f3c5..7ac7165 100644
+--- a/src/cli/types.ts
++++ b/src/cli/types.ts
+@@ -165,6 +165,13 @@ export interface ChannelInfo {
+ 	channelId: ChannelIdHex;
+ 	peerPubkey: string;
+ 	state: ChannelStateString;
++	/**
++	 * The state the channel was in when a disconnect, or a restart, put it in
++	 * AWAITING_REESTABLISH; present exactly while it is there. It tells a
++	 * channel still opening from one already open while the peer is away
++	 * (issue #1899).
++	 */
++	preReestablishState?: ChannelStateString;
+ 	localBalanceSats: number;
+ 	/** Balance-based debit ceiling for one new outbound HTLC, floored to
+ 	 * sats, before routing fees and route HTLC limits. Zero when unavailable.
+@@ -199,6 +206,18 @@ export interface ChannelInfo {
+ 	 * has never been spliced (issue #1060).
+ 	 */
+ 	previousFundingTxids?: TxidHex[];
++	/**
++	 * Funding txids this channel has locked, oldest first (display byte
++	 * order): the open's funding once both channel_ready messages crossed,
++	 * and each splice's funding once both splice_locked messages did (issue
++	 * #1899). Kept through close. Complete for the locks this version
++	 * recorded; a channel written by an earlier version is seeded on load
++	 * with what its stored state proves, so treat a txid that is not listed,
++	 * and an absent field, as "not known", not as "never locked". On a
++	 * zero-conf channel a lock comes before the funding confirms, so a listed
++	 * txid is not proof of confirmation.
++	 */
++	lockedFundingTxids?: TxidHex[];
+ 	/** Whether the channel will accept a NEW HTLC (0.6.0+). */
+ 	htlcUsable?: boolean;
+ 	ffor?: {
+diff --git a/src/electrum/index.ts b/src/electrum/index.ts
+index a498d34..ec88444 100644
+--- a/src/electrum/index.ts
++++ b/src/electrum/index.ts
+@@ -1430,16 +1430,20 @@ export class Electrum {
+ 	 * answered for each script hash. A script hash found here is not asked
+ 	 * again, and every one the server answers is added to it. One the server
+ 	 * failed is left out, which is how the gap scan tells it from unused.
++	 * @param {IAddresses} [additionalScriptHashes] Read besides the addresses
++	 * picked above.
+ 	 * @returns {Promise<Result<IGetAddressHistoryResponse[]>>}
+ 	 */
+ 	async getAddressHistory({
+ 		scriptHashes = [],
+ 		scanAllAddresses = false,
+-		answered
++		answered,
++		additionalScriptHashes = {}
+ 	}: {
+ 		scriptHashes?: IAddress[];
+ 		scanAllAddresses?: boolean;
+ 		answered?: Map<string, TTxResult[]>;
++		additionalScriptHashes?: IAddresses;
+ 	}): Promise<Result<IGetAddressHistoryResponse[]>> {
+ 		try {
+ 			if (this._disconnected) return err(DISCONNECTED_ERROR);
+@@ -1508,6 +1512,7 @@ export class Electrum {
+ 					addToScan(changeAddressValues);
+ 				});
+ 			}
++			addToScan(Object.values(additionalScriptHashes));
+ 			scriptHashes = [...toScan.values()];
+ 			if (scriptHashes.length < 1) {
+ 				return err('No scriptHashes available to check.');
+diff --git a/src/lightning/README.md b/src/lightning/README.md
+index e1a8d9c..250918a 100644
+--- a/src/lightning/README.md
++++ b/src/lightning/README.md
+@@ -1312,7 +1312,7 @@ const result = await node.recoverFromStaticChannelBackup(scb.channels);
+ | `splice:complete` | `(data: { channelId: Buffer; fundingTxid: Buffer \| null \| undefined })` | splice_locked exchanged both ways: the channel runs on the new funding. |
+ | `splice:aborted` | `(data: { channelId: Buffer; reason: string })` | A splice negotiation was unwound by tx_abort before its point of no return. |
+ | `splice:conflicted` | `(data: { channelId: Buffer; spliceTxid: string; conflictTxid: string; inputIndex: number; height: number })` | An input of an in-flight splice that this node does not vouch for (a depth-locked splice carrying a stranger's coin, issue #760) was spent by another transaction, confirmed six deep while the splice is not on chain: the splice can never confirm. The node records it durably, raises `node:error` code `SPLICE_INPUT_CONFLICT`, and asks the peer to verify and revert; the request is re-sent every block and on reconnect until agreed. |
+-| `splice:reverted` | `(data: { channelId: Buffer; spliceTxid: string; conflictTxid: string })` | A conflicted splice was unwound by agreement: both sides verified the conflict on their own chain view and returned to the pre-splice funding, which both still hold valid commitments for. The channel is NORMAL on the old outpoint, its watch re-armed; a `spliceInAndWait` on that splice rejects, and a direct-funding request behind it is failed (`direct-funding:offer:failed`, "the payer spent the offered coin elsewhere"). |
++| `splice:reverted` | `(data: { channelId: Buffer; spliceTxid: string; conflictTxid: string })` | A conflicted splice was unwound by agreement: both sides verified the conflict on their own chain view and returned to the pre-splice funding, which both still hold valid commitments for. The channel is NORMAL on the old outpoint, its watch re-armed; a `spliceInAndWait` on that splice rejects, and a direct-funding request behind it is failed (`direct-funding:offer:failed`, "the payer spent the offered coin elsewhere"), or, when its receipt already went out, its received record is marked REVERTED. |
+ | `htlc:forward` | `(inChannelId: Buffer, outChannelId: Buffer, amountMsat: bigint, paymentHash: Buffer)` | An HTLC was relayed to the next hop. |
+ | `htlc:forwarded` | `(data: { inChannelId: Buffer; outChannelId: Buffer; amountInMsat: bigint; amountOutMsat: bigint; feeMsat: bigint })` | A forwarded HTLC settled: the fee was earned. |
+ | `htlc:forward-failed` | `(data: { inChannelId: Buffer; outChannelId: Buffer })` | A forwarded HTLC failed downstream. |
+diff --git a/src/lightning/channel/channel-manager.ts b/src/lightning/channel/channel-manager.ts
+index ce42132..e867817 100644
+--- a/src/lightning/channel/channel-manager.ts
++++ b/src/lightning/channel/channel-manager.ts
+@@ -729,7 +729,7 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
+ 	private ownChannelIndex: {
+ 		revision: number;
+ 		byScid: Map<string, Channel[]>;
+-		peers: Set<string>;
++		peers: Map<string, number>;
+ 	} | null = null;
+ 	/** Synchronous funding promotions reserved across reentrant observers. */
+ 	private channelIdReservations: Map<string, Channel> = new Map();
+@@ -1775,7 +1775,8 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
+ 		paymentHash: Buffer,
+ 		cltvExpiry: number,
+ 		onionRoutingPacket: Buffer,
+-		blindingPoint?: Buffer
++		blindingPoint?: Buffer,
++		skimmedFeeMsat?: bigint
+ 	): ChannelResult {
+ 		const idHex = channelId.toString('hex');
+ 		const channel = this.channels.get(idHex);
+@@ -1796,7 +1797,8 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
+ 			paymentHash,
+ 			cltvExpiry,
+ 			onionRoutingPacket,
+-			blindingPoint
++			blindingPoint,
++			skimmedFeeMsat
+ 		);
+ 		this.processActions(peerPubkey, channel, actions);
+ 
+@@ -2808,6 +2810,11 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
+ 			// constant, which above 1,000,000 sat is LESS than the peer
+ 			// requires of us. Raise it (issue #387).
+ 			channel.repairKeptChannelReserve();
++			// Rows written before lockedFundingTxids existed get what they prove
++			// (issue #1899). The method reads through a wrapped state, so the
++			// order against markForReestablish does not matter. Not persisted
++			// here: the next write of the row carries it.
++			channel.backfillLockedFundingTxids();
+ 
+ 			// Mark channels for reestablishment — after a restart the peer
+ 			// connection is lost, so we must complete channel_reestablish
+@@ -2965,9 +2972,14 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
+ 		return this.getOwnChannelIndex().peers.has(pubkey);
+ 	}
+ 
++	/** How many of `pubkey`'s channels hasChannelWithPeer counts. */
++	countChannelsWithPeer(pubkey: string): number {
++		return this.getOwnChannelIndex().peers.get(pubkey) ?? 0;
++	}
++
+ 	private getOwnChannelIndex(): {
+ 		byScid: Map<string, Channel[]>;
+-		peers: Set<string>;
++		peers: Map<string, number>;
+ 	} {
+ 		// Every counter only grows, so the sum changes whenever any of them does.
+ 		const revision =
+@@ -2978,7 +2990,7 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
+ 		if (this.ownChannelIndex?.revision === revision)
+ 			return this.ownChannelIndex;
+ 		const byScid = new Map<string, Channel[]>();
+-		const peers = new Set<string>();
++		const peers = new Map<string, number>();
+ 		for (const map of [this.channels, this.tempChannels]) {
+ 			for (const channel of map.values()) {
+ 				const state = channel.getFullState();
+@@ -2995,7 +3007,7 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
+ 				}
+ 				const channelId = channel.getChannelId();
+ 				const peer = channelId && this.getPeerForChannel(channelId);
+-				if (peer) peers.add(peer);
++				if (peer) peers.set(peer, (peers.get(peer) ?? 0) + 1);
+ 			}
+ 		}
+ 		this.ownChannelIndex = { revision, byScid, peers };
+diff --git a/src/lightning/channel/channel-state.ts b/src/lightning/channel/channel-state.ts
+index 10e3ad8..f98ec3c 100644
+--- a/src/lightning/channel/channel-state.ts
++++ b/src/lightning/channel/channel-state.ts
+@@ -720,6 +720,19 @@ export interface IChannelState {
+ 	 * written before the field existed and on a never-spliced channel.
+ 	 */
+ 	previousFundingTxids?: Buffer[];
++	/**
++	 * Every funding txid this channel has locked, oldest first (internal byte
++	 * order), no duplicates (issue #1899): the open's funding once both
++	 * channel_ready messages have crossed, and each splice's funding once both
++	 * splice_locked messages have. A force close that adopts a confirmed
++	 * splice locks nothing and adds nothing. Kept through close, so a client
++	 * can still tell that a funding locked after the channel is gone or while
++	 * its peer is away. Persisted; absent on a channel that has locked
++	 * nothing yet, and on rows written before the field existed until the
++	 * restore backfill (Channel.backfillLockedFundingTxids) seeds what the row
++	 * proves.
++	 */
++	lockedFundingTxids?: Buffer[];
+ 	/**
+ 	 * Issue #764: the splice (txid in internal byte order) that the commitment
+ 	 * this FORCE_CLOSED channel broadcast spends, when the chain had that
+diff --git a/src/lightning/channel/channel.ts b/src/lightning/channel/channel.ts
+index 865dd9f..c715c4d 100644
+--- a/src/lightning/channel/channel.ts
++++ b/src/lightning/channel/channel.ts
+@@ -1482,7 +1482,9 @@ export class Channel {
+ 	 * The two funding keys of the 2-of-2, once both sides are known. What the
+ 	 * direct-funding attestation binds a payer's coin to: the payer rebuilds the
+ 	 * funding script from these and refuses if the transaction's output is not
+-	 * it. Null before accept_channel2 has delivered the peer's key.
++	 * it. Null before accept_channel2 has delivered the peer's key. During a
++	 * splice this is still the pair the shared input spends; the new output's
++	 * pair is getPendingSpliceTx().newFundingPubkeys.
+ 	 */
+ 	getFundingPubkeys(): { local: Buffer; remote: Buffer } | null {
+ 		const local = this._state.localBasepoints?.fundingPubkey;
+@@ -3009,6 +3011,12 @@ export class Channel {
+ 
+ 		if (this._state.remoteChannelReady) {
+ 			this._state.state = ChannelState.NORMAL;
++			// Both channel_ready messages have crossed: the open's funding is
++			// locked (issue #1899). Recorded here and in handleChannelReady,
++			// the only two places both flags become true, so every path to an
++			// open lock (depth, zero-conf, a v2 early ready, a reestablish
++			// flush) records it once, in the persist the transition gets.
++			this._recordFundingLock(this._state.fundingTxid);
+ 			// The peer's channel_ready means it holds the complete funding tx,
+ 			// so the v2 opening record has nothing left to resume or retransmit
+ 			// (the funding tx itself stays in pendingFundingTxHex until depth).
+@@ -3051,6 +3059,20 @@ export class Channel {
+ 		);
+ 	}
+ 
++	/**
++	 * Append a funding this channel has locked to lockedFundingTxids (issue
++	 * #1899), once. A lock is retransmitted on every reconnect and a
++	 * restored row can be backfilled with the same funding, so a txid
++	 * already in the list is not added again. Callers persist through the
++	 * transition they record, never a write of their own.
++	 */
++	private _recordFundingLock(txid: Buffer | null | undefined): void {
++		if (!txid) return;
++		const locked = this._state.lockedFundingTxids ?? [];
++		if (locked.some((t) => t.equals(txid))) return;
++		this._state.lockedFundingTxids = [...locked, Buffer.from(txid)];
++	}
++
+ 	/**
+ 	 * Consume a stashed early channel_ready (issue #572): the peer's ready
+ 	 * arrived while our v2 tx_signatures were withheld on an external
+@@ -3256,6 +3278,8 @@ export class Channel {
+ 
+ 		if (this._state.localChannelReady) {
+ 			this._state.state = ChannelState.NORMAL;
++			// The open's lock, as in fundingConfirmed (issue #1899).
++			this._recordFundingLock(this._state.fundingTxid);
+ 			// Mirror of fundingConfirmed: the peer's channel_ready means the v2
+ 			// opening record has nothing left to resume or retransmit, and no
+ 			// other attempt of this open can confirm any more.
+@@ -3593,8 +3617,15 @@ export class Channel {
+ 		paymentHash: Buffer,
+ 		cltvExpiry: number,
+ 		onionRoutingPacket: Buffer,
+-		blindingPoint?: Buffer
++		blindingPoint?: Buffer,
++		skimmedFeeMsat?: bigint
+ 	): ChannelAction[] {
++		if (
++			skimmedFeeMsat !== undefined &&
++			(skimmedFeeMsat < 0n || skimmedFeeMsat > 0xffffffffffffffffn)
++		) {
++			throw new Error('skimmedFeeMsat must fit in u64');
++		}
+ 		const refusal = this.validateOutgoingHtlc(amountMsat, cltvExpiry);
+ 		if (refusal.length > 0) return refusal;
+ 		const htlcId = this._state.localHtlcCounter++;
+@@ -3630,6 +3661,7 @@ export class Channel {
+ 			onionRoutingPacket,
+ 			...(blindingPoint ? { blindingPoint } : {})
+ 		};
++		if (skimmedFeeMsat !== undefined) msg.skimmedFeeMsat = skimmedFeeMsat;
+ 
+ 		// We added an offered HTLC — we owe the remote a commitment_signed.
+ 		this._state.needsCommitment = true;
+@@ -11121,6 +11153,61 @@ export class Channel {
+ 		return true;
+ 	}
+ 
++	/**
++	 * Seed lockedFundingTxids on a row written before the field existed, from
++	 * what the row itself proves (issue #1899). Returns whether it seeded
++	 * anything; the next persist writes it, and until then every load seeds
++	 * the same list again.
++	 *
++	 * Two facts prove a lock. Both channel_ready flags set means the open
++	 * locked, and its funding is the first one the channel ran on. A channel
++	 * whose effective state is NORMAL, SPLICING, SHUTTING_DOWN or
++	 * NEGOTIATING_CLOSING got there through a lock of the funding it runs on
++	 * now: each of the last three is reached only through NORMAL, and
++	 * fundingTxid stays the old, locked funding for the whole pending-lock
++	 * window of a splice, moving only when completeSplice adopts it.
++	 *
++	 * Nothing else is guessed. A splice funding that locked and was retired
++	 * by a later splice, the current funding of a closed channel, and the
++	 * open's funding of a row spliced before previousFundingTxids existed all
++	 * stay unknown: a closed channel may have adopted its funding by force
++	 * close, which locks nothing. Rows that already carry the field are left
++	 * alone.
++	 */
++	backfillLockedFundingTxids(): boolean {
++		const s = this._state;
++		if (s.lockedFundingTxids !== undefined) return false;
++		if (s.localChannelReady && s.remoteChannelReady) {
++			// The open's funding is the first one the channel ran on. A row
++			// spliced before previousFundingTxids existed (0.31) has no history
++			// to name it, and its fundingTxid may be a splice a force close
++			// adopted with no lock. Every adoption sets hasBeenSpliced (since
++			// #1020) and leaves spliceFundingTxid equal to fundingTxid, so a
++			// row showing either seeds nothing from this rule.
++			const adopted =
++				s.hasBeenSpliced === true ||
++				(!!s.spliceFundingTxid &&
++					!!s.fundingTxid &&
++					s.spliceFundingTxid.equals(s.fundingTxid));
++			this._recordFundingLock(
++				s.previousFundingTxids?.[0] ?? (adopted ? null : s.fundingTxid)
++			);
++		}
++		const st =
++			s.state === ChannelState.AWAITING_REESTABLISH
++				? s.preReestablishState
++				: s.state;
++		if (
++			st === ChannelState.NORMAL ||
++			st === ChannelState.SPLICING ||
++			st === ChannelState.SHUTTING_DOWN ||
++			st === ChannelState.NEGOTIATING_CLOSING
++		) {
++			this._recordFundingLock(s.fundingTxid);
++		}
++		return s.lockedFundingTxids !== undefined;
++	}
++
+ 	/**
+ 	 * Refuse to resume a restored v2 open whose commitment #0 could never be
+ 	 * broadcast, on load. Returns whether it tore one down (issue #387).
+@@ -14221,6 +14308,18 @@ export class Channel {
+ 		);
+ 	}
+ 
++	/**
++	 * Whether this channel has recorded a lock of the named funding (display
++	 * txid) in lockedFundingTxids (issue #1899). False for a funding the record
++	 * does not know, which is not proof that it never locked.
++	 */
++	hasLockedFunding(fundingTxidDisplayHex: string): boolean {
++		const internal = Buffer.from(fundingTxidDisplayHex, 'hex').reverse();
++		return (this._state.lockedFundingTxids ?? []).some((t) =>
++			t.equals(internal)
++		);
++	}
++
+ 	/**
+ 	 * Record that an input of the in-flight splice was spent elsewhere and the
+ 	 * spend confirmed (issue #760). Only while the splice is in flight and the
+@@ -15762,6 +15861,13 @@ export class Channel {
+ 		const adopted = this._computeSpliceAdoption();
+ 		if (!adopted) return;
+ 		Object.assign(this._state, adopted);
++		// The splice's funding is locked (issue #1899). Both callers,
++		// handleSpliceLocked and sendSpliceLocked, get here only once
++		// splice_locked has crossed in both directions, and both persist the
++		// step. Recorded here rather than in _computeSpliceAdoption, which a
++		// force close also runs to adopt a confirmed splice no splice_locked
++		// ever locked. An adoption that moved no funding records nothing.
++		this._recordFundingLock(adopted.fundingTxid);
+ 		this._finishSpliceRuntime();
+ 	}
+ 
+@@ -19945,12 +20051,18 @@ export class Channel {
+ 	 * a delivery it crashed part way through reads (issue #645): an owner that
+ 	 * has been credited leaves the owed list, and only the release flag says
+ 	 * whether its witness bought anything.
++	 *
++	 * `newFundingPubkeys` are the keys of the new funding output's 2-of-2. The
++	 * peer may have sent a fresh funding key for this splice, so they can
++	 * differ from getFundingPubkeys(), which the shared input spends until the
++	 * splice locks (issue #1871).
+ 	 */
+ 	getPendingSpliceTx(): {
+ 		tx: import('bitcoinjs-lib').Transaction;
+ 		spliceTxid: Buffer;
+ 		sharedInputIndex: number;
+ 		newFundingOutputIndex: number;
++		newFundingPubkeys: { local: Buffer; remote: Buffer } | null;
+ 		prevouts: { scripts: Buffer[]; values: bigint[] } | null;
+ 		owedExternalInputs: Array<{
+ 			inputIndex: number;
+@@ -19979,11 +20091,22 @@ export class Channel {
+ 				prevTxid: Buffer.from(st.tx.ins[inputIndex].hash),
+ 				prevOutputIndex: st.tx.ins[inputIndex].index
+ 			}));
++		// Resolved as buildAndSignSpliceTx resolved it; a restored session
++		// carries the key from the in-flight record.
++		const local = this._state.localBasepoints?.fundingPubkey;
++		const remote =
++			this._spliceSession?.getRemoteFundingPubkey() ??
++			this._state.spliceInFlight?.remoteFundingPubkey ??
++			this._state.remoteBasepoints?.fundingPubkey;
+ 		return {
+ 			tx: clone,
+ 			spliceTxid: Buffer.from(st.tx.getHash()),
+ 			sharedInputIndex: st.sharedInputIndex,
+ 			newFundingOutputIndex: st.newFundingOutputIndex,
++			newFundingPubkeys:
++				local && remote
++					? { local: Buffer.from(local), remote: Buffer.from(remote) }
++					: null,
+ 			prevouts: this._spliceInputPrevouts(),
+ 			owedExternalInputs: outpointsOf(this._spliceOwedExternal()),
+ 			filledExternalInputs: outpointsOf(this._spliceFilledExternal()),
+diff --git a/src/lightning/direct-funding/index.ts b/src/lightning/direct-funding/index.ts
+index 3957e42..e59e98b 100644
+--- a/src/lightning/direct-funding/index.ts
++++ b/src/lightning/direct-funding/index.ts
+@@ -58,7 +58,8 @@ export {
+ 	ownershipDigest,
+ 	ownershipMessage,
+ 	ownershipProbePoisonTxid,
+-	ownershipProbeTransaction
++	ownershipProbeTransaction,
++	spliceAttestationMessage
+ } from './messages';
+ export type {
+ 	IDfAttestation,
+@@ -75,6 +76,9 @@ export type {
+ export {
+ 	DF_DEFAULT_MAX_OUTSTANDING,
+ 	DF_DEFAULT_SWEEP_INTERVAL_MS,
++	DF_MAX_RECEIVED_RECORDS,
++	DF_RECEIVED_RETENTION_MS,
++	DF_RECEIVED_STORAGE_KEY,
+ 	DF_REQUESTS_STORAGE_KEY,
+ 	DirectFundingRequestStore,
+ 	requestEncryptionPublicKey
+@@ -110,11 +114,13 @@ export {
+ 	isUnknownTransport
+ } from './types';
+ export type {
++	DfReceivedStatus,
+ 	DfTransportDescriptor,
+ 	IDfAttemptFunding,
+ 	IDfBlindedHop,
+ 	IDfDirectPeerTransport,
+ 	IDfOnionTransport,
++	IDfReceivedRecord,
+ 	IDfRelayTransport,
+ 	IDfRequestEnvelope,
+ 	IDfRequestRecord,
+diff --git a/src/lightning/direct-funding/messages.ts b/src/lightning/direct-funding/messages.ts
+index ba29d88..e42a686 100644
+--- a/src/lightning/direct-funding/messages.ts
++++ b/src/lightning/direct-funding/messages.ts
+@@ -130,8 +130,20 @@ export interface IDfPrevout {
+ 
+ export interface IDfAttestation {
+ 	fundingOutputIndex: number;
++	/** The keys of the funding output's 2-of-2. */
+ 	localFundingPubkey: Buffer;
+ 	remoteFundingPubkey: Buffer;
++	/**
++	 * Splice only, and only when a funding key was rotated for it: the keys of
++	 * the 2-of-2 the shared input spends. A splice may pay a new pair (a peer
++	 * deriving a fresh funding key per splice is the common case), so the old
++	 * funding and the new output are then two scripts, and the signature covers
++	 * both through `spliceAttestationMessage`. Absent, the shared input spends
++	 * the same 2-of-2 the output pays and `attestationMessage` is what is
++	 * signed. Carried in an odd TLV: a payer that predates it finds the shared
++	 * input is not the attested 2-of-2 and refuses, as it did before.
++	 */
++	priorFundingPubkeys?: { local: Buffer; remote: Buffer };
+ 	/** Raw 65-byte compact recoverable signature by the receiver's node key. */
+ 	signature: Buffer;
+ }
+@@ -486,9 +498,13 @@ const SIGN_REQUEST_TYPES = {
+ 	localFundingPubkey: 8n,
+ 	remoteFundingPubkey: 10n,
+ 	attestationSignature: 12n,
+-	sharedInputIndex: 13n
++	sharedInputIndex: 13n,
++	/** Odd: 33-byte local then 33-byte remote key of the spliced-away funding. */
++	priorFundingPubkeys: 15n
+ };
+ 
++const PRIOR_FUNDING_PUBKEYS_BYTES = 2 * DF_NODE_ID_BYTES;
++
+ function encodePrevouts(prevouts: IDfPrevout[]): Buffer {
+ 	if (prevouts.length > DF_MAX_PREVOUTS) {
+ 		throw malformed(
+@@ -574,6 +590,16 @@ export function encodeDfSignRequest(s: IDfSignRequest): Buffer {
+ 			value: u32Buf(s.sharedInputIndex, 'shared input index')
+ 		});
+ 	}
++	const prior = s.attestation.priorFundingPubkeys;
++	if (prior) {
++		records.push({
++			type: SIGN_REQUEST_TYPES.priorFundingPubkeys,
++			value: Buffer.concat([
++				fixed(prior.local, DF_NODE_ID_BYTES, 'prior local funding pubkey'),
++				fixed(prior.remote, DF_NODE_ID_BYTES, 'prior remote funding pubkey')
++			])
++		});
++	}
+ 	return encodeTlvStream(records);
+ }
+ 
+@@ -584,6 +610,10 @@ export function decodeDfSignRequest(data: Buffer): IDfSignRequest {
+ 		'funding_sign_request'
+ 	);
+ 	const shared = f.get(SIGN_REQUEST_TYPES.sharedInputIndex);
++	const prior = f.get(SIGN_REQUEST_TYPES.priorFundingPubkeys);
++	const priorBytes = prior
++		? fixed(prior, PRIOR_FUNDING_PUBKEYS_BYTES, 'prior funding pubkeys')
++		: undefined;
+ 	return {
+ 		offerId: needFixed(
+ 			f,
+@@ -617,6 +647,14 @@ export function decodeDfSignRequest(data: Buffer): IDfSignRequest {
+ 				DF_NODE_ID_BYTES,
+ 				'remote funding pubkey'
+ 			),
++			...(priorBytes
++				? {
++						priorFundingPubkeys: {
++							local: Buffer.from(priorBytes.subarray(0, DF_NODE_ID_BYTES)),
++							remote: Buffer.from(priorBytes.subarray(DF_NODE_ID_BYTES))
++						}
++				  }
++				: {}),
+ 			signature: needFixed(
+ 				f,
+ 				SIGN_REQUEST_TYPES.attestationSignature,
+@@ -1011,3 +1049,42 @@ export function attestationMessage(
+ 		`${fundingOutputIndex}:${localFundingPubkey.toString('hex')}`
+ 	);
+ }
++
++/**
++ * The attestation string for a splice that rotated a funding key (issue
++ * #1871): the shared input spends one 2-of-2 and the funding output pays
++ * another, so the receiver vouches for both, and for which input spends the
++ * old one. Every key is named rather than left to the script hashes, and the
++ * prefix differs from `attestationMessage`'s so a signature over one form
++ * never verifies as the other.
++ */
++export function spliceAttestationMessage(
++	offerId: Buffer,
++	rawTx: Buffer,
++	fundingOutputIndex: number,
++	fundingPubkeys: { local: Buffer; remote: Buffer },
++	sharedInputIndex: number,
++	priorFundingPubkeys: { local: Buffer; remote: Buffer }
++): string {
++	fixed(offerId, DF_OFFER_ID_BYTES, 'offer id');
++	const keys = [
++		fixed(fundingPubkeys.local, DF_NODE_ID_BYTES, 'local funding pubkey'),
++		fixed(fundingPubkeys.remote, DF_NODE_ID_BYTES, 'remote funding pubkey'),
++		fixed(
++			priorFundingPubkeys.local,
++			DF_NODE_ID_BYTES,
++			'prior local funding pubkey'
++		),
++		fixed(
++			priorFundingPubkeys.remote,
++			DF_NODE_ID_BYTES,
++			'prior remote funding pubkey'
++		)
++	].map((k) => k.toString('hex'));
++	const txHash = sha256(rawTx).toString('hex');
++	return (
++		`lfbw-direct-funding-splice-attest:${offerId.toString('hex')}:${txHash}:` +
++		`${fundingOutputIndex}:${keys[0]}:${keys[1]}:` +
++		`${sharedInputIndex}:${keys[2]}:${keys[3]}`
++	);
++}
+diff --git a/src/lightning/direct-funding/receiver/engine.ts b/src/lightning/direct-funding/receiver/engine.ts
+index f8fe67e..b7fbf5b 100644
+--- a/src/lightning/direct-funding/receiver/engine.ts
++++ b/src/lightning/direct-funding/receiver/engine.ts
+@@ -65,15 +65,21 @@ import {
+ 	decodeDfWitness,
+ 	encodeDfOfferAck,
+ 	encodeDfReceipt,
+-	encodeDfSignRequest
++	encodeDfSignRequest,
++	spliceAttestationMessage
+ } from '../messages';
+-import type { IDfAttemptFunding, IDfRequestRecord } from '../types';
++import type {
++	IDfAttemptFunding,
++	IDfReceivedRecord,
++	IDfRequestRecord
++} from '../types';
+ import { DF_SIGNATURE_BYTES, DirectFundingError } from '../types';
+ import type { DfTransportRegistry } from '../transport/registry';
+ import type { IDfInboundFrame, IDfLaneSender } from '../transport/types';
+ import type { IDfOfferSession } from './sessions';
+ import { contentHashOf, DfOfferSessions, outpointKey } from './sessions';
+ import {
++	attestedKeysProblem,
+ 	classifyOfferedCoin,
+ 	fundingTransactionProblem,
+ 	offerFieldProblem,
+@@ -170,6 +176,8 @@ interface IDfFinalTx {
+ 	baseFundingValueSat?: bigint;
+ 	/** Splice only. */
+ 	sharedInputIndex?: number;
++	/** Splice only: the new output's pair, when the channel reports it. */
++	newFundingPubkeys?: { local: Buffer; remote: Buffer };
+ }
+ 
+ interface DfFinalTxWaiter {
+@@ -358,6 +366,9 @@ export class DirectFundingReceiver extends TypedEmitter<DirectFundingReceiverEve
+ 				this.deps.onSpliceReverted((e) => this.failRevertedSpliceFunding(e))
+ 			);
+ 		}
++		// After the subscription, so no revert falls between the two.
++		this.markRevertedReceipts();
++		this.markLockedReceipts();
+ 		this.sweepTimer = setInterval(() => {
+ 			this.state.sweep(this.now());
+ 			this.retireLapsedFundings();
+@@ -510,6 +521,65 @@ export class DirectFundingReceiver extends TypedEmitter<DirectFundingReceiverEve
+ 			});
+ 			this.emit('offer:failed', { offerId: held.offerIdHex, reason });
+ 		}
++		// A funding whose receipt already went out is no longer held above, and
++		// its request still reads paid. Its received record is what says it was
++		// not (issue #1893).
++		this.deps.requests.markReceivedReverted(e.spliceTxid);
++	}
++
++	/**
++	 * Mark the received payments whose splice the channel remembers reverting
++	 * (issue #1893): the event that marks one fires once, and a mark that did
++	 * not reach storage, or a revert from before this receiver was listening,
++	 * would otherwise read as paid for good. A record with no channel, one
++	 * backfilled from a tombstone, cannot be checked.
++	 */
++	private markRevertedReceipts(): void {
++		if (!this.deps.hasRevertedSplice) return;
++		for (const entry of this.deps.requests.received()) {
++			if (entry.status !== 'PAID' || !entry.splice || !entry.channelId) {
++				continue;
++			}
++			if (this.deps.hasRevertedSplice(entry.channelId, entry.fundingTxid)) {
++				this.deps.requests.markReceivedReverted(entry.fundingTxid);
++			}
++		}
++	}
++
++	/**
++	 * Set lockedAt on the received payments whose funding the channel has
++	 * recorded as locked (issue #1899). The node marks records on its lock
++	 * events, which fire once: a mark that did not reach storage, or a lock
++	 * from before this receiver was listening, would otherwise never be made.
++	 */
++	private markLockedReceipts(): void {
++		for (const entry of this.deps.requests.received()) {
++			this.markIfLocked(entry);
++		}
++	}
++
++	/**
++	 * The same check for the record a revealed receipt just created (issue
++	 * #1899). A zero-conf open or splice can lock before the payer's witness
++	 * is in, so the lock event has already fired by the time the record
++	 * exists and will not fire again.
++	 */
++	private markLockedReceipt(receiptHashHex: string): void {
++		const entry = this.deps.requests.receivedFor(receiptHashHex);
++		if (entry) this.markIfLocked(entry);
++	}
++
++	/**
++	 * A record with no channel, one backfilled from a tombstone, cannot be
++	 * checked here; the node's lock event still marks it by funding.
++	 */
++	private markIfLocked(entry: IDfReceivedRecord): void {
++		if (!this.deps.hasLockedFunding) return;
++		if (entry.status !== 'PAID' || entry.lockedAt !== undefined) return;
++		if (!entry.channelId) return;
++		if (this.deps.hasLockedFunding(entry.channelId, entry.fundingTxid)) {
++			this.deps.requests.markReceivedLocked(entry.fundingTxid);
++		}
+ 	}
+ 
+ 	stop(): void {
+@@ -875,9 +945,10 @@ export class DirectFundingReceiver extends TypedEmitter<DirectFundingReceiverEve
+ 		} catch (err) {
+ 			this.log(DF_LOG_OFFER_FAILED, {
+ 				offerId: held.offerIdHex,
+-				error: `receipt tombstone not persisted: ${errorText(err)}`
++				error: `receipt not persisted: ${errorText(err)}`
+ 			});
+ 		}
++		this.markLockedReceipt(held.receiptHash);
+ 		const complete = final.tx.ins.every((i) => i.witness.length > 0);
+ 		const receipt = encodeDfReceipt({
+ 			offerId,
+@@ -1674,7 +1745,10 @@ export class DirectFundingReceiver extends TypedEmitter<DirectFundingReceiverEve
+ 				// record in the same batch that releases our tx_signatures, and a
+ 				// txid recorded afterwards would be lost by exactly the crash it
+ 				// exists for (issue #658).
+-				fundingTxid: final.fundingTxidDisplay.toString('hex')
++				fundingTxid: final.fundingTxidDisplay.toString('hex'),
++				// What the received record of a funding finished on a recovery
++				// path reports, the offer being gone with this session (issue #1893).
++				amountSat: ctx.offer.amountSat.toString()
+ 			},
+ 			session.expiresAt
+ 		);
+@@ -1904,9 +1978,10 @@ export class DirectFundingReceiver extends TypedEmitter<DirectFundingReceiverEve
+ 		} catch (err) {
+ 			this.log(DF_LOG_OFFER_FAILED, {
+ 				offerId: offerIdHex,
+-				error: `receipt tombstone not persisted: ${errorText(err)}`
++				error: `receipt not persisted: ${errorText(err)}`
+ 			});
+ 		}
++		this.markLockedReceipt(record.receiptHash);
+ 		const receipt = encodeDfReceipt({
+ 			offerId,
+ 			preimage: Buffer.from(record.preimageHex, 'hex'),
+@@ -2264,17 +2339,49 @@ export class DirectFundingReceiver extends TypedEmitter<DirectFundingReceiverEve
+ 			offer: ctx.offer
+ 		});
+ 		if (problem) throw new Error(`refusing to attest: ${problem}`);
+-		const pubkeys = this.deps.fundingPubkeys(final.channelId);
+-		if (!pubkeys) throw new Error('funding pubkeys are unavailable');
++		const committed = this.deps.fundingPubkeys(final.channelId);
++		if (!committed) throw new Error('funding pubkeys are unavailable');
++		// A splice's output pays the keys negotiated for it, which a peer may
++		// have rotated (issue #1871). The shared input still spends the committed
++		// pair, and the attestation then has to name both.
++		const pubkeys = final.newFundingPubkeys ?? committed;
++		const prior =
++			final.sharedInputIndex !== undefined &&
++			!(
++				pubkeys.local.equals(committed.local) &&
++				pubkeys.remote.equals(committed.remote)
++			)
++				? committed
++				: undefined;
++		const keysProblem = attestedKeysProblem({
++			tx: final.tx,
++			fundingOutputIndex: final.fundingOutputIndex,
++			fundingPubkeys: pubkeys,
++			prevoutScripts: final.prevouts.scripts,
++			...(final.sharedInputIndex !== undefined
++				? { sharedInputIndex: final.sharedInputIndex }
++				: {}),
++			...(prior ? { priorFundingPubkeys: prior } : {})
++		});
++		if (keysProblem) throw new Error(`refusing to attest: ${keysProblem}`);
+ 		const rawTx = final.tx.toBuffer();
+ 		const signature = zbase32Decode(
+ 			this.deps.signMessage(
+-				attestationMessage(
+-					ctx.offer.offerId,
+-					rawTx,
+-					final.fundingOutputIndex,
+-					pubkeys.local
+-				)
++				prior
++					? spliceAttestationMessage(
++							ctx.offer.offerId,
++							rawTx,
++							final.fundingOutputIndex,
++							pubkeys,
++							final.sharedInputIndex!,
++							prior
++					  )
++					: attestationMessage(
++							ctx.offer.offerId,
++							rawTx,
++							final.fundingOutputIndex,
++							pubkeys.local
++					  )
+ 			)
+ 		);
+ 		if (!signature || signature.length !== DF_SIGNATURE_BYTES) {
+@@ -2296,6 +2403,7 @@ export class DirectFundingReceiver extends TypedEmitter<DirectFundingReceiverEve
+ 					fundingOutputIndex: final.fundingOutputIndex,
+ 					localFundingPubkey: pubkeys.local,
+ 					remoteFundingPubkey: pubkeys.remote,
++					...(prior ? { priorFundingPubkeys: prior } : {}),
+ 					signature
+ 				},
+ 				...(final.sharedInputIndex !== undefined
+@@ -2448,7 +2556,8 @@ export class DirectFundingReceiver extends TypedEmitter<DirectFundingReceiverEve
+ 		try {
+ 			this.deps.requests.markReceiptRevealed(ctx.session.receiptHashHex, {
+ 				offerIdHex: ctx.session.offerIdHex,
+-				fundingTxidHex: final.fundingTxidDisplay.toString('hex')
++				fundingTxidHex: final.fundingTxidDisplay.toString('hex'),
++				amountSat: ctx.offer.amountSat.toString()
+ 			});
+ 		} catch (err) {
+ 			// Only the write failed; the in-memory tombstone stands. Withholding
+@@ -2457,9 +2566,10 @@ export class DirectFundingReceiver extends TypedEmitter<DirectFundingReceiverEve
+ 			// the two failures by a distance.
+ 			this.log(DF_LOG_OFFER_FAILED, {
+ 				offerId: ctx.session.offerIdHex,
+-				error: `receipt tombstone not persisted: ${errorText(err)}`
++				error: `receipt not persisted: ${errorText(err)}`
+ 			});
+ 		}
++		this.markLockedReceipt(ctx.session.receiptHashHex);
+ 		// The complete transaction, when every witness is in: no chain round
+ 		// trip, and a payer holding it can rebroadcast alone. Omitted while the
+ 		// channel counterparty's own tx_signatures are still outstanding.
+@@ -2758,7 +2868,10 @@ export class DirectFundingReceiver extends TypedEmitter<DirectFundingReceiverEve
+ 				// The new funding output carries the pre-splice capacity as well,
+ 				// and the shared input's value IS that capacity.
+ 				baseFundingValueSat: prevouts.values[pending.sharedInputIndex],
+-				sharedInputIndex: pending.sharedInputIndex
++				sharedInputIndex: pending.sharedInputIndex,
++				...(pending.newFundingPubkeys
++					? { newFundingPubkeys: pending.newFundingPubkeys }
++					: {})
+ 			};
+ 		}
+ 		return {
+diff --git a/src/lightning/direct-funding/receiver/types.ts b/src/lightning/direct-funding/receiver/types.ts
+index 89a7612..cc05d63 100644
+--- a/src/lightning/direct-funding/receiver/types.ts
++++ b/src/lightning/direct-funding/receiver/types.ts
+@@ -263,6 +263,13 @@ export interface IDfPendingSpliceTx {
+ 	spliceTxid: Buffer;
+ 	sharedInputIndex: number;
+ 	newFundingOutputIndex: number;
++	/**
++	 * The keys of the new funding output's 2-of-2, which a splice that rotated
++	 * a funding key makes different from `fundingPubkeys` (issue #1871).
++	 * Absent or null reads as unchanged keys, and the receiver refuses to attest
++	 * if the transaction says otherwise.
++	 */
++	newFundingPubkeys?: { local: Buffer; remote: Buffer } | null;
+ 	prevouts: { scripts: Buffer[]; values: bigint[] } | null;
+ 	owedExternalInputs: IDfExternalInput[];
+ 	filledExternalInputs: IDfExternalInput[];
+@@ -343,7 +350,10 @@ export interface IDfReceiverDeps {
+ 	 * peer is started, splice or open.
+ 	 */
+ 	spliceInFlightWith(peerHex: string): boolean;
+-	/** Funding pubkeys of a channel, for the attestation. */
++	/**
++	 * The committed funding pubkeys of a channel, for the attestation: the 2-of-2
++	 * a new channel's output pays, or the one a splice's shared input spends.
++	 */
+ 	fundingPubkeys(channelId: Buffer): { local: Buffer; remote: Buffer } | null;
+ 	/** Upstream's own zero-conf gate (zero-conf.ts canOpenZeroConfTo). */
+ 	canOpenZeroConfTo(peerHex: string): boolean;
+@@ -422,6 +432,23 @@ export interface IDfReceiverDeps {
+ 			conflictTxid: string;
+ 		}) => void
+ 	): () => void;
++	/**
++	 * Whether the channel remembers reverting this splice (display txid). What
++	 * a starting receiver checks its received payments against (issue #1893):
++	 * the event above fires once, so a mark that did not reach storage, or a
++	 * revert that landed before the subscription, would otherwise read as paid
++	 * for good. Optional.
++	 */
++	hasRevertedSplice?(channelIdHex: string, spliceTxid: string): boolean;
++	/**
++	 * Whether the channel has recorded a lock of this funding (display txid)
++	 * in its lockedFundingTxids (issue #1899). What a receiver checks a
++	 * received payment against when the record is created and when it starts:
++	 * a zero-conf lock can land before the receipt is revealed and the record
++	 * exists, and a mark that did not reach storage would otherwise never be
++	 * made. Optional; without it only the node's lock events set lockedAt.
++	 */
++	hasLockedFunding?(channelIdHex: string, fundingTxid: string): boolean;
+ 	now?(): number;
+ 	/** Structured-log sink, the same one 4B's lanes take. */
+ 	log?: DfTransportLog;
+diff --git a/src/lightning/direct-funding/receiver/verify.ts b/src/lightning/direct-funding/receiver/verify.ts
+index b6d1675..3c8180f 100644
+--- a/src/lightning/direct-funding/receiver/verify.ts
++++ b/src/lightning/direct-funding/receiver/verify.ts
+@@ -21,6 +21,7 @@ import { MAX_INTERACTIVE_TX_SEQUENCE } from '../../interactive-tx/validation';
+ import { schnorrVerify } from '../../offer/schnorr';
+ import { isValidShutdownScript } from '../../channel/validation';
+ import { estimateSpliceTxWeight } from '../../channel/splice-weight';
++import { createFundingScript } from '../../script/funding';
+ import { scriptKind } from '../../wallet/wallet-funding-provider';
+ import type { IDfOffer } from '../messages';
+ import {
+@@ -435,6 +436,49 @@ export function fundingTransactionProblem(c: IDfFundingCheck): string | null {
+ 	return null;
+ }
+ 
++export interface IDfAttestedKeysCheck {
++	tx: bitcoin.Transaction;
++	fundingOutputIndex: number;
++	/** The pair the attestation names for the funding output. */
++	fundingPubkeys: { local: Buffer; remote: Buffer };
++	prevoutScripts: Buffer[];
++	/** Splice only. */
++	sharedInputIndex?: number;
++	/** The pair the shared input spends, when it is not `fundingPubkeys`. */
++	priorFundingPubkeys?: { local: Buffer; remote: Buffer };
++}
++
++/**
++ * Do the keys about to be attested build the scripts the transaction pays and
++ * spends? Returns the problem, or null.
++ *
++ * The payer rebuilds both from the attestation and refuses a mismatch, so
++ * attesting one only puts this node's key over a claim the transaction
++ * contradicts, and reports the failure on the wrong side. Issue #1871 was
++ * that: a splice whose peer rotated its funding key, attested with the pair
++ * the shared input spends.
++ */
++export function attestedKeysProblem(c: IDfAttestedKeysCheck): string | null {
++	const out = c.tx.outs[c.fundingOutputIndex];
++	const funding = createFundingScript(
++		c.fundingPubkeys.local,
++		c.fundingPubkeys.remote
++	).p2wshOutput;
++	if (!out || !Buffer.from(out.script).equals(funding)) {
++		return 'the funding output is not the 2-of-2 of the attested keys';
++	}
++	if (c.sharedInputIndex === undefined) return null;
++	const prior = c.priorFundingPubkeys ?? c.fundingPubkeys;
++	const shared = c.prevoutScripts[c.sharedInputIndex];
++	if (
++		!shared ||
++		!shared.equals(createFundingScript(prior.local, prior.remote).p2wshOutput)
++	) {
++		return 'the shared input is not the 2-of-2 of the channel funding keys';
++	}
++	return null;
++}
++
+ // ─────────────── The feerate a splice of the offered coin can carry ───────────────
+ 
+ export interface IDfSpliceFeerateCeiling {
+diff --git a/src/lightning/direct-funding/requests.ts b/src/lightning/direct-funding/requests.ts
+index 31438d7..7ae07f5 100644
+--- a/src/lightning/direct-funding/requests.ts
++++ b/src/lightning/direct-funding/requests.ts
+@@ -21,7 +21,11 @@ import { randomBytes, sha256 } from '../crypto/provider';
+ import type { IDfLaneKeys, IDfWireFrame } from './frames';
+ import { mintRequestEncryptionKeys, receiverLaneKeys } from './frames';
+ import { getPublicKey } from '../crypto/ecdh';
+-import type { IDfAttemptFunding, IDfRequestRecord } from './types';
++import type {
++	IDfAttemptFunding,
++	IDfReceivedRecord,
++	IDfRequestRecord
++} from './types';
+ import {
+ 	DF_DEFAULT_REQUEST_TTL_MS,
+ 	DF_MAX_AMOUNT_SAT,
+@@ -45,6 +49,19 @@ export const DF_DEFAULT_MAX_OUTSTANDING = 256;
+ /** How often the expiry sweep runs once `start()` has been called. */
+ export const DF_DEFAULT_SWEEP_INTERVAL_MS = 60_000;
+ 
++/** Wallet-data key holding the record of every payment received (issue #1893). */
++export const DF_RECEIVED_STORAGE_KEY = 'df:received';
++
++/**
++ * How long a received record is kept, and how many are held at once: the
++ * figures the payer's own records use, for the same reasons. A client coming
++ * back after a week to ask whether its request was paid still gets the truth,
++ * and the set, written whole on every change, stays bounded. A client that has
++ * seen the payment keeps it in its own history from then on.
++ */
++export const DF_RECEIVED_RETENTION_MS = 30 * 24 * 60 * 60 * 1000;
++export const DF_MAX_RECEIVED_RECORDS = 512;
++
+ /**
+  * The narrow slice of the node's storage this needs, declared here rather
+  * than imported whole so the engine can be driven by a map in tests (the
+@@ -77,6 +94,19 @@ export class DirectFundingRequestStore {
+ 	private byId = new Map<string, string>();
+ 	/** By onion path secret: the index a blinded-path delivery arrives on. */
+ 	private byPathSecret = new Map<string, string>();
++	/** Payments received, by receipt hash. Outlives the records above. */
++	private receivedByHash = new Map<string, IDfReceivedRecord>();
++	/**
++	 * The received set changed and the write did not land. Every later write
++	 * retries it.
++	 */
++	private receivedUnsaved = false;
++	/**
++	 * Receipt hashes whose received record has not reached storage. Until it
++	 * does, the paid request is not swept: its tombstone is then the only
++	 * stored trace of the payment.
++	 */
++	private unsavedReceipts = new Set<string>();
+ 	private sweepTimer: NodeJS.Timeout | null = null;
+ 	private readonly ttlMs: number;
+ 	private readonly maxOutstanding: number;
+@@ -105,27 +135,29 @@ export class DirectFundingRequestStore {
+ 	 * Reload outstanding requests, dropping the expired ones no funding still
+ 	 * needs (see `answersFor`), and rebuild both indexes. Returns how many came
+ 	 * back. Call once, after the node's own storage restore.
++	 *
++	 * The received records come back first, and a paid request that has none
++	 * (one paid before they were kept) is given its record here, before an
++	 * expired one is dropped and takes the only trace of its payment with it.
+ 	 */
+ 	restore(): number {
+ 		this.byHash.clear();
+ 		this.byId.clear();
+ 		this.byPathSecret.clear();
++		this.restoreReceived();
+ 		const raw = this.deps.storage?.loadWalletData(DF_REQUESTS_STORAGE_KEY);
+-		if (!raw) return 0;
+-		let parsed: unknown;
++		let parsed: unknown = [];
+ 		try {
+-			parsed = JSON.parse(raw);
++			parsed = raw ? JSON.parse(raw) : [];
+ 		} catch {
+ 			// Corrupt state runs from nothing rather than taking the node down;
+ 			// the outstanding envelopes are lost either way, and refusing to
+ 			// start would lose the wallet too.
+-			return 0;
+ 		}
+-		if (!Array.isArray(parsed)) return 0;
+-		const now = this.now();
++		const entries: IDfRequestRecord[] = [];
+ 		let dropped = 0;
+ 		let stripped = false;
+-		for (const entry of parsed as IDfRequestRecord[]) {
++		for (const entry of Array.isArray(parsed) ? parsed : []) {
+ 			if (!isWellFormedRecord(entry)) {
+ 				dropped++;
+ 				continue;
+@@ -133,7 +165,18 @@ export class DirectFundingRequestStore {
+ 			// The strip comes FIRST: a row whose only claim on life is a marker
+ 			// that did not come back intact has no funding to answer for.
+ 			if (stripMalformedAttempt(entry)) stripped = true;
+-			if (!answersFor(entry, now)) {
++			this.receive(entry);
++			entries.push(entry);
++		}
++		// Before anything is dropped below: an expired paid request goes only
++		// once its payment's record is stored.
++		if (this.receivedUnsaved) this.persistReceived();
++		const now = this.now();
++		for (const entry of entries) {
++			if (
++				!answersFor(entry, now) &&
++				!this.unsavedReceipts.has(entry.receiptHash)
++			) {
+ 				dropped++;
+ 				continue;
+ 			}
+@@ -168,9 +211,18 @@ export class DirectFundingRequestStore {
+ 	 */
+ 	sweep(): number {
+ 		const now = this.now();
++		// Received records past retention go here too, so a node that takes no
++		// new payment still lets them go.
++		if (this.pruneReceived()) this.receivedUnsaved = true;
++		if (this.receivedUnsaved) this.persistReceived();
+ 		let dropped = 0;
+ 		for (const record of [...this.byHash.values()]) {
+-			if (!answersFor(record, now)) {
++			// A paid request is its payment's only stored trace until the
++			// received record lands.
++			if (
++				!answersFor(record, now) &&
++				!this.unsavedReceipts.has(record.receiptHash)
++			) {
+ 				this.unindex(record);
+ 				dropped++;
+ 			}
+@@ -279,10 +331,18 @@ export class DirectFundingRequestStore {
+ 	 * back looking unpaid is a paid request the next restart cannot recognise.
+ 	 * The in-memory mark stands either way, so a caller that retries writes the
+ 	 * whole set again rather than losing the reveal.
++	 *
++	 * The same call writes the request's received record (issue #1893), and
++	 * throws NOT_PERSISTED when that write fails too: it is the only way a
++	 * client finds out the request was paid once the record above is swept.
++	 * It is written FIRST, because the tombstone clears the mark that holds the
++	 * channel and the amount, and a failed write is retried by every later one
++	 * while the paid request is kept from the sweep. `amountSat` is the paying
++	 * offer's amount, when the caller still holds it.
+ 	 */
+ 	markReceiptRevealed(
+ 		receiptHashHex: string,
+-		paidBy?: { offerIdHex: string; fundingTxidHex: string }
++		paidBy?: { offerIdHex: string; fundingTxidHex: string; amountSat?: string }
+ 	): void {
+ 		const record = this.byReceiptHash(receiptHashHex);
+ 		if (!record) return;
+@@ -290,7 +350,31 @@ export class DirectFundingRequestStore {
+ 		// The FIRST payment's receipt stands: a later offer against a tombstoned
+ 		// request is refused, so anything overwriting this would be answering a
+ 		// replay with someone else's funding.
+-		if (paidBy && !record.paidBy) record.paidBy = paidBy;
++		if (paidBy && !record.paidBy) {
++			// Before the mark is cleared below: the funding it holds is where the
++			// channel and, on a recovery path, the amount come from.
++			const funding = paidFunding(
++				record,
++				paidBy.offerIdHex,
++				paidBy.fundingTxidHex
++			);
++			const amount = [paidBy.amountSat, funding?.amountSat].find(
++				isPositiveDecimal
++			);
++			record.paidBy = {
++				offerIdHex: paidBy.offerIdHex,
++				fundingTxidHex: paidBy.fundingTxidHex,
++				...(funding
++					? { channelIdHex: funding.channelId, splice: funding.splice }
++					: {}),
++				...(amount !== undefined ? { amountSat: amount } : {})
++			};
++		}
++		this.receive(record);
++		// Written whenever there is one, not only when it is new, so a caller's
++		// retry lands it.
++		const kept =
++			!this.receivedByHash.has(record.receiptHash) || this.persistReceived();
+ 		// A funding that completed past its request's own expiry leaves a
+ 		// tombstone the next sweep takes at once, and the payer has spent its coin
+ 		// by then: a receipt frame lost on the way could never be replayed. The row
+@@ -301,12 +385,19 @@ export class DirectFundingRequestStore {
+ 			record.expiresAt = held.expiresAt;
+ 		}
+ 		record.activeAttempt = undefined;
+-		if (!this.persist()) {
++		const tombstoned = this.persist();
++		if (!tombstoned) {
+ 			throw new DirectFundingError(
+ 				DirectFundingErrorCode.NOT_PERSISTED,
+ 				'direct-funding receipt tombstone could not be persisted'
+ 			);
+ 		}
++		if (!kept) {
++			throw new DirectFundingError(
++				DirectFundingErrorCode.NOT_PERSISTED,
++				'direct-funding received record could not be persisted'
++			);
++		}
+ 	}
+ 
+ 	isTombstoned(receiptHashHex: string): boolean {
+@@ -322,7 +413,76 @@ export class DirectFundingRequestStore {
+ 	paidOffer(
+ 		receiptHashHex: string
+ 	): { offerIdHex: string; fundingTxidHex: string } | null {
+-		return this.byReceiptHash(receiptHashHex)?.paidBy ?? null;
++		const paid = this.byReceiptHash(receiptHashHex)?.paidBy;
++		return paid
++			? { offerIdHex: paid.offerIdHex, fundingTxidHex: paid.fundingTxidHex }
++			: null;
++	}
++
++	// ─────────────── Received payments ───────────────
++
++	/** Every payment received that is still kept, newest first. */
++	received(): IDfReceivedRecord[] {
++		return [...this.receivedByHash.values()]
++			.sort((a, b) => b.paidAt - a.paidAt)
++			.map((entry) => ({ ...entry }));
++	}
++
++	/** The payment a request was paid by, or null. Outlives the request. */
++	receivedFor(receiptHashHex: string): IDfReceivedRecord | null {
++		const entry = this.receivedByHash.get(receiptHashHex);
++		return entry ? { ...entry } : null;
++	}
++
++	/**
++	 * Mark the payments a reverted splice carried (issue #760). The payer spent
++	 * its coin elsewhere and the channel is back on its old funding, so the
++	 * request was not paid after all, whatever its receipt says. The record
++	 * stays, REVERTED, so a client that showed the payment can take it back.
++	 * Returns how many it marked. A mark whose write fails is retried by the
++	 * next write, and the receiver checks again against the channel's own
++	 * memory of the revert when it starts.
++	 */
++	markReceivedReverted(fundingTxidHex: string): number {
++		const now = this.now();
++		let marked = 0;
++		for (const entry of this.receivedByHash.values()) {
++			if (entry.fundingTxid !== fundingTxidHex) continue;
++			if (entry.status === 'REVERTED') continue;
++			entry.status = 'REVERTED';
++			entry.updatedAt = now;
++			marked++;
++		}
++		if (marked > 0) {
++			this.receivedUnsaved = true;
++			this.persistReceived();
++		}
++		return marked;
++	}
++
++	/**
++	 * Mark the payments a locked funding carried (issue #1899): `lockedAt` is
++	 * set, once, on every PAID record for that funding (display txid) that has
++	 * none, and `updatedAt` moves with it, so retention runs from the lock.
++	 * `at` defaults to now. Returns whether it marked any. A mark whose write
++	 * fails is retried by the next write, and the receiver checks again
++	 * against the channel's own record of its locks when it starts.
++	 */
++	markReceivedLocked(fundingTxidHex: string, at?: number): boolean {
++		const now = this.now();
++		let marked = false;
++		for (const entry of this.receivedByHash.values()) {
++			if (entry.fundingTxid !== fundingTxidHex) continue;
++			if (entry.status !== 'PAID' || entry.lockedAt !== undefined) continue;
++			entry.lockedAt = at ?? now;
++			entry.updatedAt = now;
++			marked = true;
++		}
++		if (marked) {
++			this.receivedUnsaved = true;
++			this.persistReceived();
++		}
++		return marked;
+ 	}
+ 
+ 	/**
+@@ -591,8 +751,12 @@ export class DirectFundingRequestStore {
+ 		this.byPathSecret.delete(record.onionPathSecretHex);
+ 	}
+ 
+-	/** Write the whole set. Reports whether it landed. */
++	/**
++	 * Write the whole set. Reports whether it landed. A received set whose own
++	 * write failed is retried with it, since no caller retries that one.
++	 */
+ 	private persist(): boolean {
++		if (this.receivedUnsaved) this.persistReceived();
+ 		if (!this.deps.storage) return true;
+ 		try {
+ 			this.deps.storage.saveWalletData(
+@@ -604,6 +768,128 @@ export class DirectFundingRequestStore {
+ 			return false;
+ 		}
+ 	}
++
++	/**
++	 * Add the received record for a paid request, once: the first payment's
++	 * stands, as its receipt does. Reports whether it added one, which is then
++	 * unsaved until a write lands it.
++	 *
++	 * The channel and the amount come from what the tombstone kept, then from
++	 * the funding the paying offer's mark holds, when it still holds one (a
++	 * mark held by any other offer describes another funding). The amount
++	 * falls back to the one the request fixed.
++	 */
++	private receive(record: IDfRequestRecord): boolean {
++		const paid = record.paidBy;
++		if (!paid || this.receivedByHash.has(record.receiptHash)) return false;
++		// Dated from the payment, so a record backfilled from an old tombstone
++		// is held to the same window as one written at the time.
++		const paidAt = record.revealedAt ?? this.now();
++		if (this.now() - paidAt > DF_RECEIVED_RETENTION_MS) return false;
++		const funding = paidFunding(record, paid.offerIdHex, paid.fundingTxidHex);
++		const kept =
++			typeof paid.channelIdHex === 'string' &&
++			isHex(paid.channelIdHex, 32) &&
++			typeof paid.splice === 'boolean'
++				? { channelId: paid.channelIdHex, splice: paid.splice }
++				: undefined;
++		const channel =
++			kept ??
++			(funding
++				? { channelId: funding.channelId, splice: funding.splice }
++				: undefined);
++		const amount = [paid.amountSat, funding?.amountSat, record.amountSat].find(
++			isPositiveDecimal
++		);
++		this.evictReceived();
++		this.receivedByHash.set(record.receiptHash, {
++			receiptHash: record.receiptHash,
++			requestId: record.requestId,
++			offerId: paid.offerIdHex,
++			fundingTxid: paid.fundingTxidHex,
++			...(channel ?? {}),
++			...(amount !== undefined ? { amountSat: amount } : {}),
++			status: 'PAID',
++			paidAt,
++			updatedAt: paidAt
++		});
++		this.receivedUnsaved = true;
++		this.unsavedReceipts.add(record.receiptHash);
++		return true;
++	}
++
++	private restoreReceived(): void {
++		this.receivedByHash.clear();
++		this.receivedUnsaved = false;
++		this.unsavedReceipts.clear();
++		const raw = this.deps.storage?.loadWalletData(DF_RECEIVED_STORAGE_KEY);
++		if (!raw) return;
++		let parsed: unknown;
++		try {
++			parsed = JSON.parse(raw);
++		} catch {
++			// What is lost is bookkeeping, not money: the funding is in the channel
++			// or it is not, and a request still held is given its record again.
++			return;
++		}
++		if (!Array.isArray(parsed)) return;
++		for (const entry of parsed) {
++			if (isWellFormedReceived(entry)) {
++				this.receivedByHash.set(entry.receiptHash, entry);
++			}
++		}
++		if (this.pruneReceived()) this.receivedUnsaved = true;
++	}
++
++	/**
++	 * Drop records not paid or changed within the retention window. Reports
++	 * whether any went.
++	 */
++	private pruneReceived(): boolean {
++		const now = this.now();
++		let pruned = false;
++		for (const entry of [...this.receivedByHash.values()]) {
++			if (now - entry.updatedAt > DF_RECEIVED_RETENTION_MS) {
++				this.receivedByHash.delete(entry.receiptHash);
++				pruned = true;
++			}
++		}
++		return pruned;
++	}
++
++	/**
++	 * Drop records past retention, then the oldest while the set is at its
++	 * ceiling, so the one about to be added fits.
++	 */
++	private evictReceived(): void {
++		this.pruneReceived();
++		if (this.receivedByHash.size < DF_MAX_RECEIVED_RECORDS) return;
++		const oldest = [...this.receivedByHash.values()].sort(
++			(a, b) => a.updatedAt - b.updatedAt
++		);
++		for (const entry of oldest) {
++			if (this.receivedByHash.size < DF_MAX_RECEIVED_RECORDS) break;
++			this.receivedByHash.delete(entry.receiptHash);
++		}
++	}
++
++	/** Write every received record. Reports whether it landed. */
++	private persistReceived(): boolean {
++		let landed = true;
++		if (this.deps.storage) {
++			try {
++				this.deps.storage.saveWalletData(
++					DF_RECEIVED_STORAGE_KEY,
++					JSON.stringify([...this.receivedByHash.values()])
++				);
++			} catch {
++				landed = false;
++			}
++		}
++		this.receivedUnsaved = !landed;
++		if (landed) this.unsavedReceipts.clear();
++		return landed;
++	}
+ }
+ 
+ /**
+@@ -702,7 +988,46 @@ function isWellFormedFunding(funding: unknown): boolean {
+ 	);
+ }
+ 
+-function isPositiveDecimal(value: unknown): boolean {
++/**
++ * The funding the paying offer's mark still holds, if it holds one for that
++ * funding. A mark held by any other offer describes another funding.
++ */
++function paidFunding(
++	record: IDfRequestRecord,
++	offerIdHex: string,
++	fundingTxidHex: string
++): IDfAttemptFunding | undefined {
++	const active = record.activeAttempt;
++	if (active?.offerIdHex !== offerIdHex || !active.funding) return undefined;
++	const txid = active.funding.fundingTxid;
++	return txid === undefined || txid === fundingTxidHex
++		? active.funding
++		: undefined;
++}
++
++/**
++ * A received record is only shown if it came back whole. An amount that did
++ * not is dropped with the row rather than shown as some other figure.
++ */
++function isWellFormedReceived(entry: unknown): entry is IDfReceivedRecord {
++	const r = entry as IDfReceivedRecord | null;
++	return (
++		!!r &&
++		isHex(r.receiptHash, 32) &&
++		isHex(r.requestId, DF_REQUEST_ID_BYTES) &&
++		isHex(r.offerId, DF_OFFER_ID_BYTES) &&
++		isHex(r.fundingTxid, 32) &&
++		(r.channelId === undefined || isHex(r.channelId, 32)) &&
++		(r.splice === undefined || typeof r.splice === 'boolean') &&
++		(r.amountSat === undefined || isPositiveDecimal(r.amountSat)) &&
++		(r.status === 'PAID' || r.status === 'REVERTED') &&
++		Number.isFinite(r.paidAt) &&
++		(r.lockedAt === undefined || Number.isFinite(r.lockedAt)) &&
++		Number.isFinite(r.updatedAt)
++	);
++}
++
++function isPositiveDecimal(value: unknown): value is string {
+ 	if (typeof value !== 'string' || !/^[1-9][0-9]{0,17}$/.test(value)) {
+ 		return false;
+ 	}
+diff --git a/src/lightning/direct-funding/sender/engine.ts b/src/lightning/direct-funding/sender/engine.ts
+index d9bf53f..59aa56d 100644
+--- a/src/lightning/direct-funding/sender/engine.ts
++++ b/src/lightning/direct-funding/sender/engine.ts
+@@ -1724,6 +1724,7 @@ export class DirectFundingSender {
+ 		}
+ 		if (ctl.settled()) return;
+ 
++		const prior = request.attestation.priorFundingPubkeys;
+ 		const persisted = this.deps.payments.commitWitness(
+ 			attempt.record.requestId,
+ 			{
+@@ -1733,6 +1734,13 @@ export class DirectFundingSender {
+ 						request.attestation.localFundingPubkey.toString('hex'),
+ 					remoteFundingPubkey:
+ 						request.attestation.remoteFundingPubkey.toString('hex'),
++					...(prior
++						? {
++								sharedInputIndex: request.sharedInputIndex,
++								priorLocalFundingPubkey: prior.local.toString('hex'),
++								priorRemoteFundingPubkey: prior.remote.toString('hex')
++						  }
++						: {}),
+ 					signature: request.attestation.signature.toString('hex')
+ 				},
+ 				negotiatedTx: request.rawTx.toString('hex'),
+diff --git a/src/lightning/direct-funding/sender/types.ts b/src/lightning/direct-funding/sender/types.ts
+index 7e5a5d2..f299a17 100644
+--- a/src/lightning/direct-funding/sender/types.ts
++++ b/src/lightning/direct-funding/sender/types.ts
+@@ -366,6 +366,13 @@ export interface IDfPaymentRecord {
+ 		fundingOutputIndex: number;
+ 		localFundingPubkey: string;
+ 		remoteFundingPubkey: string;
++		/**
++		 * A splice that rotated a funding key: the shared input and the pair it
++		 * spent, which the signature covers as well (`IDfAttestation`).
++		 */
++		sharedInputIndex?: number;
++		priorLocalFundingPubkey?: string;
++		priorRemoteFundingPubkey?: string;
+ 		signature: string;
+ 	};
+ 	/** The transaction we verified and signed, hex. */
+diff --git a/src/lightning/direct-funding/sender/verify.ts b/src/lightning/direct-funding/sender/verify.ts
+index 478e4ae..1cfdd1b 100644
+--- a/src/lightning/direct-funding/sender/verify.ts
++++ b/src/lightning/direct-funding/sender/verify.ts
+@@ -19,7 +19,7 @@ import {
+ } from '../../crypto/message-signing';
+ import { createFundingScript } from '../../script/funding';
+ import type { IDfPrevout, IDfSignRequest } from '../messages';
+-import { attestationMessage } from '../messages';
++import { attestationMessage, spliceAttestationMessage } from '../messages';
+ import { DF_MAX_PREVOUTS, DF_MAX_TX_OUTPUTS } from '../types';
+ 
+ /** Rev 2: height-based locktimes only, so the transaction is final on a block. */
+@@ -188,6 +188,12 @@ export function signRequestProblem(
+ 	// built from the attested funding pubkeys, and the node the payment request
+ 	// named is what attested to it. Without both, "delivery" is a claim. ──
+ 	const att = c.request.attestation;
++	const prior = att.priorFundingPubkeys;
++	if (prior && c.request.sharedInputIndex === undefined) {
++		return {
++			problem: 'attestation names a prior channel funding but no shared input'
++		};
++	}
+ 	const funding = createFundingScript(
+ 		att.localFundingPubkey,
+ 		att.remoteFundingPubkey
+@@ -206,8 +212,10 @@ export function signRequestProblem(
+ 	if (c.request.sharedInputIndex !== undefined) {
+ 		// Splice extension: our payment goes into a channel that already holds
+ 		// value, so both halves have to be verified. The shared input must BE the
+-		// attested channel funding (the same 2-of-2 we just checked the output
+-		// against), and the new output must carry the old capacity as well.
++		// attested channel funding, and the new output must carry the old
++		// capacity as well. That funding is the 2-of-2 we just checked the output
++		// against, unless the splice rotated a funding key: the attestation then
++		// names the old pair too, and signs over both (issue #1871).
+ 		const shared = c.request.sharedInputIndex;
+ 		if (shared === inputIndex) {
+ 			return {
+@@ -219,8 +227,11 @@ export function signRequestProblem(
+ 				problem: 'shared input index is not an input of the transaction'
+ 			};
+ 		}
++		const sharedFunding = prior
++			? createFundingScript(prior.local, prior.remote).p2wshOutput
++			: funding;
+ 		const sharedPrevout: IDfPrevout | undefined = c.request.prevouts[shared];
+-		if (!sharedPrevout || !sharedPrevout.script.equals(funding)) {
++		if (!sharedPrevout || !sharedPrevout.script.equals(sharedFunding)) {
+ 			return { problem: 'shared input is not the attested channel funding' };
+ 		}
+ 		// The fee this transaction actually charges us, not the ceiling we were
+@@ -245,12 +256,21 @@ export function signRequestProblem(
+ 	// message still recovers SOME key), so the recovered key must BE the
+ 	// receiver the request named. ──
+ 	const verdict = verifyMessageSignature(
+-		attestationMessage(
+-			c.offerId,
+-			c.request.rawTx,
+-			att.fundingOutputIndex,
+-			att.localFundingPubkey
+-		),
++		prior
++			? spliceAttestationMessage(
++					c.offerId,
++					c.request.rawTx,
++					att.fundingOutputIndex,
++					{ local: att.localFundingPubkey, remote: att.remoteFundingPubkey },
++					c.request.sharedInputIndex!,
++					prior
++			  )
++			: attestationMessage(
++					c.offerId,
++					c.request.rawTx,
++					att.fundingOutputIndex,
++					att.localFundingPubkey
++			  ),
+ 		zbase32Encode(att.signature)
+ 	);
+ 	if (!verdict.valid || !verdict.pubkey) {
+diff --git a/src/lightning/direct-funding/types.ts b/src/lightning/direct-funding/types.ts
+index 1355dba..03cbde6 100644
+--- a/src/lightning/direct-funding/types.ts
++++ b/src/lightning/direct-funding/types.ts
+@@ -292,6 +292,14 @@ export interface IDfAttemptFunding {
+ 	 * field still restores.
+ 	 */
+ 	fundingTxid?: string;
++	/**
++	 * The amount the offer funds, as decimal satoshis. The request records an
++	 * amount only when it fixed one, and the offer that named any other is gone
++	 * with its session, so this is where the received record of a funding
++	 * finished on a recovery path takes its amount from (issue #1893). Optional
++	 * so a record written before this field still restores.
++	 */
++	amountSat?: string;
+ }
+ 
+ /**
+@@ -339,8 +347,19 @@ export interface IDfRequestRecord {
+ 	 * after a successful exchange can still replay the receipt: the session
+ 	 * that recorded it lives in memory only, and without this the payer whose
+ 	 * receipt frame was lost gets a bare "already paid" and no proof of it.
++	 *
++	 * The channel, whether it was a splice, and the amount ride along for the
++	 * received record (issue #1893): the same write clears the funding mark
++	 * that held them, and a received record that did not reach storage is
++	 * rebuilt from this on restore.
+ 	 */
+-	paidBy?: { offerIdHex: string; fundingTxidHex: string };
++	paidBy?: {
++		offerIdHex: string;
++		fundingTxidHex: string;
++		channelIdHex?: string;
++		splice?: boolean;
++		amountSat?: string;
++	};
+ 	/** Offers this request has spent a funding session on, over its whole life. */
+ 	attempts?: number;
+ 	/**
+@@ -365,6 +384,61 @@ export interface IDfRequestRecord {
+ 	swarmSeedHex?: string;
+ }
+ 
++/** PAID once the receipt is revealed; REVERTED when the splice it went into was. */
++export type DfReceivedStatus = 'PAID' | 'REVERTED';
++
++/**
++ * One payment this node received against a request it minted (issue #1893).
++ *
++ * Kept apart from the request record on purpose. That record holds secrets
++ * that must go when the request does, an hour after minting by default, and
++ * the tombstone in it was until now the only trace of the payment: a client
++ * asking whether its request was paid found nothing once the sweep had run,
++ * and a payment that pays neither an invoice nor an address cannot be found
++ * any other way. This holds no secret, so it can outlive the request.
++ */
++export interface IDfReceivedRecord {
++	/**
++	 * 32-byte hex: the request's receipt hash, which `createDirectFundingRequest`
++	 * returns as its `paymentHash` and the envelope carries first.
++	 */
++	receiptHash: string;
++	/** 16-byte hex. */
++	requestId: string;
++	/** 16-byte hex: the offer that paid it. */
++	offerId: string;
++	/** The funding transaction's txid, DISPLAY byte order hex. */
++	fundingTxid: string;
++	/** Absent only when the funding record did not survive to the receipt. */
++	channelId?: string;
++	/** A splice into an existing channel rather than a new v2 open. */
++	splice?: boolean;
++	/**
++	 * Decimal satoshis. Absent only for an open-amount request paid on a
++	 * recovery path from a funding record written before amounts were kept.
++	 */
++	amountSat?: string;
++	status: DfReceivedStatus;
++	/** When the receipt was revealed, milliseconds since epoch. */
++	paidAt: number;
++	/**
++	 * When this node saw the funding lock, milliseconds since epoch (issue
++	 * #1899): the channel's lockedFundingTxids came to hold fundingTxid,
++	 * through channel_ready for an open or splice_locked for a splice, both
++	 * sent and received. Absent until then. Outlives the channel within this
++	 * record's retention, and stays on a record later marked REVERTED. For a
++	 * funding that locked before this version, it is the first start that
++	 * recorded the lock, not the lock itself.
++	 *
++	 * A lock is the channel_ready or splice_locked exchange, which on a
++	 * zero-conf channel comes before the funding confirms, so lockedAt is not
++	 * proof of confirmation: a zero-conf open whose funding is double-spent is
++	 * voided, and its record keeps lockedAt.
++	 */
++	lockedAt?: number;
++	updatedAt: number;
++}
++
+ // ─────────────── Chain binding ───────────────
+ 
+ /** The BOLT chain_hash a request minted on this network must carry. */
+diff --git a/src/lightning/liquidity/jit-receive.ts b/src/lightning/liquidity/jit-receive.ts
+index 407bca5..e1d15d7 100644
+--- a/src/lightning/liquidity/jit-receive.ts
++++ b/src/lightning/liquidity/jit-receive.ts
+@@ -1929,6 +1929,7 @@ export class JitReceiveManager extends TypedEmitter<JitReceiveEvents> {
+ 			b.forwardAmountMsat > a.forwardAmountMsat ? b : a
+ 		);
+ 		largest.forwardAmountMsat -= feeMsat;
++		largest.skimmedFeeMsat = (largest.skimmedFeeMsat ?? 0n) + feeMsat;
+ 	}
+ 
+ 	// ─────────────── Resolution ───────────────
+diff --git a/src/lightning/message/channel-update.ts b/src/lightning/message/channel-update.ts
+index a0c82b5..d76f83b 100644
+--- a/src/lightning/message/channel-update.ts
++++ b/src/lightning/message/channel-update.ts
+@@ -31,7 +31,7 @@
+  *   [4: feerate_per_kw]
+  */
+ 
+-import { decodeTlvStream } from './tlv';
++import { decodeTlvStream, encodeTlvRecord } from './tlv';
+ 
+ export interface IUpdateAddHtlcMessage {
+ 	channelId: Buffer;
+@@ -46,6 +46,8 @@ export interface IUpdateAddHtlcMessage {
+ 	 * hop can derive its blinded node key. 33-byte compressed point.
+ 	 */
+ 	blindingPoint?: Buffer;
++	/** Agreed liquidity fee withheld from this HTLC, in millisatoshis. */
++	skimmedFeeMsat?: bigint;
+ }
+ 
+ export interface IUpdateFulfillHtlcMessage {
+@@ -89,7 +91,11 @@ const UPDATE_FAIL_MALFORMED_HTLC_LENGTH = 74; // 32 + 8 + 32 + 2
+ const UPDATE_FEE_LENGTH = 36; // 32 + 4
+ 
+ const TLV_BLINDING_POINT = 0n;
+-const UPDATE_ADD_HTLC_TLV_TYPES = new Set<bigint>([TLV_BLINDING_POINT]);
++const TLV_SKIMMED_FEE_MSAT = 65537n;
++const UPDATE_ADD_HTLC_TLV_TYPES = new Set<bigint>([
++	TLV_BLINDING_POINT,
++	TLV_SKIMMED_FEE_MSAT
++]);
+ 
+ /**
+  * Encode an `update_add_htlc` message payload.
+@@ -112,18 +118,22 @@ export function encodeUpdateAddHtlcMessage(msg: IUpdateAddHtlcMessage): Buffer {
+ 
+ 	// Optional trailing blinding_point TLV (type 0, length 33). BOLT 1 allows
+ 	// trailing TLV extensions; legacy decoders ignore the extra bytes.
++	const parts: Buffer[] = [buf];
+ 	if (msg.blindingPoint) {
+ 		if (msg.blindingPoint.length !== 33) {
+ 			throw new Error('blindingPoint must be 33 bytes');
+ 		}
+-		return Buffer.concat([
+-			buf,
+-			Buffer.from([0x00, 0x21]), // type 0, length 33
+-			msg.blindingPoint
+-		]);
++		parts.push(
++			encodeTlvRecord({ type: TLV_BLINDING_POINT, value: msg.blindingPoint })
++		);
+ 	}
+ 
+-	return buf;
++	if (msg.skimmedFeeMsat !== undefined) {
++		const value = Buffer.alloc(8);
++		value.writeBigUInt64BE(msg.skimmedFeeMsat);
++		parts.push(encodeTlvRecord({ type: TLV_SKIMMED_FEE_MSAT, value }));
++	}
++	return Buffer.concat(parts);
+ }
+ 
+ /**
+@@ -155,13 +165,14 @@ export function decodeUpdateAddHtlcMessage(
+ 	);
+ 	offset += 1366;
+ 
+-	// Optional trailing update_add_htlc_tlvs; only blinding_point is known.
++	// Optional trailing update_add_htlc_tlvs.
+ 	// Its length is checked, since every sender serializes a point as 33
+ 	// bytes. It is not checked to be a curve point: a decode error fails the
+ 	// channel, and an honest relay can pass on a bad point chosen by the
+ 	// path's creator. The node fails only that HTLC, with
+ 	// invalid_onion_blinding (BOLT 2).
+ 	let blindingPoint: Buffer | undefined;
++	let skimmedFeeMsat: bigint | undefined;
+ 	if (offset < payload.length) {
+ 		const { records } = decodeTlvStream(
+ 			payload,
+@@ -176,6 +187,11 @@ export function decodeUpdateAddHtlcMessage(
+ 					);
+ 				}
+ 				blindingPoint = record.value;
++			} else if (record.type === TLV_SKIMMED_FEE_MSAT) {
++				if (record.value.length !== 8) {
++					throw new Error('update_add_htlc: skimmed_fee_msat must be 8 bytes');
++				}
++				skimmedFeeMsat = record.value.readBigUInt64BE();
+ 			}
+ 		}
+ 	}
+@@ -191,6 +207,7 @@ export function decodeUpdateAddHtlcMessage(
+ 	if (blindingPoint) {
+ 		result.blindingPoint = blindingPoint;
+ 	}
++	if (skimmedFeeMsat !== undefined) result.skimmedFeeMsat = skimmedFeeMsat;
+ 	return result;
+ }
+ 
+diff --git a/src/lightning/node/events.ts b/src/lightning/node/events.ts
+index d8b35fa..0ab0eca 100644
+--- a/src/lightning/node/events.ts
++++ b/src/lightning/node/events.ts
+@@ -205,7 +205,7 @@ export interface LightningNodeEvents
+ 		inputIndex: number;
+ 		height: number;
+ 	}) => void;
+-	/** A conflicted splice was unwound by agreement: both sides verified the conflict on their own chain view and returned to the pre-splice funding, which both still hold valid commitments for. The channel is NORMAL on the old outpoint, its watch re-armed; a `spliceInAndWait` on that splice rejects, and a direct-funding request behind it is failed (`direct-funding:offer:failed`, "the payer spent the offered coin elsewhere"). */
++	/** A conflicted splice was unwound by agreement: both sides verified the conflict on their own chain view and returned to the pre-splice funding, which both still hold valid commitments for. The channel is NORMAL on the old outpoint, its watch re-armed; a `spliceInAndWait` on that splice rejects, and a direct-funding request behind it is failed (`direct-funding:offer:failed`, "the payer spent the offered coin elsewhere"), or, when its receipt already went out, its received record is marked REVERTED. */
+ 	'splice:reverted': (data: {
+ 		channelId: Buffer;
+ 		spliceTxid: string;
+diff --git a/src/lightning/node/lightning-node.ts b/src/lightning/node/lightning-node.ts
+index fd62456..9c54841 100644
+--- a/src/lightning/node/lightning-node.ts
++++ b/src/lightning/node/lightning-node.ts
+@@ -825,6 +825,15 @@ function boundedFailureReason(reason: string): string {
+ 	return reason.slice(0, end);
+ }
+ 
++/**
++ * Note what a settled receive's HTLCs paid when it is not the record's
++ * amount. The record keeps the amount it was validated against, which a
++ * JIT skim or an overpaying sender moves away from what the channel credits.
++ */
++function recordReceivedMsat(payment: IPaymentInfo, settledMsat: bigint): void {
++	if (settledMsat !== payment.amountMsat) payment.receivedMsat = settledMsat;
++}
++
+ /**
+  * How long `requestJitReceive` waits for the LSP's ack. Kept at 15 s because
+  * the round trip sits inside the caller's own request budget: the daemon's
+@@ -1276,6 +1285,14 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
+ 		string,
+ 		{ announcement: Buffer; update: Buffer }
+ 	> = new Map();
++	/** Last timestamp signed into a direct channel_update, per channel. */
++	private directUpdateTimestamps = new Map<string, number>();
++	/**
++	 * Per channel peer, its newest private update for each SCID we have not
++	 * assigned yet, keyed by SCID hex. Without an alias, each side takes the
++	 * real SCID from its own chain view, so the peer's update can arrive first.
++	 */
++	private earlyPeerUpdates = new Map<string, Map<string, Buffer>>();
+ 	/** Periodic timer that refreshes + re-broadcasts our gossip so the node stays in the public graph. */
+ 	private _gossipRefreshTimer?: ReturnType<typeof setInterval>;
+ 	// MPP: pending multi-part payments awaiting all parts (keyed by paymentHash hex)
+@@ -4997,11 +5014,15 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
+ 		this.channelManager.on(
+ 			'channel:scid-assigned',
+ 			(channelId: Buffer, scid: Buffer) => {
++				this.adoptEarlyPeerUpdate(channelId, scid);
+ 				const channel = this.channelManager.getChannel(channelId);
+ 				if (!channel || !this.shouldAcceptRealScid(channel.getFullState())) {
+ 					return;
+ 				}
+ 				this.registerChannelScid(channelId, scid);
++				// A private peer may omit the channel_ready alias. Its first
++				// addressable policy update then has to wait for the real SCID.
++				this.sendPrivateChannelPolicy(channelId);
+ 			}
+ 		);
+ 		// A channel restored from persistence has finished reestablishing:
+@@ -5040,6 +5061,7 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
+ 		// facts only, which is what makes it safe on this every-reconnect
+ 		// event where the restore repair above is not.
+ 		this.channelManager.on('channel:reestablished', (channelId: Buffer) => {
++			this.sendPrivateChannelPolicy(channelId);
+ 			this.settleForwardsOwedUpstream(channelId);
+ 			this.fulfillSettledReceivedHtlcs(channelId);
+ 			// A conflict verdict the peer has not yet agreed is re-asked on
+@@ -5061,6 +5083,7 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
+ 		this.channelManager.on('channel:ready', (channelId: Buffer) => {
+ 			this.registerChannelScids(channelId);
+ 			this.persistChannel(channelId);
++			this.sendPrivateChannelPolicy(channelId);
+ 			// Clear reestablish stuck tracker when channel reaches NORMAL
+ 			this._stuckChannelTracker.delete(
+ 				`reestablish:${channelId.toString('hex')}`
+@@ -5177,6 +5200,7 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
+ 
+ 		this.channelManager.on('channel:closed', (channelId: Buffer) => {
+ 			this._ownChannelGossip.delete(channelId.toString('hex'));
++			this.directUpdateTimestamps.delete(channelId.toString('hex'));
+ 			this.persistChannel(channelId);
+ 			// A cooperative close records its signed tx just before the manager
+ 			// emits broadcast:tx; register the txid so the watcher's
+@@ -13167,6 +13191,28 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
+ 		return out;
+ 	}
+ 
++	private sendPrivateChannelPolicy(channelId: Buffer): void {
++		const channel = this.channelManager.getChannel(channelId);
++		if (channel && !channel.getFullState().announceChannel) {
++			// Private peers cannot learn our fees from public gossip. Send the
++			// signed policy when the channel first becomes usable and after each
++			// reconnect so their invoice hints use the fees we actually enforce.
++			this.regenerateChannelUpdateForPolicy(channelId);
++		}
++	}
++
++	/** Take the peer's held private update once we assign the SCID it names. */
++	private adoptEarlyPeerUpdate(channelId: Buffer, scid: Buffer): void {
++		const peer = this.channelManager.getPeerForChannel(channelId);
++		const held = peer ? this.earlyPeerUpdates.get(peer) : undefined;
++		const scidHex = scid.toString('hex');
++		const payload = held?.get(scidHex);
++		if (!peer || !held || !payload) return;
++		held.delete(scidHex);
++		if (held.size === 0) this.earlyPeerUpdates.delete(peer);
++		this.adoptPeerChannelPolicyNow(payload);
++	}
++
+ 	/**
+ 	 * Push the (new) effective policy out as a channel_update. Announced
+ 	 * channels: rewrite the cached update, re-add to our graph, and broadcast
+@@ -13201,7 +13247,7 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
+ 			try {
+ 				this.peerManager.sendToPeer(peer, MessageType.CHANNEL_UPDATE, payload);
+ 			} catch {
+-				// Peer not connected; it will learn the policy from route hints.
++				// Retry when the channel reestablishes with the peer.
+ 			}
+ 		} else {
+ 			this.emitOutbound(peer, MessageType.CHANNEL_UPDATE, payload);
+@@ -13245,13 +13291,21 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
+ 				policy.htlcMaximumMsat > capacityMsat
+ 					? capacityMsat
+ 					: policy.htlcMaximumMsat;
++			// The peer keeps only a strictly newer update, and readiness plus a
++			// policy change made from its listener land in the same second.
++			const hex = channelId.toString('hex');
++			const timestamp = Math.max(
++				Math.floor(Date.now() / 1000),
++				(this.directUpdateTimestamps.get(hex) ?? 0) + 1
++			);
++			this.directUpdateTimestamps.set(hex, timestamp);
+ 			const payload = encodeChannelUpdateMessage({
+ 				signature: Buffer.alloc(64), // placeholder, signed below
+ 				// Match the chain scope the receiver enforces (acceptableChainHashes),
+ 				// defaulting to OUR network's hash — never mainnet (S-7.M1).
+ 				chainHash: this.acceptableChainHashes[0] ?? this.chainHash(),
+ 				shortChannelId: scid,
+-				timestamp: Math.floor(Date.now() / 1000),
++				timestamp,
+ 				// bit 0: htlc_maximum_msat present; bit 1: dont_forward — this
+ 				// update is for an UNANNOUNCED channel, so a peer relaying it would
+ 				// leak private-channel existence and policy (BOLT 7).
+@@ -15434,6 +15488,14 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
+ 			fundingSatoshis: state.fundingSatoshis,
+ 			channelType: state.channelType
+ 		};
++		// What a disconnect wrapped (issue #1899): a client otherwise reads an
++		// opening and an open channel alike while the peer is away.
++		if (
++			state.state === ChannelState.AWAITING_REESTABLISH &&
++			state.preReestablishState
++		) {
++			info.preReestablishState = state.preReestablishState;
++		}
+ 		if (state.fundingTxid) {
+ 			info.fundingTxid = Buffer.from(state.fundingTxid)
+ 				.reverse()
+@@ -15464,6 +15526,14 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
+ 				Buffer.from(t).reverse().toString('hex')
+ 			);
+ 		}
++		// The fundings this channel has locked (issue #1899), whatever state it
++		// is in now: a closed channel, or one whose peer is away, still says
++		// its funding locked. Display order like fundingTxid.
++		if (state.lockedFundingTxids && state.lockedFundingTxids.length > 0) {
++			info.lockedFundingTxids = state.lockedFundingTxids.map((t) =>
++				Buffer.from(t).reverse().toString('hex')
++			);
++		}
+ 		info.htlcUsable = channel.acceptsNewHtlcs();
+ 		// The initial splice handshake is still NORMAL, but its quiescence
+ 		// gate already refuses outbound adds.
+@@ -16474,15 +16544,13 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
+ 				// right now, and its volume is bounded by our channel count,
+ 				// so it keeps the synchronous path. Decode here is cheap; the
+ 				// expensive signature check stays behind the graph's gates.
+-				let ours = false;
++				let msg: IChannelUpdateMessage;
+ 				try {
+-					ours = this.channelUpdateTargetsOurChannel(
+-						decodeChannelUpdateMessage(payload)
+-					);
++					msg = decodeChannelUpdateMessage(payload);
+ 				} catch {
+ 					return; // malformed gossip — same silent drop as the handler's
+ 				}
+-				if (ours) {
++				if (this.channelUpdateTargetsOurChannel(msg)) {
+ 					// While the stored map is restored in slices, the peer's
+ 					// policy is taken at once, since a private channel's route
+ 					// hints and blinded paths read it from the channel state;
+@@ -16496,6 +16564,22 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
+ 					this.handleChannelUpdate(payload);
+ 					break;
+ 				}
++				if (
++					(msg.messageFlags & 0x02) !== 0 &&
++					this.channelManager.hasChannelWithPeer(pubkey)
++				) {
++					const held = this.earlyPeerUpdates.get(pubkey) ?? new Map();
++					const scidHex = msg.shortChannelId.toString('hex');
++					held.delete(scidHex);
++					held.set(scidHex, payload);
++					// One slot per channel with the peer, oldest dropped first.
++					const slots = this.channelManager.countChannelsWithPeer(pubkey);
++					for (const key of held.keys()) {
++						if (held.size <= slots) break;
++						held.delete(key);
++					}
++					this.earlyPeerUpdates.set(pubkey, held);
++				}
+ 				this.enqueueBroadcastGossip(pubkey, type, payload);
+ 				break;
+ 			}
+@@ -21584,6 +21668,7 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
+ 				htlcId,
+ 				paymentHash,
+ 				keysendPreimage,
++				amountMsat,
+ 				amountMsat
+ 			);
+ 			return;
+@@ -21922,6 +22007,7 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
+ 				channelId,
+ 				htlcId,
+ 				partAmountMsat,
++				amountMsat,
+ 				paymentHash,
+ 				hopPayload!,
+ 				preimage!,
+@@ -21940,7 +22026,8 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
+ 			htlcId,
+ 			paymentHash,
+ 			preimage!,
+-			partAmountMsat
++			partAmountMsat,
++			amountMsat
+ 		);
+ 	}
+ 
+@@ -22176,6 +22263,7 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
+ 			);
+ 			// 0n is an any-amount invoice that had no payment until now.
+ 			if (payment.amountMsat === 0n) payment.amountMsat = settledMsat;
++			recordReceivedMsat(payment, settledMsat);
+ 			this.safeStorage(
+ 				() => this.persistPayment(paymentHash),
+ 				'persistPayment'
+@@ -24081,14 +24169,17 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
+ 	 * handleFinalHopHtlc (the payment_secret match for BOLT 11 parts, the
+ 	 * blinded path_id match for BOLT 12 parts, which have no payment_data).
+ 	 * amountMsat is the part's onion-declared amt_to_forward, NOT the
+-	 * incoming HTLC value, which may exceed it; declaredTotalMsat is the
+-	 * sender-declared total the parts accumulate toward: payment_data
+-	 * total_msat or blinded-final total_amount_msat.
++	 * incoming HTLC value, which may exceed it or (a JIT skim) fall short of
++	 * it; htlcAmountMsat is that HTLC value, kept for what the settled set
++	 * credits. declaredTotalMsat is the sender-declared total the parts
++	 * accumulate toward: payment_data total_msat or blinded-final
++	 * total_amount_msat.
+ 	 */
+ 	private handleMppPart(
+ 		channelId: Buffer,
+ 		htlcId: bigint,
+ 		amountMsat: bigint,
++		htlcAmountMsat: bigint,
+ 		paymentHash: Buffer,
+ 		hopPayload: IHopPayload,
+ 		preimage: Buffer,
+@@ -24183,6 +24274,7 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
+ 			channelId,
+ 			htlcId,
+ 			amountMsat,
++			htlcAmountMsat,
+ 			status: PaymentStatus.PENDING
+ 		};
+ 		pending.receivedParts.push(part);
+@@ -24242,6 +24334,10 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
+ 				// An any-amount invoice's record holds 0n until paid, so the
+ 				// settled parts are the only source of what it received.
+ 				if (payment.amountMsat === 0n) payment.amountMsat = totalReceived;
++				recordReceivedMsat(
++					payment,
++					pending.receivedParts.reduce((sum, p) => sum + p.htlcAmountMsat, 0n)
++				);
+ 				this.persistPayment(paymentHash);
+ 				this.emit('payment:received', payment);
+ 				this.emitInvoiceSettled(paymentHash, payment);
+@@ -24371,16 +24467,19 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
+ 	}
+ 
+ 	/**
+-	 * receivedMsat is the settled HTLC's payment amount. It replaces the
+-	 * record's amount only when that is 0n, which is an any-amount invoice
+-	 * that has not been paid yet.
++	 * declaredMsat is the onion's amt_to_forward for the settled HTLC. It
++	 * replaces the record's amount only when that is 0n, which is an
++	 * any-amount invoice that has not been paid yet. htlcMsat is the HTLC's
++	 * own value, what the channel credits, recorded as receivedMsat when the
++	 * two differ.
+ 	 */
+ 	private fulfillPayment(
+ 		channelId: Buffer,
+ 		htlcId: bigint,
+ 		paymentHash: Buffer,
+ 		preimage: Buffer,
+-		receivedMsat: bigint
++		declaredMsat: bigint,
++		htlcMsat: bigint
+ 	): void {
+ 		const hashHex = paymentHash.toString('hex');
+ 		// Clean up shared secret on fulfillment
+@@ -24401,7 +24500,8 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
+ 			payment.status = PaymentStatus.COMPLETED;
+ 			payment.completedAt = Date.now();
+ 			payment.settledHtlcs = [`${channelId.toString('hex')}:${htlcId}`];
+-			if (payment.amountMsat === 0n) payment.amountMsat = receivedMsat;
++			if (payment.amountMsat === 0n) payment.amountMsat = declaredMsat;
++			recordReceivedMsat(payment, htlcMsat);
+ 		}
+ 
+ 		// Persist BEFORE sending fulfill message: on crash, reestablish
+@@ -25217,7 +25317,8 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
+ 					part.paymentHash,
+ 					part.forwardCltv,
+ 					nextOnionBuf,
+-					part.nextBlindingPoint
++					part.nextBlindingPoint,
++					part.skimmedFeeMsat
+ 				);
+ 			}
+ 		);
+@@ -27069,8 +27170,10 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
+ 					),
+ 					`${'0'.repeat(64)}:${U64_MAX}`
+ 				];
+-				// An any-amount invoice records what its parts paid.
++				// An any-amount invoice records what its parts paid, and any
++				// invoice what they credited when that differs.
+ 				if (payment.amountMsat === 0n) settled.amountMsat = U64_MAX;
++				settled.receivedMsat = U64_MAX;
+ 			}
+ 		}
+ 		return { type: 'payment_state', paymentHash: hashHex, payment: settled };
+@@ -28525,6 +28628,16 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
+ 						this.removeListener('splice:reverted', cb);
+ 					};
+ 				},
++				hasRevertedSplice: (channelIdHex, spliceTxid): boolean =>
++					this.channelManager
++						.getChannel(Buffer.from(channelIdHex, 'hex'))
++						?.hasRevertedSplice(spliceTxid) ?? false,
++				// getRawChannel also finds a v2 open not yet promoted out of the
++				// temporary map, which a zero-conf open can still be when it locks.
++				hasLockedFunding: (channelIdHex, fundingTxid): boolean =>
++					this.getRawChannel(
++						Buffer.from(channelIdHex, 'hex')
++					)?.hasLockedFunding(fundingTxid) ?? false,
+ 				log
+ 			},
+ 			{
+@@ -28554,6 +28667,23 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
+ 		receiver.on('offer:completed', (e) =>
+ 			this.emit('direct-funding:offer:completed', e)
+ 		);
++		// A funding lock stamps lockedAt on the payments it carried (issue
++		// #1899). Both events fire after the node has persisted the lock, and
++		// every funding the channel has recorded as locked is marked, not only
++		// the one the event names: the mark is idempotent, and a lock missed
++		// earlier is picked up too. The record holds display byte order; the
++		// channel's list, like the splice event's txid, is internal order.
++		const markLocked = (channelId: Buffer): void => {
++			const locked =
++				this.getRawChannel(channelId)?.getFullState().lockedFundingTxids;
++			for (const txid of locked ?? []) {
++				requests.markReceivedLocked(
++					Buffer.from(txid).reverse().toString('hex')
++				);
++			}
++		};
++		this.on('channel:ready', ({ channelId }) => markLocked(channelId));
++		this.on('splice:complete', ({ channelId }) => markLocked(channelId));
+ 		this.directFunding = {
+ 			requests,
+ 			registry,
+@@ -31567,7 +31697,14 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
+ 		const channels = this.channelManager.listChannels();
+ 		for (const channel of channels) {
+ 			const state = channel.getFullState();
+-			const effectiveState = state.preReestablishState ?? state.state;
++			// Nothing clears preReestablishState when a marked channel closes,
++			// so reading through it on any other state would find a closed
++			// channel's HTLCs still live: it would fail their payments before
++			// the chain decides and close the channel again every block.
++			const effectiveState =
++				state.state === ChannelState.AWAITING_REESTABLISH
++					? state.preReestablishState ?? state.state
++					: state.state;
+ 			// ERRORED is admitted so the force-close backstop below still guards an
+ 			// offered HTLC on a failed channel: the value is OURS, and the
+ 			// downstream can claim it with the preimage whether or not the channel
+diff --git a/src/lightning/node/payment-types.ts b/src/lightning/node/payment-types.ts
+index 80f96a8..e8a803a 100644
+--- a/src/lightning/node/payment-types.ts
++++ b/src/lightning/node/payment-types.ts
+@@ -50,6 +50,14 @@ export interface IPaymentInfo {
+ 	 * subtracted, so this can overstate by that part.
+ 	 */
+ 	sentMsat?: bigint;
++	/**
++	 * The msat this node was credited for an incoming payment, the sum of the
++	 * HTLCs it settled, when amountMsat is not that figure. amountMsat stays
++	 * the invoice (or onion-declared) amount the payment was validated
++	 * against. A JIT skim settles HTLCs short of it by the LSP's opening fee,
++	 * and an overpaying sender's HTLCs exceed it.
++	 */
++	receivedMsat?: bigint;
+ 	status: PaymentStatus;
+ 	direction: PaymentDirection;
+ 	route?: IRoute;
+diff --git a/src/lightning/node/types.ts b/src/lightning/node/types.ts
+index 0436aeb..b304657 100644
+--- a/src/lightning/node/types.ts
++++ b/src/lightning/node/types.ts
+@@ -1112,6 +1112,13 @@ export interface IChannelInfo {
+ 	channelId: Buffer;
+ 	peerPubkey: string;
+ 	state: ChannelState;
++	/**
++	 * The state the channel was in when a disconnect, or a restart, put it in
++	 * AWAITING_REESTABLISH; present exactly while it is there. A consumer
++	 * tells a channel still opening from one already open by it while the
++	 * peer is away, as the node's own balance does (issue #1899).
++	 */
++	preReestablishState?: ChannelState;
+ 	localBalanceMsat: bigint;
+ 	/** Balance-based debit ceiling for one new outbound HTLC, including
+ 	 * commitment costs and buffers. Zero while new HTLCs are unavailable.
+@@ -1150,6 +1157,26 @@ export interface IChannelInfo {
+ 	 * that has never been spliced (issue #1060).
+ 	 */
+ 	previousFundingTxids?: string[];
++	/**
++	 * Funding txids this channel has locked, oldest first (display byte
++	 * order): the open's funding once both channel_ready messages crossed,
++	 * and each splice's funding once both splice_locked messages did (issue
++	 * #1899). Kept through close, so it still answers once the channel has
++	 * closed or while its peer is away. A force close that adopts a confirmed
++	 * splice locks nothing.
++	 *
++	 * Complete for the locks this version recorded. A channel written by an
++	 * earlier version is seeded on load with what its stored state proves
++	 * (the open's funding, and the current funding of a channel still open),
++	 * so an earlier splice lock, or the last funding of a channel closed
++	 * before the upgrade, can be missing. Treat a txid that is not listed,
++	 * and an absent field, as "not known", not as "never locked".
++	 *
++	 * A lock is the channel_ready or splice_locked exchange. On a zero-conf
++	 * channel that comes before the funding confirms, so a listed txid is not
++	 * proof of confirmation.
++	 */
++	lockedFundingTxids?: string[];
+ 	/**
+ 	 * Whether the channel will accept a NEW HTLC: it can carry traffic right
+ 	 * now (NORMAL, or ECDSA pending-lock mid-splice with pay-during-splice
+@@ -1376,7 +1403,10 @@ export interface IPaymentPart {
+ 	partIndex: number;
+ 	channelId: Buffer;
+ 	htlcId: bigint;
++	/** The part's onion amt_to_forward, which the set accumulates toward its total. */
+ 	amountMsat: bigint;
++	/** The committed HTLC's value: what settling this part credits. */
++	htlcAmountMsat: bigint;
+ 	status: PaymentStatus;
+ }
+ 
+@@ -1429,6 +1459,8 @@ export interface IForwardablePart {
+ 	inHtlcId: bigint;
+ 	paymentHash: Buffer;
+ 	forwardAmountMsat: bigint;
++	/** Agreed JIT fee deducted from this part, announced to its recipient. */
++	skimmedFeeMsat?: bigint;
+ 	/**
+ 	 * The inbound HTLC's value (msat), i.e. `forwardAmountMsat` plus whatever
+ 	 * routing fee the sender paid this hop. Recorded by the forwarding path
+diff --git a/src/lightning/storage/serialization.ts b/src/lightning/storage/serialization.ts
+index 8575e72..e122d01 100644
+--- a/src/lightning/storage/serialization.ts
++++ b/src/lightning/storage/serialization.ts
+@@ -404,6 +404,11 @@ export interface ISerializedChannelState {
+ 	 * order hex (issue #1060). Absent on rows written before the field.
+ 	 */
+ 	previousFundingTxids?: string[];
++	/**
++	 * Funding txids this channel has locked, oldest first, internal byte order
++	 * hex (issue #1899). Absent on rows written before the field.
++	 */
++	lockedFundingTxids?: string[];
+ 	fundingOutputIndex: number;
+ 	minimumDepth: number;
+ 	localConfig: ISerializedChannelConfig;
+@@ -961,6 +966,7 @@ export function serializeChannelState(
+ 		fundingUnaccounted: s.fundingUnaccounted,
+ 		hasBeenSpliced: s.hasBeenSpliced,
+ 		previousFundingTxids: s.previousFundingTxids?.map((t) => t.toString('hex')),
++		lockedFundingTxids: s.lockedFundingTxids?.map((t) => t.toString('hex')),
+ 		fundingOutputIndex: s.fundingOutputIndex,
+ 		minimumDepth: s.minimumDepth,
+ 		localConfig: serializeChannelConfig(s.localConfig),
+@@ -1595,6 +1601,7 @@ export function deserializeChannelState(
+ 		previousFundingTxids: s.previousFundingTxids?.map((t) =>
+ 			Buffer.from(t, 'hex')
+ 		),
++		lockedFundingTxids: s.lockedFundingTxids?.map((t) => Buffer.from(t, 'hex')),
+ 		fundingOutputIndex: s.fundingOutputIndex,
+ 		minimumDepth: s.minimumDepth,
+ 		localConfig: deserializeChannelConfig(s.localConfig),
+@@ -1824,6 +1831,8 @@ export interface ISerializedPaymentInfo {
+ 	amountMsat: string;
+ 	/** Msat that left the node, fees included, when amountMsat is not that (MPP). */
+ 	sentMsat?: string;
++	/** Msat an incoming payment's settled HTLCs paid, when amountMsat is not that. */
++	receivedMsat?: string;
+ 	status: string;
+ 	direction: string;
+ 	route?: string; // JSON string
+@@ -1854,6 +1863,9 @@ export function serializePaymentInfo(p: IPaymentInfo): ISerializedPaymentInfo {
+ 		preimage: bufToHex(p.preimage) ?? undefined,
+ 		amountMsat: bigintToStr(p.amountMsat),
+ 		...(p.sentMsat !== undefined ? { sentMsat: bigintToStr(p.sentMsat) } : {}),
++		...(p.receivedMsat !== undefined
++			? { receivedMsat: bigintToStr(p.receivedMsat) }
++			: {}),
+ 		status: p.status,
+ 		direction: p.direction,
+ 		route: p.route
+@@ -1909,6 +1921,9 @@ export function deserializePaymentInfo(
+ 		preimage: s.preimage ? Buffer.from(s.preimage, 'hex') : undefined,
+ 		amountMsat: strToBigint(s.amountMsat),
+ 		...(s.sentMsat !== undefined ? { sentMsat: strToBigint(s.sentMsat) } : {}),
++		...(s.receivedMsat !== undefined
++			? { receivedMsat: strToBigint(s.receivedMsat) }
++			: {}),
+ 		status: s.status as PaymentStatus,
+ 		direction: s.direction as PaymentDirection,
+ 		route: s.route ? JSON.parse(s.route, reviver) : undefined,
+diff --git a/src/wallet/index.ts b/src/wallet/index.ts
+index 1bc876b..1926fba 100644
+--- a/src/wallet/index.ts
++++ b/src/wallet/index.ts
+@@ -332,6 +332,14 @@ export class Wallet {
+ 	// is looked up once rather than on every scan. Kept to the young coins of
+ 	// the last lookup.
+ 	private readonly _coinbaseTxids: Map<string, boolean> = new Map();
++	// The coins that left the UTXO set, keyed 'txid:vout', with the address
++	// each was at. A refresh reads the history of the addresses in the window
++	// and of the coins still in the set, so the spend of a coin below the
++	// window, by another device on the same seed or by a send of ours with no
++	// change, is read only through this. An entry stays until a stored record
++	// spends the coin, or its address's history no longer lists the
++	// transaction that made it, or a scan finds the coin again. Memory only.
++	private readonly _goneCoins: Map<string, IAddress> = new Map();
+ 	// This wallet's tip at the first check a node without a txindex answered
+ 	// "no such mempool transaction" for a record the rule of issue #871 kept,
+ 	// by txid, or the highest tip it held if that was higher. A miss that
+@@ -3417,12 +3425,16 @@ export class Wallet {
+ 		// network's coins and its number means nothing to the new count.
+ 		const electrum = this.electrum;
+ 		// The set does not hold these, so nothing else keeps their addresses in
+-		// the scan once the strategy's window has moved past them.
++		// the scan once the strategy's window has moved past them. A gone coin
++		// that a scan lists again is back in the set, and no longer gone.
+ 		const heldBack: IAddresses = {};
+ 		for (const { index, path, address, scriptHash, publicKey } of this
+ 			._immatureUtxos) {
+ 			heldBack[scriptHash] = { index, path, address, scriptHash, publicKey };
+ 		}
++		for (const address of this._goneCoins.values()) {
++			heldBack[address.scriptHash] = address;
++		}
+ 		// The held-back list is memory only, and a stored record names just one
+ 		// of the addresses its transaction paid. So until a scan has applied
+ 		// since the wallet loaded, a stored coinbase makes the scan list every
+@@ -3485,6 +3497,10 @@ export class Wallet {
+ 			utxos.reduce((sum, utxo) => sum + utxo.value, 0);
+ 		const balance =
+ 			(getUtxosRes.value?.balance ?? 0) - scanned.spentValue - droppedValue;
++		this.noteGoneCoins(
++			[...this._data.utxos, ...this._immatureUtxos],
++			[...utxos, ...immature]
++		);
+ 		this._data.utxos = utxos;
+ 		this._data.balance = balance;
+ 		this._immatureUtxos = immature;
+@@ -3615,6 +3631,7 @@ export class Wallet {
+ 			spent.has(`${utxo.tx_hash}:${utxo.tx_pos}`)
+ 		);
+ 		if (!removed.length) return ok([]);
++		this.noteGoneCoins(removed, []);
+ 		this._data.utxos = this._data.utxos.filter(
+ 			(utxo) => !spent.has(`${utxo.tx_hash}:${utxo.tx_pos}`)
+ 		);
+@@ -3662,6 +3679,64 @@ export class Wallet {
+ 		return { utxos, spentValue };
+ 	}
+ 
++	/**
++	 * Records in _goneCoins the coins of `before` that `after` does not hold,
++	 * and drops the entries of coins it holds again.
++	 * @param {IUtxo[]} before
++	 * @param {IUtxo[]} after
++	 */
++	private noteGoneCoins(before: IUtxo[], after: IUtxo[]): void {
++		const held = new Set(after.map((utxo) => `${utxo.tx_hash}:${utxo.tx_pos}`));
++		for (const outpoint of this._goneCoins.keys()) {
++			if (held.has(outpoint)) this._goneCoins.delete(outpoint);
++		}
++		for (const utxo of before) {
++			const outpoint = `${utxo.tx_hash}:${utxo.tx_pos}`;
++			if (held.has(outpoint)) continue;
++			const { index, path, address, scriptHash, publicKey } = utxo;
++			this._goneCoins.set(outpoint, {
++				index,
++				path,
++				address,
++				scriptHash,
++				publicKey
++			});
++		}
++	}
++
++	/**
++	 * Drops the _goneCoins entries a history lookup settled: a transaction
++	 * its address's history lists spends the coin and is stored, or is about
++	 * to be from `fresh`, or the history no longer lists the transaction that
++	 * made the coin. An entry replaced since the lookup went out, or whose
++	 * address the server did not answer, waits for the next lookup.
++	 * @param {Map<string, IAddress>} gone The entries as the lookup went out.
++	 * @param {Map<string, TTxResult[]>} answered The lookup's answers, by
++	 * script hash.
++	 * @param {IFormattedTransactions} fresh
++	 */
++	private settleGoneCoins(
++		gone: Map<string, IAddress>,
++		answered: Map<string, TTxResult[]>,
++		fresh: IFormattedTransactions
++	): void {
++		for (const [outpoint, address] of gone) {
++			if (this._goneCoins.get(outpoint) !== address) continue;
++			const listed = answered.get(address.scriptHash);
++			if (!listed) continue;
++			const funding = outpoint.slice(0, outpoint.lastIndexOf(':'));
++			const settled =
++				!listed.some(({ tx_hash }) => tx_hash === funding) ||
++				listed.some(
++					({ tx_hash }) =>
++						(fresh[tx_hash] ?? this._data.transactions[tx_hash])?.vin?.some(
++							(vin) => 'txid' in vin && `${vin.txid}:${vin.vout}` === outpoint
++						)
++				);
++			if (settled) this._goneCoins.delete(outpoint);
++		}
++	}
++
+ 	/**
+ 	 * Writes the UTXO set, then the balance, as one pair read from memory at
+ 	 * the call. They are separate storage keys and cannot be written
+@@ -4300,14 +4375,26 @@ export class Wallet {
+ 		// stand in for this lookup only if nothing has been cleared or repaired
+ 		// since they were asked for. Then the counts above are also the ones
+ 		// they went out at, and no answer can undo a repair.
++		// Otherwise an empty map, which still tells settleGoneCoins which
++		// addresses the server answered.
++		const answered = scan?.current()
++			? scan.history
++			: new Map<string, TTxResult[]>();
++		const gone = new Map(this._goneCoins);
++		const goneAddresses: IAddresses = {};
++		for (const address of gone.values()) {
++			goneAddresses[address.scriptHash] = address;
++		}
+ 		const history = await electrum.getAddressHistory({
+ 			scanAllAddresses: scanAllAddresses || replaceStoredTransactions,
+-			answered: scan?.current() ? scan.history : undefined
++			answered,
++			additionalScriptHashes: goneAddresses
+ 		});
+ 		if (history.isErr()) {
+ 			return err(history.error);
+ 		}
+ 		if (!history.value.length) {
++			this.settleGoneCoins(gone, answered, {});
+ 			return ok(undefined);
+ 		}
+ 
+@@ -4367,6 +4454,9 @@ export class Wallet {
+ 				fresh[txid] = transaction;
+ 			}
+ 		}
++		// Every record in fresh is stored by the time this returns, if it is
++		// not already.
++		this.settleGoneCoins(gone, answered, fresh);
+ 
+ 		// Add unconfirmed transactions.
+ 		// No need to wait for this to finish.

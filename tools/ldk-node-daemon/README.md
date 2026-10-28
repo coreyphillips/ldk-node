@@ -35,6 +35,7 @@ an operator-owned Bitcoin Core backend:
   },
   "chicory": {
     "enabled": false,
+    "trusted_splice_peer_pubkeys": [],
     "flat_fee_sat": 100,
     "fee_ppm": 1000,
     "max_client_funding_sats": 500000,
@@ -56,6 +57,17 @@ bounded funding allocation, a
 six-confirmation inbound splice floor, and private stable funding keys for newly
 created compatible homes. See [the protocol documentation](../../docs/chicory-primary.md)
 for the state machine, recovery rules, backend fee policy, and qualification.
+
+`trusted_splice_peer_pubkeys` optionally lists up to 128 distinct compressed
+Lightning public keys for instant primary-funded growth of confirmed channels.
+It defaults to empty. The provider trusts each listed wallet not to spend the
+old channel funding before the splice confirms, which could cause the provider
+to lose forwarded funds. Pairing never grants this trust. Only a positive,
+entirely locally funded JIT splice qualifies; peer deposits and third-party
+direct funding keep their confirmation floor. Removing a key affects future
+attempts; already authorized attempts continue even while still negotiating. The matching phone engine must also
+trust its configured primary. See the compatibility record for this policy's
+tests and limitations.
 
 The daemon verifies the backend genesis before loading keys, binds the directory
 to its network, and takes an exclusive process lock. A directory with older

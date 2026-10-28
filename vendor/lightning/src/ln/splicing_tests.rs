@@ -2821,3 +2821,334 @@ fn test_external_splice_requires_depth_ack_and_can_abandon_before_commitments() 
 		check_added_monitors(node, 0);
 	}
 }
+
+fn start_trusted_own_splice(
+	initiator: &Node, acceptor: &Node, channel_id: ChannelId, contribution: SpliceContribution,
+) -> (msgs::SpliceInit, msgs::SpliceAck) {
+	let a = initiator.node.get_our_node_id();
+	let b = acceptor.node.get_our_node_id();
+	initiator
+		.node
+		.splice_channel_with_trusted_own_funding(
+			&channel_id,
+			&b,
+			contribution,
+			FEERATE_FLOOR_SATS_PER_KW,
+			None,
+		)
+		.unwrap();
+	let stfu = get_event_msg!(initiator, MessageSendEvent::SendStfu, b);
+	acceptor.node.handle_stfu(a, &stfu);
+	let stfu = get_event_msg!(acceptor, MessageSendEvent::SendStfu, a);
+	initiator.node.handle_stfu(b, &stfu);
+	let init = get_event_msg!(initiator, MessageSendEvent::SendSpliceInit, b);
+	assert_eq!(init.lock_depth, None);
+	assert!(init.funding_contribution_satoshis > 0);
+	acceptor.node.handle_splice_init(a, &init);
+	let ack = get_event_msg!(acceptor, MessageSendEvent::SendSpliceAck, a);
+	assert_eq!(ack.funding_contribution_satoshis, 0);
+	assert_eq!(ack.lock_depth, None);
+	(init, ack)
+}
+
+#[test]
+fn test_trusted_own_splice_locks_confirmed_channel_and_restores_candidate() {
+	let chanmon_cfgs = create_chanmon_cfgs(2);
+	let node_cfgs = create_node_cfgs(2, &chanmon_cfgs);
+	let mut config = test_default_channel_config();
+	config.channel_handshake_config.minimum_depth = 6;
+	let (restored_persister, restored_monitor);
+	let node_chanmgrs = create_node_chanmgrs(2, &node_cfgs, &[Some(config.clone()), Some(config)]);
+	let restored_manager;
+	let mut nodes = create_network(2, &node_cfgs, &node_chanmgrs);
+	let a = nodes[0].node.get_our_node_id();
+	let b = nodes[1].node.get_our_node_id();
+	create_unannounced_chan_between_nodes_with_value(&nodes, 0, 1, 1_000_000, 500_000_000);
+	send_payment(&nodes[0], &[&nodes[1]], 100_000);
+	let old_channel = nodes[0].node.list_channels().remove(0);
+	let channel_id = old_channel.channel_id;
+	let old_outpoint = old_channel.funding_txo.unwrap();
+	let old_script = old_channel.funding_redeem_script.unwrap().to_p2wsh();
+	assert_eq!(old_channel.confirmations_required, Some(6));
+	let coin = provide_anchor_utxo_reserves(&nodes, 1, Amount::from_sat(30_000));
+	let start_height = nodes[0].best_block_info().1;
+	let contribution = SpliceContribution::SpliceIn {
+		value: Amount::from_sat(20_000),
+		inputs: vec![FundingTxInput::new_p2wpkh(coin, 0).unwrap()],
+		change_script: Some(nodes[0].wallet_source.get_change_script().unwrap()),
+	};
+	let (init, ack) =
+		start_trusted_own_splice(&nodes[0], &nodes[1], channel_id, contribution.clone());
+	nodes[0].node.handle_splice_ack(b, &ack);
+	let script = chan_utils::make_funding_redeemscript(&init.funding_pubkey, &ack.funding_pubkey);
+	let commitment = complete_interactive_funding_negotiation(
+		&nodes[0],
+		&nodes[1],
+		channel_id,
+		contribution,
+		script.to_p2wsh(),
+	);
+	let (tx, early_locked) = sign_interactive_funding_tx(&nodes[0], &nodes[1], commitment, true);
+	let early_locked = early_locked.unwrap().0;
+	assert_eq!(early_locked.splice_txid, tx.compute_txid());
+	assert_eq!(nodes[0].best_block_info().1, start_height);
+	expect_splice_pending_event(&nodes[0], &b);
+	expect_splice_pending_event(&nodes[1], &a);
+	assert!(nodes[1].node.get_and_clear_pending_msg_events().is_empty());
+	assert_eq!(nodes[0].node.list_channels()[0].funding_txo, Some(old_outpoint));
+	// The peer has not opted into trust and therefore keeps its confirmation policy.
+	nodes[1].node.handle_splice_locked(a, &early_locked);
+	assert!(nodes[1].node.get_and_clear_pending_msg_events().is_empty());
+	assert_eq!(nodes[1].node.list_channels()[0].funding_txo, Some(old_outpoint));
+
+	// Persist the fully signed candidate before the peer locks it. Restart must retain
+	// this exact authorization rather than grant trust to a subsequent candidate.
+	nodes[0].node.peer_disconnected(b);
+	nodes[1].node.peer_disconnected(a);
+	let monitor = get_monitor!(nodes[0], channel_id).encode();
+	reload_node!(
+		nodes[0],
+		nodes[0].node.encode(),
+		&[&monitor],
+		restored_persister,
+		restored_monitor,
+		restored_manager
+	);
+	reconnect_nodes(ReconnectArgs::new(&nodes[0], &nodes[1]));
+	assert_eq!(nodes[0].best_block_info().1, start_height);
+	assert_eq!(nodes[0].node.list_channels()[0].funding_txo, Some(old_outpoint));
+	// The candidate is still pending and has no confirmations on either side.
+	assert_eq!(nodes[0].tx_broadcaster.txn_broadcast(), vec![tx.clone()]);
+	mine_transaction(&nodes[1], &tx);
+	connect_blocks(&nodes[1], 4);
+	assert!(nodes[1].node.get_and_clear_pending_msg_events().is_empty());
+	connect_blocks(&nodes[1], 1);
+	let peer_locked = get_event_msg!(nodes[1], MessageSendEvent::SendSpliceLocked, a);
+	assert_eq!(peer_locked.splice_txid, tx.compute_txid());
+	nodes[0].node.handle_splice_locked(b, &peer_locked);
+	expect_channel_ready_event(&nodes[0], &b);
+	expect_channel_ready_event(&nodes[1], &a);
+	check_added_monitors(&nodes[0], 1);
+	check_added_monitors(&nodes[1], 1);
+	let channel = nodes[0].node.list_channels().remove(0);
+	let new_outpoint = channel.funding_txo.unwrap();
+	assert_eq!(new_outpoint.txid, tx.compute_txid());
+	assert_eq!(tx.output[new_outpoint.index as usize].script_pubkey, script.to_p2wsh());
+	assert_eq!(channel.channel_value_satoshis, 1_020_000);
+	assert_eq!(channel.confirmations_required, Some(0));
+	assert_eq!(nodes[0].best_block_info().1, start_height);
+	for node in &nodes {
+		node.chain_source.remove_watched_txn_and_outputs(old_outpoint, old_script.clone());
+	}
+
+	// A later ordinary splice must return to the original six-block policy.
+	mine_transaction(&nodes[0], &tx);
+	connect_blocks(&nodes[0], 5);
+	// Promotion may rebroadcast the same fully signed transaction once more.
+	assert!(nodes[0].tx_broadcaster.txn_broadcast().iter().all(|rebroadcast| rebroadcast == &tx));
+	assert!(nodes[1].tx_broadcaster.txn_broadcast().is_empty());
+	let ordinary_coin = provide_anchor_utxo_reserves(&nodes, 1, Amount::from_sat(31_000));
+	let ordinary_contribution = SpliceContribution::SpliceIn {
+		value: Amount::from_sat(20_000),
+		inputs: vec![FundingTxInput::new_p2wpkh(ordinary_coin, 0).unwrap()],
+		change_script: Some(nodes[0].wallet_source.get_change_script().unwrap()),
+	};
+	let ordinary_tx = splice_channel(&nodes[0], &nodes[1], channel_id, ordinary_contribution);
+	assert!(nodes[0].node.get_and_clear_pending_msg_events().is_empty());
+	assert_eq!(nodes[0].node.list_channels()[0].funding_txo, Some(new_outpoint));
+	for node in &nodes {
+		mine_transaction(node, &ordinary_tx);
+		connect_blocks(node, 4);
+		assert!(node.node.get_and_clear_pending_msg_events().is_empty());
+	}
+	connect_blocks(&nodes[0], 1);
+	connect_blocks(&nodes[1], 1);
+	let locked_a = get_event_msg!(nodes[0], MessageSendEvent::SendSpliceLocked, b);
+	let locked_b = get_event_msg!(nodes[1], MessageSendEvent::SendSpliceLocked, a);
+	nodes[0].node.handle_splice_locked(b, &locked_b);
+	nodes[1].node.handle_splice_locked(a, &locked_a);
+	expect_channel_ready_event(&nodes[0], &b);
+	expect_channel_ready_event(&nodes[1], &a);
+	for node in &nodes {
+		check_added_monitors(node, 1);
+		assert_eq!(node.node.list_channels()[0].confirmations_required, Some(6));
+		node.chain_source.remove_watched_txn_and_outputs(new_outpoint, script.to_p2wsh());
+	}
+}
+
+#[test]
+fn test_trusted_own_splice_rejects_non_local_ack() {
+	for (remote_contribution, lock_depth) in [(1, None), (-1, None), (0, Some(1))] {
+		let chanmon_cfgs = create_chanmon_cfgs(2);
+		let node_cfgs = create_node_cfgs(2, &chanmon_cfgs);
+		let node_chanmgrs = create_node_chanmgrs(2, &node_cfgs, &[None, None]);
+		let nodes = create_network(2, &node_cfgs, &node_chanmgrs);
+		create_unannounced_chan_between_nodes_with_value(&nodes, 0, 1, 1_000_000, 500_000_000);
+		send_payment(&nodes[0], &[&nodes[1]], 100_000);
+		let channel = nodes[0].node.list_channels().remove(0);
+		let b = nodes[1].node.get_our_node_id();
+		let contribution = SpliceContribution::SpliceIn {
+			value: Amount::from_sat(20_000),
+			inputs: create_dual_funding_utxos_with_prev_txs(&nodes[0], &[30_000]),
+			change_script: Some(nodes[0].wallet_source.get_change_script().unwrap()),
+		};
+		let (_, mut ack) =
+			start_trusted_own_splice(&nodes[0], &nodes[1], channel.channel_id, contribution);
+		ack.funding_contribution_satoshis = remote_contribution;
+		ack.lock_depth = lock_depth;
+		nodes[0].node.handle_splice_ack(b, &ack);
+		let messages = nodes[0].node.get_and_clear_pending_msg_events();
+		assert_eq!(messages.len(), 1);
+		assert!(matches!(messages[0], MessageSendEvent::HandleError { .. }));
+		assert!(nodes[0].node.get_and_clear_pending_events().is_empty());
+		assert!(nodes[0].node.funding_signing_details(&channel.channel_id, &b).is_err());
+		assert_eq!(nodes[0].node.list_channels()[0].funding_txo, channel.funding_txo);
+		check_added_monitors(&nodes[0], 0);
+	}
+}
+
+#[test]
+fn test_trusted_own_splice_rejects_non_positive_local_contribution() {
+	let chanmon_cfgs = create_chanmon_cfgs(2);
+	let node_cfgs = create_node_cfgs(2, &chanmon_cfgs);
+	let node_chanmgrs = create_node_chanmgrs(2, &node_cfgs, &[None, None]);
+	let nodes = create_network(2, &node_cfgs, &node_chanmgrs);
+	create_unannounced_chan_between_nodes_with_value(&nodes, 0, 1, 1_000_000, 500_000_000);
+	send_payment(&nodes[0], &[&nodes[1]], 100_000);
+	let channel = nodes[0].node.list_channels().remove(0);
+	let b = nodes[1].node.get_our_node_id();
+	for contribution in [
+		SpliceContribution::SpliceOut {
+			outputs: vec![TxOut {
+				value: Amount::from_sat(1_000),
+				script_pubkey: nodes[0].wallet_source.get_change_script().unwrap(),
+			}],
+		},
+		SpliceContribution::SpliceIn {
+			value: Amount::ZERO,
+			inputs: create_dual_funding_utxos_with_prev_txs(&nodes[0], &[30_000]),
+			change_script: None,
+		},
+		SpliceContribution::SpliceIn {
+			value: Amount::from_sat(20_000),
+			inputs: Vec::new(),
+			change_script: None,
+		},
+	] {
+		assert!(nodes[0]
+			.node
+			.splice_channel_with_trusted_own_funding(
+				&channel.channel_id,
+				&b,
+				contribution,
+				FEERATE_FLOOR_SATS_PER_KW,
+				None,
+			)
+			.is_err());
+		assert!(nodes[0].node.get_and_clear_pending_msg_events().is_empty());
+		assert!(!nodes[0].node.has_pending_funding_operation());
+		assert_eq!(nodes[0].node.list_channels()[0].funding_txo, channel.funding_txo);
+		check_added_monitors(&nodes[0], 0);
+	}
+}
+
+#[test]
+fn test_trusted_own_splice_rejects_hidden_remote_inputs_before_commitments() {
+	for trusted in [false, true] {
+		let chanmon_cfgs = create_chanmon_cfgs(2);
+		let node_cfgs = create_node_cfgs(2, &chanmon_cfgs);
+		let node_chanmgrs = create_node_chanmgrs(2, &node_cfgs, &[None, None]);
+		let nodes = create_network(2, &node_cfgs, &node_chanmgrs);
+		create_unannounced_chan_between_nodes_with_value(&nodes, 0, 1, 1_000_000, 500_000_000);
+		send_payment(&nodes[0], &[&nodes[1]], 100_000);
+		let channel = nodes[0].node.list_channels().remove(0);
+		let channel_id = channel.channel_id;
+		let b = nodes[1].node.get_our_node_id();
+		let contribution = SpliceContribution::SpliceIn {
+			value: Amount::from_sat(20_000),
+			inputs: create_dual_funding_utxos_with_prev_txs(&nodes[0], &[30_000]),
+			change_script: Some(nodes[0].wallet_source.get_change_script().unwrap()),
+		};
+		if trusted {
+			let (_, ack) = start_trusted_own_splice(&nodes[0], &nodes[1], channel_id, contribution);
+			nodes[0].node.handle_splice_ack(b, &ack);
+		} else {
+			complete_splice_handshake(&nodes[0], &nodes[1], channel_id, contribution);
+		}
+
+		// The peer declared zero channel contribution, but can still add its own
+		// input and a change output while paying its transaction fees. The ordinary
+		// path accepts this exact construction; explicit own-input trust must not.
+		let remote_input = create_dual_funding_utxos_with_prev_txs(&nodes[1], &[30_000]).remove(0);
+		let remote_output = TxOut {
+			value: Amount::from_sat(29_000),
+			script_pubkey: nodes[1].wallet_source.get_change_script().unwrap(),
+		};
+		let mut peer_turn = 0;
+		let mut committed = false;
+		let mut aborted = false;
+		for _ in 0..10 {
+			let messages = nodes[0].node.get_and_clear_pending_msg_events();
+			assert!(!messages.is_empty());
+			for message in messages {
+				match message {
+					MessageSendEvent::UpdateHTLCs { updates, .. } => {
+						assert!(!trusted, "Trusted candidate signed a peer-funded transaction");
+						assert_eq!(updates.commitment_signed.len(), 1);
+						committed = true;
+					},
+					MessageSendEvent::SendTxAbort { msg, .. } => {
+						assert!(trusted);
+						assert!(String::from_utf8_lossy(&msg.data)
+							.contains("Trusted splice contains non-holder inputs"));
+						aborted = true;
+					},
+					MessageSendEvent::SendTxAddInput { .. }
+					| MessageSendEvent::SendTxAddOutput { .. }
+					| MessageSendEvent::SendTxComplete { .. } => {},
+					other => panic!("Unexpected construction message: {:?}", other),
+				}
+			}
+			if committed || aborted {
+				break;
+			}
+			match peer_turn {
+				0 => nodes[0].node.handle_tx_add_input(
+					b,
+					&msgs::TxAddInput {
+						channel_id,
+						serial_id: 1,
+						prevtx: Some(remote_input.prevtx.clone()),
+						prevtx_out: remote_input.utxo.outpoint.vout,
+						sequence: remote_input.sequence.to_consensus_u32(),
+						shared_input_txid: None,
+					},
+				),
+				1 => nodes[0].node.handle_tx_add_output(
+					b,
+					&msgs::TxAddOutput {
+						channel_id,
+						serial_id: 3,
+						sats: remote_output.value.to_sat(),
+						script: remote_output.script_pubkey.clone(),
+					},
+				),
+				_ => nodes[0].node.handle_tx_complete(b, &msgs::TxComplete { channel_id }),
+			}
+			peer_turn += 1;
+		}
+		assert_eq!(committed, !trusted);
+		assert_eq!(aborted, trusted);
+		let events = nodes[0].node.get_and_clear_pending_events();
+		assert!(!events
+			.iter()
+			.any(|event| matches!(event, Event::FundingTransactionReadyForSigning { .. })));
+		assert_eq!(
+			events.iter().filter(|event| matches!(event, Event::SpliceFailed { .. })).count(),
+			usize::from(trusted)
+		);
+		assert!(nodes[0].node.funding_signing_details(&channel_id, &b).is_err());
+		assert_eq!(nodes[0].node.list_channels()[0].funding_txo, channel.funding_txo);
+		check_added_monitors(&nodes[0], 0);
+	}
+}

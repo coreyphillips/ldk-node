@@ -25,6 +25,7 @@ const container = process.env.BEIGNET_REGTEST_BITCOIN || 'bitcoin';
 const timeoutMs = Number(process.env.CHICORY_TEST_TIMEOUT_MS || 180000);
 const delay = ms => new Promise(resolve => setTimeout(resolve, ms));
 const evidence = { scope: 'installed-chicory-portable', checks: [] };
+const trustedSplicePeers = new Set();
 const chicory = process.env.CHICORY_SOURCE_DIR || path.resolve(root, '../../testing/chicory');
 const portable = path.join(chicory, 'node_modules/@beignet/portable-engine');
 const walletCore = path.join(chicory, 'node_modules/@beignet/wallet-core');
@@ -73,6 +74,7 @@ async function freePort() {
 async function startPrimary(dataDir, port) {
   const child = spawn(binary, [dataDir, String(port), primaryChainSource], {
     cwd: root, stdio: ['pipe', 'pipe', 'pipe'],
+    env: { ...process.env, CHICORY_TEST_TRUSTED_SPLICE_PEERS: JSON.stringify([...trustedSplicePeers]) },
   });
   const pending = new Map();
   let serial = 0;
@@ -597,13 +599,211 @@ async function main() {
     });
     assert.equal((await rpc('/channels')).length, 0);
     pass('installed Chicory engine and wallet-core pair with native primary');
+    await assert.rejects(() => client.quoteReceive({ description: 'Amountless fresh wallet' }),
+      { code: 'AMOUNT_REQUIRED' });
+    pass('fresh wallet requires an amount before requesting JIT liquidity');
+
+    const preparePayer = async () => {
+      const payerAddress = await payer.getNewAddress();
+      assert.match(payerAddress, /^bcrt1/);
+      btc('sendtoaddress', primary.ready.address, '0.02000000');
+      btc('sendtoaddress', payerAddress, '0.01000000');
+      btc('-generate', '1');
+      await wait('fixture funding visible', async () => {
+        await primary.request('sync');
+        await payer.refreshWallet();
+        return (await primary.request('balance')).spendableOnchainSats >= 1900000 &&
+          payer.getBalance().onchain >= 1000000;
+      });
+      await payer.connectPeer(providerKey, '127.0.0.1', port);
+      await payer.openChannel(providerKey, 400000, 0, 2, false, false);
+      await wait('payer funding broadcast', () => {
+        const txid = payer.listChannels().find(channel => channel.peerPubkey === providerKey && channel.fundingTxid)?.fundingTxid;
+        return txid && JSON.parse(btc('getrawmempool')).includes(txid);
+      });
+      btc('-generate', '6');
+      await wait('payer channel usable', async () => {
+        await primary.request('sync');
+        await payer.refreshWallet();
+        return payer.listChannels().some(channel => channel.peerPubkey === providerKey && channel.htlcUsable);
+      });
+      pass('external payer has a confirmed channel to native primary');
+    };
+
+    const explicitlyTrustPhoneSplices = async () => {
+      const phoneNodeId = (await rpc('/info')).nodeId;
+      assert.match(phoneNodeId, /^0[23][0-9a-f]{64}$/);
+      assert.equal(trustedSplicePeers.has(phoneNodeId), false);
+      trustedSplicePeers.add(phoneNodeId);
+      await primary.stop();
+      primary = await startPrimary(path.join(temp, 'primary'), port);
+      evidence.processes.push(primary.child.pid);
+      assert.equal(primary.ready.nodeId, providerKey);
+      await wait('phone reconnects after explicit regtest trust opt-in', async () => {
+        await client.refreshWallet();
+        return (await client.snapshot()).primary.connected;
+      });
+      await payer.connectPeer(providerKey, '127.0.0.1', port);
+      await wait('payer reconnects after explicit regtest trust opt-in', () =>
+        payer.listChannels().some(channel => channel.peerPubkey === providerKey && channel.htlcUsable));
+      pass('operator explicitly trusts this disposable wallet for instant confirmed-channel growth', { phoneNodeId });
+    };
+
+    const testJitSplice = async growBeyondCapacity => {
+      // The first JIT channel spent the fixture's single confirmed coin. Its
+      // change must confirm before the native wallet can select a splice input.
+      btc('-generate', '6');
+      await primary.request('sync');
+      await client.refreshWallet();
+      const before = await wait('settled home before JIT splice', async () => {
+        const channels = (await rpc('/channels')).filter(channel => channel.peerPubkey === providerKey);
+        const snapshot = await client.snapshot();
+        return channels.length === 1 && channels[0].htlcUsable && channels[0].htlcCount === 0 &&
+          snapshot.balance.totalSats === channels[0].localBalanceSats && channels[0];
+      });
+      const amountSats = growBeyondCapacity ? 100000 : 30000;
+      const feeSats = 100 + Math.ceil(amountSats / 1000);
+      assert.ok(before.remoteBalanceSats < amountSats, 'This fixture requires a real outbound-liquidity shortage');
+      if (growBeyondCapacity) assert.ok(amountSats > before.capacitySats, 'Receive must exceed the entire existing channel capacity');
+      const receiverNodeId = (await rpc('/info')).nodeId;
+      const trustedGrowth = trustedSplicePeers.has(receiverNodeId);
+      const nativeBefore = (await primary.request('channels')).find(channel => channel.counterpartyNodeId === receiverNodeId);
+      assert.ok(nativeBefore?.isUsable);
+      assert.equal(nativeBefore.fundingTxid, before.fundingTxid);
+      const quote = await client.quoteReceive({ amountSats, description: 'Installed Chicory existing-home JIT splice' });
+      assert.equal(quote.feeSats, feeSats);
+      assert.equal(quote.netSats, amountSats - feeSats);
+      const receive = await client.receive(quote);
+      assert.equal(receive.feeSats, feeSats);
+      assert.match(receive.bolt11, /^lnbcrt/);
+      const dispatched = [];
+      const manager = payer.getNode().getChannelManager();
+      const originalAdd = manager.addHtlc;
+      manager.addHtlc = function (...args) {
+        if (Buffer.isBuffer(args[2]) && args[2].toString('hex') === receive.paymentHash) {
+          dispatched.push({ amountMsat: String(args[1]) });
+        }
+        return originalAdd.apply(this, args);
+      };
+      let outcome;
+      let minedAt = Date.now();
+      const pendingPayment = payer.payInvoiceSafe(receive.bolt11, timeoutMs, 1000)
+        .then(result => { outcome = { result }; }, error => { outcome = { error }; });
+      try {
+        await wait('single incoming payment triggers native JIT splice', async () => {
+          if (!trustedGrowth && Date.now() - minedAt >= 3000) { btc('-generate', '1'); minedAt = Date.now(); }
+          await primary.request('sync');
+          await client.refreshWallet();
+          return outcome;
+        });
+        await pendingPayment;
+        if (outcome.error) throw outcome.error;
+        assert.equal(outcome.result.status, 'COMPLETED', outcome.result.failureDescription || 'Existing-home JIT failed');
+      } finally {
+        manager.addHtlc = originalAdd;
+      }
+      assert.equal(dispatched.length, 1, 'A retried or multipart payment does not qualify this single-shortage path');
+      // The payer's first hop also pays the primary's advertised routing fee.
+      // The exact receiver amount and single JIT charge are asserted below.
+      assert.ok(BigInt(dispatched[0].amountMsat) >= BigInt(amountSats * 1000));
+      const expectedBalance = before.localBalanceSats + amountSats - feeSats;
+      const settled = await wait('installed wallet and native primary agree on JIT splice', async () => {
+        if (!trustedGrowth && Date.now() - minedAt >= 3000) { btc('-generate', '1'); minedAt = Date.now(); }
+        await primary.request('sync');
+        await client.refreshWallet();
+        const channels = (await rpc('/channels')).filter(channel => channel.peerPubkey === providerKey && channel.state !== 'CLOSED');
+        const native = (await primary.request('channels')).filter(channel => channel.counterpartyNodeId === receiverNodeId);
+        const snapshot = await client.snapshot();
+        const activity = snapshot.activity.find(row => row.paymentHash === receive.paymentHash && row.status === 'completed');
+        return channels.length === 1 && channels[0].htlcUsable && channels[0].htlcCount === 0 &&
+          channels[0].localBalanceSats === expectedBalance && channels[0].fundingTxid !== before.fundingTxid &&
+          native.length === 1 && native[0].isUsable && native[0].isChannelReady &&
+          native[0].fundingTxid === channels[0].fundingTxid && native[0].valueSats === channels[0].capacitySats &&
+          snapshot.balance.totalSats === expectedBalance && activity && { current: channels[0], native: native[0], activity };
+      });
+      assert.equal(settled.current.channelId, before.channelId);
+      assert.equal(settled.activity.amountSats, amountSats - feeSats);
+      assert.equal(settled.activity.feeSats, feeSats);
+      assert.equal(settled.activity.feeKnown, true);
+      assert.equal(settled.native.channelId, nativeBefore.channelId);
+      assert.equal(settled.native.fundingOutputIndex, settled.current.fundingOutputIndex);
+      assert.ok(settled.current.capacitySats > before.capacitySats);
+      const transaction = JSON.parse(btc('getrawtransaction', settled.current.fundingTxid, 'true'));
+      if (trustedGrowth) {
+        assert.equal(transaction.confirmations || 0, 0, 'Explicitly trusted growth must settle without mining');
+        pass('explicitly trusted JIT growth settles one HTLC before the splice confirms', {
+          fundingTxid: settled.current.fundingTxid, confirmations: 0, dispatchedParts: dispatched.length,
+        });
+      }
+      assert.ok(transaction.vin.some(input => input.txid === before.fundingTxid && input.vout === before.fundingOutputIndex));
+      assert.equal(Math.round(transaction.vout[settled.current.fundingOutputIndex].value * 1e8), settled.current.capacitySats);
+      pass('installed wallet receives through one enlarged home with one JIT splice fee', {
+        paymentHash: receive.paymentHash, amountSats, feeSats, netReceivedSats: amountSats - feeSats,
+        localBalanceSats: settled.current.localBalanceSats, activityAmountSats: settled.activity.amountSats,
+        oldFundingTxid: before.fundingTxid, fundingTxid: settled.current.fundingTxid,
+        oldCapacitySats: before.capacitySats, capacitySats: settled.current.capacitySats,
+        receiverChannels: 1, dispatchedParts: dispatched.length, primaryUsable: settled.native.isUsable,
+        incomingAmountMsat: dispatched[0].amountMsat,
+      });
+      if (growBeyondCapacity) {
+        const spendSats = before.capacitySats + 1000;
+        assert.ok(spendSats < expectedBalance);
+        const invoice = await primary.request('invoice', { amountSats: spendSats,
+          description: 'Spend beyond the original channel capacity' });
+        const review = await client.prepareSend({ request: invoice.bolt11 });
+        const sent = await client.send(review);
+        assert.equal(sent.status, 'completed', sent.message || 'Grown channel spend failed');
+        const balanceAfter = expectedBalance - spendSats;
+        await wait('grown home commits a spend larger than its original capacity', async () => {
+          const home = (await rpc('/channels')).find(channel => channel.channelId === before.channelId);
+          return home?.htlcUsable && home.htlcCount === 0 && home.localBalanceSats === balanceAfter;
+        });
+        await client.close();
+        await primary.stop();
+        primary = await startPrimary(path.join(temp, 'primary'), port);
+        evidence.processes.push(primary.child.pid);
+        assert.equal(primary.ready.nodeId, providerKey);
+        runtime = await createPortableRuntime(options);
+        client = new EmbeddedWalletClient({ runtime, walletId });
+        await client.startWallet();
+        await wait('grown home and its balance survive both endpoint restarts', async () => {
+          await client.refreshWallet();
+          const channels = (await rpc('/channels')).filter(channel => channel.peerPubkey === providerKey && channel.state !== 'CLOSED');
+          const native = (await primary.request('channels')).filter(channel => channel.counterpartyNodeId === receiverNodeId);
+          return channels.length === 1 && native.length === 1 && channels[0].htlcUsable && native[0].isUsable &&
+            channels[0].channelId === before.channelId && native[0].channelId === nativeBefore.channelId &&
+            channels[0].fundingTxid === settled.current.fundingTxid && native[0].fundingTxid === settled.current.fundingTxid &&
+            channels[0].localBalanceSats === balanceAfter && (await client.snapshot()).balance.totalSats === balanceAfter;
+        });
+        await payer.connectPeer(providerKey, '127.0.0.1', port);
+        pass('grown channel sends above its original capacity and survives both restarts', {
+          originalCapacitySats: before.capacitySats, receivedSats: amountSats, spentSats: spendSats,
+          capacitySats: settled.current.capacitySats, balanceSats: balanceAfter,
+        });
+      }
+    };
 
     if (process.env.CHICORY_TEST_INITIAL_DEPOSIT === '1') {
       const phoneNodeId = (await rpc('/info')).nodeId;
       const address = (await rpc('/address/new', 'POST', {})).address;
       assert.match(address, /^bcrt1/);
-      btc('sendtoaddress', primary.ready.address, '0.02000000');
-      const depositTxid = btc('sendtoaddress', address, '0.00030000');
+      // LDK requires its separate anchor emergency reserve even when the phone
+      // supplies every funding input. Do not waive that safety policy.
+      btc('sendtoaddress', primary.ready.address, '0.00025000');
+      const smallDepositTxid = btc('sendtoaddress', address, '0.00020000');
+      await wait('unconfirmed initial deposit stays outside a channel', async () => {
+        await client.refreshWallet();
+        return (await rpc('/utxos')).some(coin => coin.txid === smallDepositTxid && !coin.height) &&
+          (await rpc('/channels')).length === 0;
+      });
+      btc('-generate', '1');
+      await wait('small confirmed deposit stays below automatic channelization threshold', async () => {
+        await client.refreshWallet();
+        return (await rpc('/utxos')).some(coin => coin.txid === smallDepositTxid && coin.height > 0) &&
+          (await rpc('/channels')).length === 0;
+      });
+      pass('unconfirmed and below-threshold initial deposits remain onchain', { amountSats: 20000 });
+      const depositTxid = btc('sendtoaddress', address, '0.00010000');
       btc('-generate', '1');
       const candidate = await wait('first confirmed deposit opens a phone-funded home', async () => {
         await primary.request('sync');
@@ -615,6 +815,7 @@ async function main() {
       const transaction = JSON.parse(btc('getrawtransaction', candidate.fundingTxid, 'true'));
       assert.equal(transaction.confirmations || 0, 0);
       assert.ok(transaction.vin.some(input => input.txid === depositTxid));
+      assert.ok(transaction.vin.some(input => input.txid === smallDepositTxid));
       assert.equal(Math.round(transaction.vout[candidate.fundingOutputIndex].value * 1e8), candidate.capacitySats);
       const pending = (await primary.request('channels')).filter(channel => channel.counterpartyNodeId === phoneNodeId);
       assert.equal(pending.length, 1);
@@ -656,6 +857,8 @@ async function main() {
         fundingTxid: candidate.fundingTxid, capacitySats: funded.home.capacitySats,
         spentSats: 1000, localBalanceSats: expectedBalance,
       });
+      assert.equal((await primary.request('balance')).onchainSats, 25000,
+        'Phone funding must leave the primary anchor reserve untouched');
       await client.close();
       runtime = await createPortableRuntime(options);
       client = new EmbeddedWalletClient({ runtime, walletId });
@@ -668,35 +871,18 @@ async function main() {
       });
       assert.equal((await client.snapshot()).balance.totalSats, expectedBalance);
       pass('phone reopen preserves the initial deposit home and post-spend balance');
+      if (process.env.CHICORY_TEST_INITIAL_DEPOSIT_GROWTH === '1') {
+        await preparePayer();
+        await explicitlyTrustPhoneSplices();
+        await testJitSplice(true);
+      }
       succeeded = true;
       evidence.completedAt = new Date().toISOString();
       console.log('CHICORY_PORTABLE_INTEROP ' + JSON.stringify(evidence));
       return;
     }
 
-    const payerAddress = await payer.getNewAddress();
-    assert.match(payerAddress, /^bcrt1/);
-    btc('sendtoaddress', primary.ready.address, '0.02000000');
-    btc('sendtoaddress', payerAddress, '0.01000000');
-    btc('-generate', '1');
-    await wait('fixture funding visible', async () => {
-      await primary.request('sync');
-      await payer.refreshWallet();
-      return (await primary.request('balance')).spendableOnchainSats >= 1900000 &&
-        payer.getBalance().onchain >= 1000000;
-    });
-    await payer.openChannel(providerKey, 400000, 0, 2, false, false);
-    await wait('payer funding broadcast', () => {
-      const txid = payer.listChannels().find(channel => channel.peerPubkey === providerKey && channel.fundingTxid)?.fundingTxid;
-      return txid && JSON.parse(btc('getrawmempool')).includes(txid);
-    });
-    btc('-generate', '6');
-    await wait('payer channel usable', async () => {
-      await primary.request('sync');
-      await payer.refreshWallet();
-      return payer.listChannels().some(channel => channel.peerPubkey === providerKey && channel.htlcUsable);
-    });
-    pass('external payer has a confirmed channel to native primary');
+    await preparePayer();
 
     const quote = await client.quoteReceive({ amountSats: 20000, description: 'Installed Chicory JIT receive' });
     assert.equal(quote.feeSats, 120);
@@ -726,6 +912,9 @@ async function main() {
     assert.equal(homes[0].htlcCount, 0);
     assert.equal(homes[0].localBalanceSats, 19880);
     assert.equal(snapshot.balance.totalSats, 19880);
+    assert.equal(activity.amountSats, 19880);
+    assert.equal(activity.feeSats, 120);
+    assert.equal(activity.feeKnown, true);
     assert.ok(snapshot.balance.availableSats > 0 && snapshot.balance.availableSats <= 19880);
     pass('installed wallet Activity and balances reflect the native JIT payment', {
       paymentHash: receive.paymentHash, status: activity.status,
@@ -756,6 +945,63 @@ async function main() {
     await wait('portable outgoing Activity settled', async () => (await client.snapshot()).activity.some(row =>
       row.paymentHash === decoded.paymentHash && row.kind === 'sent' && row.status === 'completed'));
     pass('installed wallet pays a native primary invoice and records completed Activity');
+
+    if (process.env.CHICORY_TEST_EXISTING_RECEIVE === '1') {
+      for (const amountless of [false, true]) {
+        const amountSats = amountless ? 1000 : 5000;
+        const before = (await rpc('/channels')).find(channel => channel.peerPubkey === providerKey && channel.htlcUsable);
+        assert.ok(before && before.remoteBalanceSats > amountSats);
+        const quote = await client.quoteReceive({ ...(amountless ? {} : { amountSats }),
+          description: amountless ? 'Amountless existing-home receive' : 'Existing-home receive' });
+        assert.equal(quote.feeSats, 0);
+        if (amountless) assert.equal(quote.amountSats, null);
+        const request = await client.receive(quote);
+        const payment = await payer.payInvoiceSafe(request.bolt11, {
+          timeoutMs, maxFeeSats: 1000, ...(amountless ? { amountSats } : {}),
+        });
+        assert.equal(payment.status, 'COMPLETED', payment.failureDescription || 'Ordinary receive failed');
+        await wait('ordinary existing-home receive completes without funding', async () => {
+          const homes = (await rpc('/channels')).filter(channel => channel.peerPubkey === providerKey && channel.state !== 'CLOSED');
+          const snapshot = await client.snapshot();
+          const rows = snapshot.activity.filter(row => row.paymentHash === request.paymentHash && row.status === 'completed');
+          return homes.length === 1 && homes[0].htlcUsable && homes[0].htlcCount === 0 &&
+            homes[0].channelId === before.channelId && homes[0].fundingTxid === before.fundingTxid &&
+            homes[0].capacitySats === before.capacitySats && homes[0].localBalanceSats === before.localBalanceSats + amountSats &&
+            snapshot.balance.totalSats === before.localBalanceSats + amountSats && rows.length === 1;
+        });
+        assert.equal((await client.getReceiveStatus(request)).phase, 'completed');
+        pass('installed wallet receives ' + (amountless ? 'amountless' : 'fixed-amount') + ' Lightning without a splice or JIT fee', {
+          amountSats, feeSats: 0, fundingTxid: before.fundingTxid,
+        });
+      }
+      const beforeSend = (await rpc('/channels')).find(channel => channel.peerPubkey === providerKey && channel.htlcUsable);
+      const externalInvoice = payer.createInvoice(1000, 'Payment routed through the native primary');
+      const externalReview = await client.prepareSend({ request: externalInvoice.bolt11 });
+      const externalSend = await client.send(externalReview);
+      assert.equal(externalSend.status, 'completed', externalSend.message || 'External Lightning send failed');
+      const externalRow = await wait('external receiver and wallet agree on the routed payment', async () => {
+        const received = payer.getPayment(externalInvoice.paymentHash);
+        const snapshot = await client.snapshot();
+        const rows = snapshot.activity.filter(row => row.paymentHash === externalInvoice.paymentHash);
+        const home = (await rpc('/channels')).find(channel => channel.channelId === beforeSend.channelId);
+        assert.equal(received?.status, 'COMPLETED', 'External recipient payment status');
+        assert.equal(received.amountSats, 1000, 'External recipient credited amount');
+        assert.equal(rows.length, 1, 'External send must have one Activity row');
+        assert.equal(rows[0].status, 'completed', 'External send Activity status');
+        // The public Beignet outgoing amount is the total debit, including fees.
+        assert.equal(rows[0].amountSats, 1000 + rows[0].feeSats, 'External send Activity debit');
+        assert.equal(rows[0].feeKnown, true, 'External send Activity fee must be known');
+        assert.ok(home?.htlcUsable && home.htlcCount === 0, 'External send must commit');
+        assert.equal(home.fundingTxid, beforeSend.fundingTxid);
+        assert.equal(home.localBalanceSats, beforeSend.localBalanceSats - rows[0].amountSats,
+          'External send balance must include the routing fee');
+        assert.equal(snapshot.balance.totalSats, home.localBalanceSats);
+        return rows[0];
+      });
+      pass('installed wallet routes Lightning to an external recipient through the native primary', {
+        amountSats: 1000, feeSats: externalRow.feeSats, fundingTxid: beforeSend.fundingTxid,
+      });
+    }
 
     if (process.env.CHICORY_TEST_RECOVERY === '1') {
       const mnemonic = await client.getRecoveryPhrase();
@@ -874,92 +1120,8 @@ async function main() {
       }
     }
 
-    if (process.env.CHICORY_TEST_JIT_SPLICE === '1') {
-      // The first JIT channel spent the fixture's single confirmed coin. Its
-      // change must confirm before the native wallet can select a splice input.
-      btc('-generate', '6');
-      await primary.request('sync');
-      await client.refreshWallet();
-      const before = await wait('settled home before JIT splice', async () => {
-        const channels = (await rpc('/channels')).filter(channel => channel.peerPubkey === providerKey);
-        const snapshot = await client.snapshot();
-        return channels.length === 1 && channels[0].htlcUsable && channels[0].htlcCount === 0 &&
-          channels[0].localBalanceSats === 16880 && snapshot.balance.totalSats === 16880 && channels[0];
-      });
-      const amountSats = 30000;
-      const feeSats = 130;
-      assert.ok(before.remoteBalanceSats < amountSats, 'This fixture requires a real outbound-liquidity shortage');
-      assert.ok(before.capacitySats > amountSats, 'Keep the payment below the original negotiated HTLC maximum');
-      const receiverNodeId = (await rpc('/info')).nodeId;
-      const nativeBefore = (await primary.request('channels')).find(channel => channel.counterpartyNodeId === receiverNodeId);
-      assert.ok(nativeBefore?.isUsable);
-      assert.equal(nativeBefore.fundingTxid, before.fundingTxid);
-      const quote = await client.quoteReceive({ amountSats, description: 'Installed Chicory existing-home JIT splice' });
-      assert.equal(quote.feeSats, feeSats);
-      assert.equal(quote.netSats, amountSats - feeSats);
-      const receive = await client.receive(quote);
-      assert.equal(receive.feeSats, feeSats);
-      assert.match(receive.bolt11, /^lnbcrt/);
-      const dispatched = [];
-      const manager = payer.getNode().getChannelManager();
-      const originalAdd = manager.addHtlc;
-      manager.addHtlc = function (...args) {
-        if (Buffer.isBuffer(args[2]) && args[2].toString('hex') === receive.paymentHash) {
-          dispatched.push({ amountMsat: String(args[1]) });
-        }
-        return originalAdd.apply(this, args);
-      };
-      let outcome;
-      let minedAt = Date.now();
-      const pendingPayment = payer.payInvoiceSafe(receive.bolt11, timeoutMs, 1000)
-        .then(result => { outcome = { result }; }, error => { outcome = { error }; });
-      try {
-        await wait('single incoming payment triggers native JIT splice', async () => {
-          if (Date.now() - minedAt >= 3000) { btc('-generate', '1'); minedAt = Date.now(); }
-          await primary.request('sync');
-          await client.refreshWallet();
-          return outcome;
-        });
-        await pendingPayment;
-        if (outcome.error) throw outcome.error;
-        assert.equal(outcome.result.status, 'COMPLETED', outcome.result.failureDescription || 'Existing-home JIT failed');
-      } finally {
-        manager.addHtlc = originalAdd;
-      }
-      assert.equal(dispatched.length, 1, 'A retried or multipart payment does not qualify this single-shortage path');
-      // The payer's first hop also pays the primary's advertised routing fee.
-      // The exact receiver amount and single JIT charge are asserted below.
-      assert.ok(BigInt(dispatched[0].amountMsat) >= BigInt(amountSats * 1000));
-      const expectedBalance = before.localBalanceSats + amountSats - feeSats;
-      const settled = await wait('installed wallet and native primary agree on JIT splice', async () => {
-        if (Date.now() - minedAt >= 3000) { btc('-generate', '1'); minedAt = Date.now(); }
-        await primary.request('sync');
-        await client.refreshWallet();
-        const channels = (await rpc('/channels')).filter(channel => channel.peerPubkey === providerKey && channel.state !== 'CLOSED');
-        const native = (await primary.request('channels')).filter(channel => channel.counterpartyNodeId === receiverNodeId);
-        const snapshot = await client.snapshot();
-        const activity = snapshot.activity.find(row => row.paymentHash === receive.paymentHash && row.status === 'completed');
-        return channels.length === 1 && channels[0].htlcUsable && channels[0].htlcCount === 0 &&
-          channels[0].localBalanceSats === expectedBalance && channels[0].fundingTxid !== before.fundingTxid &&
-          native.length === 1 && native[0].isUsable && native[0].isChannelReady &&
-          native[0].fundingTxid === channels[0].fundingTxid && native[0].valueSats === channels[0].capacitySats &&
-          snapshot.balance.totalSats === expectedBalance && activity && { current: channels[0], native: native[0], activity };
-      });
-      assert.equal(settled.current.channelId, before.channelId);
-      assert.equal(settled.native.channelId, nativeBefore.channelId);
-      assert.equal(settled.native.fundingOutputIndex, settled.current.fundingOutputIndex);
-      assert.ok(settled.current.capacitySats > before.capacitySats);
-      const transaction = JSON.parse(btc('getrawtransaction', settled.current.fundingTxid, 'true'));
-      assert.ok(transaction.vin.some(input => input.txid === before.fundingTxid && input.vout === before.fundingOutputIndex));
-      assert.equal(Math.round(transaction.vout[settled.current.fundingOutputIndex].value * 1e8), settled.current.capacitySats);
-      pass('installed wallet receives through one enlarged home with one JIT splice fee', {
-        paymentHash: receive.paymentHash, amountSats, feeSats, netReceivedSats: amountSats - feeSats,
-        localBalanceSats: settled.current.localBalanceSats, activityAmountSats: settled.activity.amountSats,
-        oldFundingTxid: before.fundingTxid, fundingTxid: settled.current.fundingTxid,
-        oldCapacitySats: before.capacitySats, capacitySats: settled.current.capacitySats,
-        receiverChannels: 1, dispatchedParts: dispatched.length, primaryUsable: settled.native.isUsable,
-        incomingAmountMsat: dispatched[0].amountMsat,
-      });
+    if (process.env.CHICORY_TEST_JIT_SPLICE === '1' || process.env.CHICORY_TEST_JIT_GROWTH === '1') {
+      await testJitSplice(process.env.CHICORY_TEST_JIT_GROWTH === '1');
     }
 
     if (process.env.CHICORY_TEST_SPLICES === '1') {
@@ -1091,6 +1253,12 @@ async function main() {
       assert.ok(conflict);
       const candidate = JSON.parse(btc('getrawtransaction', conflict.candidateTxid, 'true'));
       assert.equal(candidate.confirmations || 0, 0);
+      await wait('conflicted candidate first appears as a pending receive', async () => {
+        await client.refreshWallet();
+        const status = await client.getReceiveStatus(request);
+        return status.method === 'direct-funding' && status.phase === 'pending' &&
+          status.pendingSats === amountSats && status.confirmedSats === 0;
+      });
       assert.ok(candidate.vin.some(input => input.txid === before.fundingTxid && input.vout === before.fundingOutputIndex));
       assert.equal(candidate.vin[conflict.inputIndex].txid, conflict.spentTxid);
       assert.equal(candidate.vin[conflict.inputIndex].vout, conflict.spentVout);
@@ -1153,6 +1321,16 @@ async function main() {
         return home?.htlcUsable && !home.pendingSpliceTxid && home.fundingTxid === before.fundingTxid &&
           native?.isUsable && native.fundingTxid === before.fundingTxid;
       });
+      await wait('reverted funding removes the pending receive credit after restart', async () => {
+        await client.refreshWallet();
+        const status = await client.getReceiveStatus(request);
+        const snapshot = await client.snapshot();
+        const rows = snapshot.activity.filter(row => row.paymentHash === request.paymentHash);
+        return status.phase === 'waiting' && status.receivedSats === 0 &&
+          rows.length === 1 && rows[0].kind === 'request' &&
+          snapshot.balance.totalSats === before.localBalanceSats;
+      });
+      pass('reverted direct funding restores the unpaid request without a phantom receive');
       const invoice = await primary.request('invoice', { amountSats: 1000, description: 'Spend after conflict recovery' });
       const review = await client.prepareSend({ request: invoice.bolt11 });
       const payment = await client.send(review);
@@ -1168,18 +1346,69 @@ async function main() {
         const phone = startDirectFundingPayer(path.join(temp, 'direct-payer-' + label),
           primary.ready.uri, request.uri, amountSats);
         let minedAt = Date.now();
+        let observedPending = false;
+        let restartedPending = false;
         try {
           await wait('installed direct-funding payer ' + label, async () => {
             if (phone.state.error) return true;
-            if (Date.now() - minedAt >= 3000) {
+            await primary.request('sync');
+            await client.refreshWallet();
+            if (phone.state.steps.sent && !observedPending) {
+              const status = await client.getReceiveStatus(request);
+              if (status.method === 'direct-funding' && status.phase === 'pending') {
+                assert.equal(status.receivedSats, amountSats);
+                assert.equal(status.pendingSats, amountSats);
+                assert.equal(status.confirmedSats, 0);
+                assert.equal(status.fundingTxid, phone.state.steps.sent.txid);
+                assert.deepEqual(status.txids, []);
+                observedPending = true;
+              }
+            }
+            if (observedPending && !restartedPending) {
+              assert.equal(JSON.parse(btc('getrawtransaction', phone.state.steps.sent.txid, 'true')).confirmations || 0, 0);
+              await client.close();
+              await primary.stop();
+              primary = await startPrimary(path.join(temp, 'primary'), port);
+              evidence.processes.push(primary.child.pid);
+              assert.equal(primary.ready.nodeId, providerKey);
+              await payer.connectPeer(providerKey, '127.0.0.1', port);
+              runtime = await createPortableRuntime(options);
+              client = new EmbeddedWalletClient({ runtime, walletId });
+              await client.startWallet();
+              await wait('pending direct-funding receipt survives both restarts ' + label, async () => {
+                await primary.request('sync');
+                await client.refreshWallet();
+                const status = await client.getReceiveStatus(request);
+                return (await client.snapshot()).primary.connected && status.method === 'direct-funding' &&
+                  status.phase === 'pending' && status.pendingSats === amountSats &&
+                  status.confirmedSats === 0 && status.fundingTxid === phone.state.steps.sent.txid;
+              });
+              restartedPending = true;
+              minedAt = Date.now();
+              pass('unconfirmed direct-funding ' + label + ' receipt remains pending after both restarts');
+            }
+            if (observedPending && before) {
+              const transaction = JSON.parse(btc('getrawtransaction', phone.state.steps.sent.txid, 'true'));
+              if ((transaction.confirmations || 0) < 6) {
+                const status = await client.getReceiveStatus(request);
+                assert.equal(status.phase, 'pending');
+                assert.equal(status.confirmedSats, 0);
+                const home = (await rpc('/channels')).find(channel => channel.channelId === before.channelId);
+                assert.equal(home.fundingTxid, before.fundingTxid);
+                assert.equal(home.localBalanceSats, before.localBalanceSats);
+                const native = (await primary.request('channels')).find(channel => channel.fundingTxid === before.fundingTxid);
+                assert.ok(native, 'Primary must retain old funding below its six-confirmation splice policy');
+              }
+            }
+            // Observe the real receiver's pending receipt before confirming it.
+            if (observedPending && Date.now() - minedAt >= 3000) {
               btc('-generate', '1');
               minedAt = Date.now();
             }
-            await primary.request('sync');
-            await client.refreshWallet();
             return phone.state.exited && phone.state.steps.proof;
           });
           if (phone.state.error) throw phone.state.error;
+          assert.ok(observedPending, 'Direct funding must appear as pending before it locks');
           const proof = phone.state.steps.proof;
           assert.equal(proof.amountSats, amountSats);
           assert.equal(proof.receiptVerified, true);
@@ -1197,6 +1426,7 @@ async function main() {
           assert.equal(current.fundingOutputIndex, proof.fundingOutputIndex);
           assert.equal(current.capacitySats, (before?.capacitySats || 0) + amountSats);
           assert.equal(current.localBalanceSats, (before?.localBalanceSats || 0) + amountSats);
+          if (before) assert.equal(current.channelId, before.channelId);
           const native = await wait('native primary activates direct funding ' + label, async () => {
             if (Date.now() - minedAt >= 3000) { btc('-generate', '1'); minedAt = Date.now(); }
             await primary.request('sync');
@@ -1216,12 +1446,86 @@ async function main() {
           const output = transaction.vout[proof.fundingOutputIndex];
           assert.equal(output.scriptPubKey.hex, proof.fundingScript);
           assert.equal(Math.round(output.value * 1e8), current.capacitySats);
-          const received = await runtime.request({ path: `/api/wallets/${walletId}` });
-          assert.ok(['accepted', 'completed'].includes(received.lfbw?.lastOffer?.state));
+          // lastOffer is a transient diagnostic and deliberately resets when
+          // the runtime closes. Qualify the durable receipt after restart.
+          await wait('direct-funding receipt has a durable funding lock ' + label, async () => {
+            const receipts = (await rpc('/direct-funding/received')).filter(row => row.receiptHash === proof.receiptHash);
+            if (receipts.length !== 1 || !Number.isSafeInteger(receipts[0].lockedAt) || receipts[0].lockedAt <= 0) return false;
+            assert.equal(receipts[0].requestId, proof.requestId);
+            assert.equal(receipts[0].fundingTxid, proof.fundingTxid);
+            assert.equal(receipts[0].status, 'PAID');
+            assert.equal(receipts[0].amountSat, String(amountSats));
+            return true;
+          });
           pass('installed direct funding ' + label + ' pays the exact channel amount and verifies its receipt', {
             ...proof, capacitySats: current.capacitySats, localBalanceSats: current.localBalanceSats,
             payerCoinSats: phone.state.steps.coin.valueSats, primaryUsable: native.isUsable,
             confirmations: transaction.confirmations,
+          });
+          const activityState = snapshot => snapshot.activity.map(row => ({
+            id: row.id, status: row.status, amountSats: row.amountSats,
+            txid: row.txid || null, paymentHash: row.paymentHash || null,
+          })).sort((a, b) => a.id.localeCompare(b.id));
+          const beforeRestart = await client.snapshot();
+          const assertReceipt = async snapshot => {
+            const status = await client.getReceiveStatus(request);
+            assert.equal(status.phase, 'completed');
+            assert.equal(status.method, 'direct-funding');
+            assert.equal(status.receivedSats, amountSats);
+            assert.equal(status.confirmedSats, amountSats);
+            assert.equal(status.pendingSats, 0);
+            assert.equal(status.fundingTxid, proof.fundingTxid);
+            assert.deepEqual(status.txids, []);
+            const rows = snapshot.activity.filter(row => row.paymentHash === request.paymentHash);
+            assert.equal(rows.length, 1);
+            assert.equal(rows[0].kind, 'received');
+            assert.equal(rows[0].status, 'completed');
+            assert.equal(rows[0].amountSats, amountSats);
+            assert.equal(rows[0].receiveStatus?.method, 'direct-funding');
+            assert.equal(rows[0].receiveStatus?.fundingTxid, proof.fundingTxid);
+          };
+          await assertReceipt(beforeRestart);
+          const savedActivity = activityState(beforeRestart);
+          assert.ok(savedActivity.length > 0, 'The receiver must retain its payment request history');
+          assert.equal(new Set(savedActivity.map(row => row.id)).size, savedActivity.length);
+          assert.equal(beforeRestart.balance.totalSats, current.localBalanceSats);
+          await client.close();
+          await primary.stop();
+          primary = await startPrimary(path.join(temp, 'primary'), port);
+          evidence.processes.push(primary.child.pid);
+          assert.equal(primary.ready.nodeId, providerKey);
+          await payer.connectPeer(providerKey, '127.0.0.1', port);
+          runtime = await createPortableRuntime(options);
+          client = new EmbeddedWalletClient({ runtime, walletId });
+          await client.startWallet();
+          const restored = await wait('direct-funded home survives receiver and primary restart ' + label, async () => {
+            await primary.request('sync');
+            await client.refreshWallet();
+            const snapshot = await client.snapshot();
+            const channels = (await rpc('/channels')).filter(channel =>
+              channel.peerPubkey === providerKey && channel.state !== 'CLOSED');
+            const nativeChannels = (await primary.request('channels')).filter(channel =>
+              channel.counterpartyNodeId === proof.receiverNodeId);
+            return snapshot.primary.connected && snapshot.balance.totalSats === current.localBalanceSats &&
+              channels.length === 1 && channels[0].htlcUsable && channels[0].htlcCount === 0 &&
+              channels[0].channelId === current.channelId && channels[0].fundingTxid === proof.fundingTxid &&
+              channels[0].fundingOutputIndex === proof.fundingOutputIndex &&
+              channels[0].capacitySats === current.capacitySats && channels[0].localBalanceSats === current.localBalanceSats &&
+              nativeChannels.length === 1 && nativeChannels[0].isUsable && nativeChannels[0].isChannelReady &&
+              nativeChannels[0].channelId === native.channelId && nativeChannels[0].fundingTxid === proof.fundingTxid &&
+              nativeChannels[0].fundingOutputIndex === proof.fundingOutputIndex &&
+              nativeChannels[0].valueSats === current.capacitySats && snapshot;
+          });
+          assert.equal((await rpc('/info')).nodeId, proof.receiverNodeId);
+          assert.deepEqual(activityState(restored), savedActivity);
+          await assertReceipt(restored);
+          await client.refreshWallet();
+          assert.deepEqual(activityState(await client.snapshot()), savedActivity,
+            'Repeated refresh must not duplicate direct-funding history');
+          pass('installed direct funding ' + label + ' preserves exact home, balance and Activity after both restarts', {
+            channelId: current.channelId, fundingTxid: proof.fundingTxid,
+            fundingOutputIndex: proof.fundingOutputIndex, localBalanceSats: current.localBalanceSats,
+            activityRows: savedActivity.length,
           });
           const spendInvoice = await primary.request('invoice', {
             amountSats: 1000, description: 'Spend direct funding ' + label,
@@ -1229,13 +1533,28 @@ async function main() {
           const spendReview = await client.prepareSend({ request: spendInvoice.bolt11 });
           const spend = await client.send(spendReview);
           assert.equal(spend.status, 'completed', spend.message || 'Direct-funded channel payment failed');
+          assert.match(spend.paymentHash || '', /^[0-9a-f]{64}$/);
           await wait('direct-funded channel commits outgoing payment ' + label, async () => {
+            await client.refreshWallet();
+            const snapshot = await client.snapshot();
             const channels = (await rpc('/channels')).filter(channel =>
               channel.peerPubkey === providerKey && channel.state !== 'CLOSED');
-            return channels.length === 1 && channels[0].htlcCount === 0 &&
-              channels[0].localBalanceSats === current.localBalanceSats - 1000;
+            const rows = snapshot.activity.filter(row => row.paymentHash === spend.paymentHash);
+            return channels.length === 1 && channels[0].htlcUsable && channels[0].htlcCount === 0 &&
+              channels[0].channelId === current.channelId && channels[0].fundingTxid === proof.fundingTxid &&
+              channels[0].localBalanceSats === current.localBalanceSats - 1000 &&
+              snapshot.balance.totalSats === current.localBalanceSats - 1000 &&
+              rows.length === 1 && rows[0].status === 'completed' && rows[0].amountSats === 1000;
           });
-          pass('installed wallet spends from the direct-funded ' + label + ' channel', { amountSats: 1000 });
+          pass('installed wallet spends from the direct-funded ' + label + ' channel after both restarts', { amountSats: 1000 });
+          if (!before) {
+            await explicitlyTrustPhoneSplices();
+            await testJitSplice(true);
+            await assertReceipt(await client.snapshot());
+            pass('direct-funding receive completion survives a later JIT splice and both restarts', {
+              requestId: proof.requestId, fundingTxid: proof.fundingTxid, amountSats,
+            });
+          }
         } finally { await phone.stop(); }
       };
 
@@ -1301,8 +1620,10 @@ async function main() {
         const native = (await primary.request('channels')).filter(channel => channel.counterpartyNodeId === phoneNodeId);
         return homes.length === 1 && homes[0].htlcUsable && homes[0].fundingTxid !== before.fundingTxid &&
           native.length === 1 && native[0].isUsable && native[0].fundingTxid === homes[0].fundingTxid &&
+          native[0].fundingOutputIndex === homes[0].fundingOutputIndex &&
           native[0].valueSats === homes[0].capacitySats && homes[0].htlcCount === 0 &&
-          rows.length === 1 && rows[0].txid && { home: homes[0], row: rows[0] };
+          rows.length === 1 && rows[0].txid === homes[0].fundingTxid &&
+          { home: homes[0], native: native[0], row: rows[0] };
       });
       assert.equal(paid.home.channelId, before.channelId);
       assert.equal(paid.home.localBalanceSats, review.keptSats);
@@ -1313,6 +1634,8 @@ async function main() {
       const paidSats = transaction.vout.filter(output => output.scriptPubKey.hex === script)
         .reduce((total, output) => total + Math.round(output.value * 1e8), 0);
       assert.equal(paidSats, review.amountSats);
+      assert.equal(paid.row.amountSats, paidSats);
+      assert.equal(Math.round(transaction.vout[paid.home.fundingOutputIndex].value * 1e8), paid.home.capacitySats);
       pass('installed send-max pays the exact reviewed ' + kind + ' destination', {
         amountSats: paidSats, keptSats: review.keptSats, txid: paid.row.txid,
       });
@@ -1331,15 +1654,31 @@ async function main() {
         const homes = (await rpc('/channels')).filter(channel => channel.peerPubkey === providerKey && channel.state !== 'CLOSED');
         const native = (await primary.request('channels')).filter(channel => channel.counterpartyNodeId === phoneNodeId);
         return snapshot.primary.connected && rows.length === 1 && rows[0].status === 'completed' &&
-          native.length === 1 && native[0].isUsable && native[0].fundingTxid === paid.home.fundingTxid &&
-          homes.length === 1 && homes[0].htlcUsable && homes[0].localBalanceSats === review.keptSats;
+          rows[0].amountSats === review.amountSats &&
+          native.length === 1 && native[0].isUsable && native[0].isChannelReady &&
+          native[0].channelId === paid.native.channelId && native[0].fundingTxid === paid.home.fundingTxid &&
+          native[0].fundingOutputIndex === paid.home.fundingOutputIndex && native[0].valueSats === paid.home.capacitySats &&
+          homes.length === 1 && homes[0].htlcUsable && homes[0].htlcCount === 0 &&
+          homes[0].channelId === before.channelId && homes[0].fundingTxid === paid.home.fundingTxid &&
+          homes[0].fundingOutputIndex === paid.home.fundingOutputIndex && homes[0].capacitySats === paid.home.capacitySats &&
+          homes[0].localBalanceSats === review.keptSats && snapshot.balance.totalSats === review.keptSats;
       });
+      assert.equal((await rpc('/info')).nodeId, phoneNodeId);
       pass('installed send-max retains one completed Activity row and its home after both restarts');
     }
     if (process.env.CHICORY_TEST_DRAIN === '1') {
       btc('-generate', '6');
       await primary.request('sync');
       await client.refreshWallet();
+      const oldHomes = (await rpc('/channels')).filter(channel => channel.peerPubkey === providerKey && channel.state !== 'CLOSED');
+      assert.equal(oldHomes.length, 1);
+      const oldHome = oldHomes[0];
+      assert.equal(oldHome.htlcUsable, true);
+      const phoneNodeId = (await rpc('/info')).nodeId;
+      const oldNative = (await primary.request('channels')).filter(channel => channel.counterpartyNodeId === phoneNodeId);
+      assert.equal(oldNative.length, 1);
+      assert.equal(oldNative[0].fundingTxid, oldHome.fundingTxid);
+      assert.equal(oldNative[0].fundingOutputIndex, oldHome.fundingOutputIndex);
       const coinAddress = (await rpc('/address/new', 'POST', {})).address;
       const coinTxid = btc('sendtoaddress', coinAddress, '0.00020000');
       btc('-generate', '1');
@@ -1357,14 +1696,37 @@ async function main() {
         const progress = await client.getDrain(review.id);
         return progress.phase === 'pending' && new Set(progress.txids).size === 2 && progress;
       });
+      const bitcoin = require(require.resolve('bitcoinjs-lib', { paths: [source] }));
+      const destinationScript = Buffer.from(bitcoin.address.toOutputScript(address, bitcoin.networks.regtest)).toString('hex');
+      let paidSats = 0;
+      let closeTransactions = 0;
+      let sweepTransactions = 0;
       for (const txid of submitted.txids) {
         const tx = JSON.parse(btc('getrawtransaction', txid, 'true'));
         assert.equal(tx.confirmations || 0, 0);
-        assert.ok(tx.vout.some(output => output.scriptPubKey.address === address));
+        const destinationSats = tx.vout.filter(output => output.scriptPubKey.hex === destinationScript)
+          .reduce((total, output) => total + Math.round(output.value * 1e8), 0);
+        assert.ok(destinationSats > 0);
+        paidSats += destinationSats;
+        if (tx.vin.some(input => input.txid === oldHome.fundingTxid && input.vout === oldHome.fundingOutputIndex)) {
+          closeTransactions++;
+          assert.equal(destinationSats, submitted.closeAmountSats);
+        }
+        if (tx.vin.some(input => input.txid === coinTxid)) {
+          sweepTransactions++;
+          assert.equal(destinationSats, submitted.sweepAmountSats);
+        }
       }
+      assert.equal(closeTransactions, 1);
+      assert.equal(sweepTransactions, 1);
+      assert.equal(paidSats, submitted.amountSats);
+      assert.equal(submitted.reviewedDebitSats, review.drain.reviewedDebitSats);
+      assert.equal(paidSats + submitted.feeSats, review.totalSats,
+        'Final payout and negotiated fees must account for the full reviewed debit');
       assert.equal((await rpc('/channelize/status')).paused, false);
       pass('installed drain broadcasts cooperative close and loose-coin sweep before confirmation', {
         txids: submitted.txids, reviewedAmountSats: review.amountSats,
+        paidSats, finalFeeSats: submitted.feeSats, reviewedDebitSats: review.totalSats,
       });
       const laterTxid = btc('sendtoaddress', coinAddress, '0.00001000');
       await client.close();
@@ -1381,18 +1743,29 @@ async function main() {
         return (await client.snapshot()).primary.connected &&
           payer.listChannels().some(channel => channel.peerPubkey === providerKey && channel.htlcUsable);
       });
+      assert.equal((await rpc('/info')).nodeId, phoneNodeId);
       assert.equal((await rpc('/channelize/status')).paused, false);
       const quote = await client.quoteReceive({ amountSats: 5000, description: 'Receive after pending drain' });
       const receive = await client.receive(quote);
       const paid = await payer.payInvoiceSafe(receive.bolt11, timeoutMs, 1000);
       assert.equal(paid.status, 'COMPLETED', paid.failureDescription || 'Post-drain JIT failed');
-      await wait('post-drain receive commits on a fresh home', async () => {
+      const newHome = await wait('post-drain receive commits on a fresh home', async () => {
+        await client.refreshWallet();
         const homes = (await rpc('/channels')).filter(channel => channel.peerPubkey === providerKey && channel.state !== 'CLOSED');
-        return homes.length === 1 && homes[0].htlcUsable && homes[0].htlcCount === 0 && homes[0].localBalanceSats === quote.netSats;
+        const native = (await primary.request('channels')).filter(channel => channel.counterpartyNodeId === phoneNodeId);
+        const rows = (await client.snapshot()).activity.filter(row => row.paymentHash === receive.paymentHash);
+        return homes.length === 1 && homes[0].channelId !== oldHome.channelId &&
+          homes[0].fundingTxid !== oldHome.fundingTxid && homes[0].htlcUsable && homes[0].htlcCount === 0 &&
+          homes[0].localBalanceSats === quote.netSats &&
+          native.length === 1 && native[0].channelId !== oldNative[0].channelId &&
+          native[0].isUsable && native[0].isChannelReady && native[0].fundingTxid === homes[0].fundingTxid &&
+          native[0].fundingOutputIndex === homes[0].fundingOutputIndex && native[0].valueSats === homes[0].capacitySats &&
+          rows.length === 1 && rows[0].status === 'completed' && homes[0];
       });
       for (const txid of submitted.txids) assert.equal(JSON.parse(btc('getrawtransaction', txid, 'true')).confirmations || 0, 0);
       pass('restarted installed wallet receives through a new home while old drain confirmations remain pending', {
         paymentHash: receive.paymentHash, netReceivedSats: quote.netSats,
+        oldChannelId: oldHome.channelId, newChannelId: newHome.channelId, fundingTxid: newHome.fundingTxid,
       });
       btc('-generate', '6');
       const completed = await wait('drain completion preserves one Activity row and later coin', async () => {
@@ -1406,12 +1779,17 @@ async function main() {
           !utxos.some(coin => coin.txid === coinTxid) && { progress, row: rows[0] };
       });
       assert.deepEqual(new Set(completed.progress.txids), new Set(submitted.txids));
+      assert.equal(completed.progress.amountSats, paidSats);
+      assert.equal(completed.row.amountSats, paidSats);
+      assert.equal(completed.row.feeSats, completed.progress.feeSats);
+      assert.equal(completed.progress.reviewedDebitSats, review.drain.reviewedDebitSats);
+      assert.equal(paidSats + completed.progress.feeSats, review.totalSats);
       for (const txid of submitted.txids) {
         const tx = JSON.parse(btc('getrawtransaction', txid, 'true'));
         assert.ok(!tx.vin.some(input => input.txid === laterTxid));
       }
       pass('installed drain completes once after both restarts and excludes later receipts', {
-        txids: completed.progress.txids, laterCoinSats: 1000,
+        txids: completed.progress.txids, paidSats, finalFeeSats: completed.progress.feeSats, laterCoinSats: 1000,
       });
     }
     succeeded = true;

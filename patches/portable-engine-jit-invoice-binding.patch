@@ -1,0 +1,331 @@
+diff --git a/src/lightning/node/lightning-node.ts b/src/lightning/node/lightning-node.ts
+index 6a1e513..458da55 100644
+--- a/src/lightning/node/lightning-node.ts
++++ b/src/lightning/node/lightning-node.ts
+@@ -17350,6 +17350,22 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
+ 	// ─────────────── Invoice Management ───────────────
+ 
+ 	createInvoice(options: ICreateInvoiceOptions): ICreateInvoiceResult {
++		return this.createInvoiceWithPreimage(options);
++	}
++
++	/** Build an invoice, optionally using the preimage already authorized for JIT. */
++	private createInvoiceWithPreimage(
++		options: ICreateInvoiceOptions,
++		invoicePreimage?: Buffer
++	): ICreateInvoiceResult {
++		if (invoicePreimage !== undefined) {
++			if (!Buffer.isBuffer(invoicePreimage) || invoicePreimage.length !== 32) {
++				throw new Error('Invoice preimage must be 32 bytes');
++			}
++			if (options.hold || options.fforVoucher || options.paymentHash) {
++				throw new Error('Internal invoice preimage requires an ordinary invoice');
++			}
++		}
+ 		// Validate description / descriptionHash (BOLT 11: exactly one required)
+ 		if (
+ 			options.description !== undefined &&
+@@ -17392,16 +17408,25 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
+ 		if (externalHash && externalHash.length !== 32) {
+ 			throw new Error('paymentHash must be 32 bytes');
+ 		}
+-		// An external hash must be new to this node. Writing an invoice under
++		const preimage = externalHash
++			? undefined
++			: invoicePreimage !== undefined
++			? Buffer.from(invoicePreimage)
++			: randomBytes(32);
++		const paymentHash = externalHash ?? sha256(preimage!);
++		// An externally supplied or preselected hash must be new to this node.
++		// Check after the JIT authorization await too: another operation may
++		// have claimed the hash while the provider answered. Writing under
+ 		// a hash we already hold a record for would replace that record: a
+ 		// payment we are sending would read as an unpaid incoming one, its
+ 		// fulfilment would never complete it, and a later cancel of the new
+ 		// invoice would mark it failed and lift the duplicate-send guard.
+-		if (externalHash && this.paymentHashInUse(externalHash)) {
++		if (
++			(externalHash || invoicePreimage !== undefined) &&
++			this.paymentHashInUse(paymentHash)
++		) {
+ 			throw new Error('paymentHash is already in use by this node');
+ 		}
+-		const preimage = externalHash ? undefined : randomBytes(32);
+-		const paymentHash = externalHash ?? sha256(preimage!);
+ 		const paymentSecret = randomBytes(32);
+ 
+ 		if (preimage) {
+@@ -23920,7 +23945,14 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
+ 			opts.amountMsat !== undefined
+ 				? this.jitShareCrossingLspMsat(lspPubkeyHex, opts.amountMsat)
+ 				: undefined;
++		// Bind this authorization before issuing its invoice. An unused receive
++		// request may still have a live intent after another rail paid it; amount
++		// matching cannot distinguish equal requests or the first part of MPP.
++		// Keep the preimage local until the accepted quote can be persisted with
++		// the ordinary invoice and its fee allowance.
++		const invoicePreimage = randomBytes(32);
+ 		const grant = await this.requestJitReceive(lspPubkeyHex, {
++			paymentHash: sha256(invoicePreimage),
+ 			maxAmountMsat,
+ 			...(expectedTotalMsat !== undefined ? { expectedTotalMsat } : {}),
+ 			targetRemainingInboundSat: opts.targetRemainingInboundSat ?? 0n,
+@@ -23944,7 +23976,7 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
+ 		// receives under its pre-splice scid, and an intercept hint minted
+ 		// while it splices is the same second channel by another door.
+ 		const existing = this.liveChannelWith(lspPubkeyHex);
+-		const result = this.createInvoice({
++		const result = this.createInvoiceWithPreimage({
+ 			amountMsat: opts.amountMsat,
+ 			description: opts.description ?? '',
+ 			expiry,
+@@ -23970,7 +24002,7 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
+ 						}
+ 				  }
+ 				: {})
+-		});
++		}, invoicePreimage);
+ 		return {
+ 			...result,
+ 			interceptScid: grant.interceptScid,
+diff --git a/portable-tests/jit-invoice-binding.test.cjs b/portable-tests/jit-invoice-binding.test.cjs
+new file mode 100644
+index 0000000..5430d01
+--- /dev/null
++++ b/portable-tests/jit-invoice-binding.test.cjs
+@@ -0,0 +1,235 @@
++const { test } = require('node:test');
++const assert = require('node:assert/strict');
++const crypto = require('node:crypto');
++const { buildSync } = require('esbuild');
++
++const source = buildSync({
++  stdin: { contents: `
++    export { LightningNode } from './src/lightning/node/lightning-node';
++    export { MemoryStorage } from './src/lightning/storage/memory-storage';
++    export { Channel } from './src/lightning/channel/channel';
++    export { createOpenerState } from './src/lightning/channel/channel-state';
++    export { ChannelState, DEFAULT_CHANNEL_CONFIG } from './src/lightning/channel/types';
++    export { Network } from './src/lightning/invoice/types';
++    export { decode } from './src/lightning/invoice/decode';
++    export { getPublicKey } from './src/lightning/crypto/ecdh';
++    export { decodeCustomMessage, BeignetCustomSubtype, BEIGNET_CUSTOM_MESSAGE_TYPE } from './src/lightning/message/custom';
++    export { decodeJitAuthorization } from './src/lightning/liquidity/jit-receive';`,
++    resolveDir: require('node:path').join(__dirname, '..'), loader: 'ts',
++  }, bundle: true, platform: 'node', format: 'cjs', packages: 'external', write: false,
++}).outputFiles[0].text;
++const mod = { exports: {} };
++new Function('module', 'exports', 'require', source)(mod, mod.exports, name =>
++  name === 'better-sqlite3' ? class UnusedDatabase {} : require(name));
++const { LightningNode, MemoryStorage, Channel, createOpenerState, ChannelState,
++  DEFAULT_CHANNEL_CONFIG, Network, decode, getPublicKey, decodeCustomMessage,
++  BeignetCustomSubtype, BEIGNET_CUSTOM_MESSAGE_TYPE, decodeJitAuthorization,
++} = mod.exports;
++const sha256 = bytes => crypto.createHash('sha256').update(bytes).digest();
++
++function config(label) {
++  const seed = sha256(Buffer.from('invoice-binding-' + label));
++  const keys = Array.from({ length: 5 }, (_, i) => sha256(Buffer.concat([seed, Buffer.from([i])])));
++  return {
++    nodePrivateKey: sha256(Buffer.from('invoice-binding-identity-' + label)),
++    channelBasepoints: {
++      fundingPubkey: getPublicKey(keys[0]), revocationBasepoint: getPublicKey(keys[1]),
++      paymentBasepoint: getPublicKey(keys[2]), delayedPaymentBasepoint: getPublicKey(keys[3]),
++      htlcBasepoint: getPublicKey(keys[4]), firstPerCommitmentPoint: Buffer.alloc(33),
++    },
++    perCommitmentSeed: seed, fundingPrivkey: keys[0], htlcBasepointSecret: keys[4],
++    network: Network.REGTEST,
++  };
++}
++
++function pair(t, { providerConfig = {}, walletConfig = {}, beforeAuthorization } = {}) {
++  const provider = new LightningNode({ ...config('provider'),
++    jitReceive: { enabled: true, flatFeeSat: 2n, feePpm: 1000, ...providerConfig } });
++  const wallet = new LightningNode({ ...config('wallet'), ...walletConfig });
++  const authorizations = [];
++  const deliver = (from, to) => (pubkey, type, payload) => {
++    if (pubkey !== to.getNodeId()) return;
++    if (from === wallet && type === BEIGNET_CUSTOM_MESSAGE_TYPE) {
++      const envelope = decodeCustomMessage(payload);
++      if (envelope.subtype === BeignetCustomSubtype.JIT_RECEIVE_AUTHORIZATION) {
++        const authorization = decodeJitAuthorization(envelope.payload);
++        authorizations.push(authorization);
++        if (beforeAuthorization?.(authorization, wallet) === false) return;
++      }
++    }
++    to.handlePeerMessage(from.getNodeId(), type, payload);
++  };
++  for (const [self, peer] of [[provider, wallet], [wallet, provider]]) {
++    self.on('node:error', () => {});
++    self.on('message:outbound', deliver(self, peer));
++    self.peerManager = {
++      getPeer: key => key === peer.getNodeId()
++        ? { getRemoteInit: () => ({ features: LightningNode.defaultFeatures() }) } : undefined,
++      sendToPeer: deliver(self, peer), destroy() {},
++    };
++    self.handleNewBlock(1000);
++  }
++  t.after(async () => { await wallet.destroy(); await provider.destroy(); });
++  return { provider, wallet, authorizations };
++}
++
++function injectHome(node, peer) {
++  const channelId = crypto.randomBytes(32);
++  const state = createOpenerState({
++    temporaryChannelId: crypto.randomBytes(32), fundingSatoshis: 15000n, pushMsat: 0n,
++    localConfig: { ...DEFAULT_CHANNEL_CONFIG },
++    localBasepoints: config('channel').channelBasepoints,
++    localPerCommitmentSeed: crypto.randomBytes(32),
++  });
++  Object.assign(state, { state: ChannelState.NORMAL, channelId,
++    remoteScidAlias: Buffer.from('0000010000010000', 'hex') });
++  node.channelManager.channels.set(channelId.toString('hex'), new Channel(state));
++  node.channelManager.channelPeers.set(channelId.toString('hex'), peer.getNodeId());
++  return channelId;
++}
++
++function assertNormalInvoice(wallet, result, authorization, feeMode) {
++  const hash = result.paymentHash.toString('hex');
++  const decoded = decode(result.bolt11);
++  assert.deepEqual(authorization.paymentHash, result.paymentHash);
++  assert.deepEqual(decoded.paymentHash, result.paymentHash);
++  assert.deepEqual(sha256(wallet.preimages.get(hash)), result.paymentHash);
++  assert.deepEqual(wallet.getPayment(result.paymentHash).preimage, wallet.preimages.get(hash));
++  assert.deepEqual(wallet.paymentSecrets.get(hash), result.paymentSecret);
++  assert.equal(wallet.heldInvoiceHashes.has(hash), false, 'JIT remains an ordinary settling invoice');
++  assert.equal(wallet.invoices.get(hash).hold, undefined);
++  assert.equal(decoded.minFinalCltvExpiry, 72);
++  assert.deepEqual(wallet.invoices.get(hash).jitFee,
++    feeMode === 'skim' ? { flatFeeSat: 2, feePpm: 1000 } : undefined);
++}
++
++for (const existing of [false, true]) for (const feeMode of ['skim', 'hop']) {
++  for (const amountless of [false, true]) {
++    test(`authorization binds the ordinary invoice: existing=${existing}, mode=${feeMode}, amountless=${amountless}`, async t => {
++      const p = pair(t);
++      if (existing) injectHome(p.wallet, p.provider);
++      const result = await p.wallet.createJitInvoice({
++        lspPubkeyHex: p.provider.getNodeId(), feeMode,
++        ...(amountless ? { maxAmountMsat: 10000000n } : { amountMsat: 10000000n }),
++      });
++      assert.equal(p.authorizations.length, 1);
++      assertNormalInvoice(p.wallet, result, p.authorizations[0], feeMode);
++      const [intent] = p.provider.getJitReceiveManager().listIntents();
++      assert.equal(intent.paymentHashHex, result.paymentHash.toString('hex'));
++      assert.equal(intent.maxAmountMsat, 10000000n);
++      assert.equal(decode(result.bolt11).amountMsat, amountless ? undefined : 10000000n);
++      const hint = decode(result.bolt11).routingHints[0][0];
++      assert.equal(hint.shortChannelId.equals(result.interceptScid), !existing);
++    });
++  }
++}
++
++for (const amountMsat of [15000000n, 10000000n]) {
++  for (const multipart of [false, true]) {
++    test(`new ${amountMsat / 1000n}-sat receive outranks an unused 15k request, multipart=${multipart}`, async t => {
++      const p = pair(t);
++      injectHome(p.wallet, p.provider);
++      const channelId = injectHome(p.provider, p.wallet);
++      // An older client or a unified request paid over direct funding can leave
++      // a wildcard authorization live. Its amount overlaps this new request.
++      const old = await p.wallet.requestJitReceive(p.provider.getNodeId(), {
++        maxAmountMsat: 15000000n, expectedTotalMsat: 15000000n, targetRemainingInboundSat: 0n,
++      });
++      const earlier = await p.wallet.createJitInvoice({
++        lspPubkeyHex: p.provider.getNodeId(), amountMsat: 15000000n,
++      });
++      const current = await p.wallet.createJitInvoice({
++        lspPubkeyHex: p.provider.getNodeId(), amountMsat,
++      });
++      assert.notDeepEqual(earlier.paymentHash, current.paymentHash);
++      const manager = p.provider.getJitReceiveManager();
++      // Parts join an existing splice queue, exercising real matching and
++      // aggregate claimed-amount accounting without starting chain funding.
++      manager.spliceInFlight.add(channelId.toString('hex'));
++      const amounts = multipart ? [5000000n, amountMsat - 5000000n] : [amountMsat];
++      for (const [index, forwardAmountMsat] of amounts.entries()) {
++        const part = {
++          incomingChannelId: Buffer.alloc(32, 7), incomingHtlcId: BigInt(index),
++          incomingAmountMsat: forwardAmountMsat, forwardAmountMsat,
++          paymentHash: current.paymentHash, incomingCltvExpiry: 1200,
++          outgoingCltvValue: 1128, failIncoming: () => true,
++        };
++        assert.equal(manager.tryHoldForSplice(channelId, part), true);
++        assert.equal(part.intentScidHex, current.interceptScid.toString('hex'));
++      }
++      assert.equal(manager.claimedAgainst(old.interceptScid.toString('hex')), 0n);
++      assert.equal(manager.claimedAgainst(earlier.interceptScid.toString('hex')), 0n);
++      assert.equal(manager.claimedAgainst(current.interceptScid.toString('hex')), amountMsat);
++    });
++  }
++}
++
++test('refused and timed-out registrations create no invoice or secret records', async t => {
++  for (const options of [
++    { providerConfig: { maxClientFundingSats: 1000n } },
++    { providerConfig: { flatFeeSat: 5000n }, walletConfig: { jitReceiveClient: { maxFlatFeeSat: 100n } } },
++    { beforeAuthorization: () => false },
++  ]) {
++    const p = pair(t, options);
++    await assert.rejects(p.wallet.createJitInvoice({
++      lspPubkeyHex: p.provider.getNodeId(), amountMsat: 10000000n, timeoutMs: 10,
++    }));
++    assert.equal(p.authorizations[0].paymentHash.length, 32);
++    assert.equal(p.wallet.invoices.size, 0);
++    assert.equal(p.wallet.preimages.size, 0);
++    assert.equal(p.wallet.paymentSecrets.size, 0);
++    assert.equal(p.wallet.payments.size, 0);
++  }
++});
++
++test('a hash claimed while authorization is pending cannot be overwritten', async t => {
++  let existing;
++  const p = pair(t, { beforeAuthorization(auth, wallet) {
++    assert.equal(wallet.invoices.size, 0, 'No invoice is exposed before the acknowledgement');
++    existing = wallet.createInvoice({ description: 'existing hold', hold: true, paymentHash: auth.paymentHash });
++  } });
++  await assert.rejects(p.wallet.createJitInvoice({
++    lspPubkeyHex: p.provider.getNodeId(), amountMsat: 10000000n,
++  }), /paymentHash is already in use/);
++  const hash = existing.paymentHash.toString('hex');
++  assert.equal(p.wallet.invoices.size, 1);
++  assert.equal(p.wallet.invoices.get(hash).bolt11, existing.bolt11);
++  assert.equal(p.wallet.heldInvoiceHashes.has(hash), true);
++  assert.equal(p.wallet.preimages.has(hash), false);
++});
++
++test('ordinary and external-hash hold public APIs keep their existing semantics', async t => {
++  const p = pair(t);
++  const external = Buffer.alloc(32, 17);
++  const ordinary = p.wallet.createInvoice({ description: 'ordinary', paymentHash: external });
++  assert.notDeepEqual(ordinary.paymentHash, external, 'An ignored public hash is not a preimage override');
++  assert.deepEqual(sha256(p.wallet.preimages.get(ordinary.paymentHash.toString('hex'))), ordinary.paymentHash);
++  const held = p.wallet.createInvoice({ description: 'hold', hold: true, paymentHash: external });
++  assert.deepEqual(held.paymentHash, external);
++  assert.equal(p.wallet.heldInvoiceHashes.has(external.toString('hex')), true);
++  assert.equal(p.wallet.preimages.has(external.toString('hex')), false);
++  assert.throws(() => p.wallet.createInvoice({ description: 'duplicate', hold: true, paymentHash: external }), /already in use/);
++  assert.throws(() => p.wallet.createInvoiceWithPreimage({ description: 'bad' }, Buffer.alloc(31)), /32 bytes/);
++  for (const options of [{ hold: true }, { fforVoucher: true }, { paymentHash: external }]) {
++    assert.throws(() => p.wallet.createInvoiceWithPreimage({ description: 'bad', ...options }, Buffer.alloc(32, 18)), /ordinary invoice/);
++  }
++});
++
++test('restart restores the authorized preimage, secret and skim allowance from one invoice transaction', async t => {
++  const storage = new MemoryStorage();
++  const p = pair(t, { walletConfig: { storage } });
++  const result = await p.wallet.createJitInvoice({
++    lspPubkeyHex: p.provider.getNodeId(), amountMsat: 10000000n,
++  });
++  const hash = result.paymentHash.toString('hex');
++  const before = storage.loadPayment(result.paymentHash.toString('hex'));
++  assert.equal(storage.loadAllInvoices().length, 1);
++  await p.wallet.destroy();
++  const restored = new LightningNode({ ...config('wallet'), storage });
++  restored.on('node:error', () => {});
++  t.after(() => restored.destroy());
++  assertNormalInvoice(restored, result, p.authorizations[0], 'skim');
++  assert.deepEqual(restored.getPayment(result.paymentHash), before);
++  assert.equal(restored.invoices.get(hash).bolt11, result.bolt11);
++  assert.equal(restored.heldInvoiceHashes.size, 0);
++});

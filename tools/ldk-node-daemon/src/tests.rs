@@ -59,6 +59,38 @@ fn explicit_network_policy_and_unknown_config_fields() {
 }
 
 #[test]
+fn trusted_splice_peers_are_explicit_validated_and_survive_config_restart() {
+	let temp = Temp::new();
+	let cfg = configuration(&temp.0);
+	assert!(cfg.policy().trusted_splice_peer_pubkeys.is_empty());
+	let peer = "0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798";
+	let mut value = serde_json::to_value(cfg).unwrap();
+	value["chicory"]["enabled"] = json!(true);
+	value["chicory"]["trusted_splice_peer_pubkeys"] = json!([peer.to_uppercase()]);
+	let cfg: config::Config = serde_json::from_value(value.clone()).unwrap();
+	cfg.validate().unwrap();
+	let path = temp.0.join("config.json");
+	config::atomic_write(&path, &serde_json::to_vec(&cfg).unwrap()).unwrap();
+	let restored = config::Config::read(&path).unwrap();
+	assert_eq!(restored.policy().trusted_splice_peer_pubkeys, vec![peer.parse().unwrap()]);
+	assert_eq!(
+		serde_json::to_value(&restored).unwrap()["chicory"]["trusted_splice_peer_pubkeys"],
+		json!([peer])
+	);
+	assert_eq!(restored.policy().inbound_splice_minimum_depth, 6);
+	for invalid in [
+		json!([peer, peer.to_uppercase()]),
+		json!(["02"]),
+		json!(["020000000000000000000000000000000000000000000000000000000000000000"]),
+		json!([format!("04{}{}", &peer[2..], &peer[2..])]),
+		json!(vec![peer; 129]),
+	] {
+		value["chicory"]["trusted_splice_peer_pubkeys"] = invalid;
+		assert!(serde_json::from_value::<config::Config>(value.clone()).is_err());
+	}
+}
+
+#[test]
 fn process_lock_network_binding_and_existing_state_are_enforced() {
 	let temp = Temp::new();
 	let cfg = configuration(&temp.0.join("node"));

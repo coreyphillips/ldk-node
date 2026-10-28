@@ -21,7 +21,7 @@ funding and pairing steps, and optional Iroh transport. The
 [native iOS fixture](chicory-ios-testing.md) describes the isolated simulator
 build and its scope.
 
-The source audit used Chicory 0.7.4 with these installed dependencies:
+The original source audit used Chicory 0.7.4 with these installed dependencies:
 
 - `@beignet/portable-engine` commit
   `67bc9cf0ba3e55fa1e1d7ad73e360bb04321a62c`, based on Beignet 0.32.1
@@ -29,6 +29,24 @@ The source audit used Chicory 0.7.4 with these installed dependencies:
 - `@beignet/wallet-core` commit
   `cc544e6b712f4ef9042dd24e9a5b64def2f9f53b`.
 - LDK Node's `lightning` dependency at 0.2.7.
+
+The current Umbrel compatibility work uses the reviewed portable updates recorded
+in [`chicory-local-engine-updates-manifest.json`](../scripts/chicory-local-engine-updates-manifest.json)
+and wallet-core `f1cae26eda6c9b3b8c8e21220b2f42eaaff8661d` with Chicory's tracked
+durable-lock compatibility patch. The portable updates retain the earlier
+initial-commitment, shared-input and reconnect corrections and selectively adopt
+Beignet changes for rotated funding keys (#1875), net receive accounting (#1876),
+private routing policy (#1880), spent-coin history (#1885), received direct-funding
+records (#1894), reestablishment state (#1900 and #1904), and durable funding locks
+(#1907). These are explicit backports to the recorded base, not a wholesale
+Beignet version upgrade.
+
+`scripts/chicory-install-local-engine.cjs --prepare-source --check /path/to/source`
+verifies the four tracked source patches against a clean supported base. Omit
+`--check` to apply them, then build the package with its normal build command.
+The existing two-path installer mode verifies the reviewed source and bundle
+hashes before replacing an installed local compatibility bundle. A changed
+dependency build or source revision requires a new reviewed manifest.
 
 The branch includes local `lightning` and `lightning-liquidity` 0.2.7 source
 patches documented in `vendor/README.md`. The first adds opt-in outgoing v1
@@ -69,12 +87,41 @@ conservatively after restart, consume their authorization, and retain any
 already charged funding allocation. Restart does not resume an interrupted
 payment or initiate another channel for it. Unused registration replay remains
 idempotent across restart.
-The installed Beignet client authorizes before creating its invoice and omits
-the payment hash. Such an authorization is a one-use intercept SCID capability:
-the first valid matching HTLC atomically binds its hash in durable storage.
-Further parts must match that hash and remain inside the authorization cap.
-The group consumes its request before funding or forwarding. A supplied hash
-must match.
+
+Channels first funded onchain or through direct funding retain their normal
+confirmation requirement. Six block confirmations are not compatible with the
+short lifetime of an ordinary held Lightning payment. The optional
+`trusted_splice_peer_pubkeys` list enables prompt JIT growth of those channels
+only for explicitly trusted clients and entirely locally funded positive
+splices. It defaults to empty. The peer must not spend the old channel funding
+in conflict with the new transaction: doing so before confirmation can cause
+the provider to lose newly forwarded funds. Pairing and ownership of the new
+inputs do not remove that risk.
+
+The native fast path verifies that no peer input was added to the final
+transaction before releasing commitment signatures. The phone must separately
+trust its configured primary. Both sides record permission for this candidate
+without changing the general channel policy. Third-party direct funding,
+phone deposits, and subsequent ordinary splices retain their confirmation
+requirements. Removing a client from the provider list affects future attempts;
+an already authorized attempt continues even if it is still negotiating. An unlisted client may need to retry an
+oversized payment after the splice confirms.
+
+The current portable client generates a private invoice preimage before JIT
+registration and authorizes its hash. It creates the ordinary invoice with that
+same preimage after the primary accepts the request. The preimage stays local;
+normal invoice persistence and settlement rules remain unchanged. This binds
+equal, smaller, and multipart receives to the intended authorization even when
+an earlier unified request was paid through direct funding.
+
+Older clients may omit the payment hash. Such an authorization is a one-use
+intercept SCID capability: the first valid matching HTLC atomically binds its
+hash in durable storage. Alias selection checks the complete admission rules,
+including amount and aggregate caps, before choosing a registration, and prefers
+an exact supplied hash. Older overlapping unbound multipart requests remain
+ambiguous; use the pinned client for exact invoice binding. Further parts must
+match the bound hash and remain inside the authorization cap. The group consumes
+its request before funding or forwarding.
 An independent durable funding lease serializes JIT-owned wallet funding attempts.
 Manual funding through Node administration APIs must use
 `Node::with_chicory_wallet_operation` to coordinate with ongoing JIT funding.
@@ -340,9 +387,30 @@ node scripts/chicory-portable-interop.cjs
 
 The same primary, Electrum, Bitcoin container, timeout and evidence environment
 variables apply. `CHICORY_TEST_INITIAL_DEPOSIT=1` runs a separate first-deposit
-fixture: a confirmed 30,000-sat coin creates one phone-funded home, the primary
+fixture: a 20,000-sat deposit stays onchain while unconfirmed and below the
+channelization threshold, then a 10,000-sat top-up creates one phone-funded home
+using both confirmed coins. The primary
 keeps it unusable at zero confirmations and across restart, then both engines
 activate it at confirmation and complete a 1,000-sat spend and phone reopen.
+Add `CHICORY_TEST_INITIAL_DEPOSIT_GROWTH=1` to receive 100,000 sats through that
+same home, exceeding its original total capacity, then spend more than that
+original capacity and verify both endpoint restarts.
+
+`CHICORY_TEST_EXISTING_RECEIVE=1` checks fixed and amountless Lightning receives
+without splicing or a liquidity fee, followed by an external Lightning send
+routed through the primary. `CHICORY_TEST_JIT_GROWTH=1` checks a 100,000-sat
+single-part receive through the existing home, exact net credit and fee, one
+replacement funding transaction, a larger subsequent spend, and both restarts.
+
+The direct-funding fixture also checks the actual receive request's pending and
+completed states and its unique Activity row. It restarts both endpoints before
+confirmation, enforces the existing-channel six-confirmation splice policy,
+and verifies receipt persistence after a later JIT splice. Conflict testing
+requires the reverted payment to return to an unpaid request without retained
+receive credit. The Umbrel repository's `scripts/chicory-flow-container-test.py`
+runs these and the send-max, drain and recovery cases through the authenticated
+manager and packaged daemon, recording the exact image and installed packages.
+
 `CHICORY_TEST_RECOVERY=1` imports the seed into a new empty phone volume after
 stopping the old installation and restarting the primary. It verifies that the
 stored capsule restores the exact home and balance. Beignet deliberately keeps

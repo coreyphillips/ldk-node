@@ -130,6 +130,66 @@ cargo test -p lightning@0.2.7 --lib native_splice_conflict
 cargo test -p lightning@0.2.7 --lib test_retired_splice_monitor_archive
 ```
 
+## Private channel routing updates
+
+Unicast routing updates set `dont_forward` until both peers have exchanged
+announcement signatures. This includes permanently private channels and the
+early state of channels intended for public announcement. Broadcast updates
+remain forwardable. A transition to public scope advances the signed timestamp
+so two different payloads do not share a timestamp for the same channel.
+
+The existing node signer authenticates the flag with the rest of the update.
+No new cryptographic operation, unsafe block, parser or persisted field is
+introduced. An untrusted peer still must pass the existing chain, channel and
+signature checks. This follows the
+[BOLT 7 channel-update requirements](https://github.com/lightning/bolts/blob/master/07-routing-gossip.md#the-channel_update-message)
+and allows a receiving wallet to hold an early private policy until its own
+chain view assigns the channel SCID.
+
+The regression checks private initial and reconnect updates, early and announced
+public updates, their signatures, and increasing timestamps across scope changes.
+
+```sh
+cargo test -p lightning --lib test_channel_update_forwarding_scope
+```
+
+## Explicit trusted-client splice funding
+
+`splice_channel_with_trusted_own_funding` permits one locally initiated positive
+splice-in to lock without confirmation. The caller must own all contributed
+inputs and explicitly trust the peer not to spend the previous shared funding
+output in conflict with the splice. Initial splice signatures do not revoke the
+previous commitment, and normal promotion does not retain the old monitor scope
+for unconfirmed conflict recovery. This is a counterparty trust decision with
+potential loss, not a safety consequence of funding the new inputs ourselves.
+
+The native Chicory provider uses this API only for exact peers listed in
+`trusted_splice_peer_pubkeys`, which defaults to empty. Pairing grants no such
+permission. Ordinary splices, incoming splices and the third-party direct-funding
+depth API retain their existing confirmation policy. The peer cannot request a
+depth or contribute funding to the fast candidate. Completed interactive input
+ownership is checked before commitment signing, including hidden peer inputs
+whose declared net contribution is zero.
+
+The authorization is specific to the candidate and persists across restart.
+Even TLVs in splice instructions (14), pending funding (10), funding scopes (18)
+and the active channel (74) cause older readers to fail closed when present.
+The next ordinary splice does not inherit the candidate's zero-depth override.
+No new cryptographic operation or unsafe code is introduced. The existing
+[BOLT 2 splice lock exchange](https://github.com/lightning/bolts/blob/master/02-peer-protocol.md#the-splice_locked-message)
+permits locally chosen acceptable depth; both peers still must lock the same
+fully signed funding transaction before channel promotion.
+
+Regressions cover exact-peer opt-in, config restart, candidate restart, ordinary
+confirmation policy, declared contributions, requested depth, and hidden peer
+inputs rejected before commitment signatures.
+
+```sh
+cargo test -p lightning --lib test_trusted_own_splice
+cargo test --lib --features chicory trusted_splice_policy
+cargo test --manifest-path tools/ldk-node-daemon/Cargo.toml trusted_splice
+```
+
 ## Removed private offline-receive extension
 
 The Beignet FFOR implementation, custom feature negotiation, wire messages,

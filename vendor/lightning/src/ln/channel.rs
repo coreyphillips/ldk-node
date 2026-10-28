@@ -2097,6 +2097,24 @@ where
 							)
 						})
 						.and_then(|(is_initiator, mut funding, interactive_tx_constructor)| {
+							if pending_splice.trusted_own_funding.is_some() {
+								// A zero declared contribution does not rule out hidden peer inputs.
+								// Check the final transaction before releasing any commitment signature.
+								if !is_initiator
+									|| !interactive_tx_constructor.has_only_holder_inputs()
+								{
+									pending_splice.funding_negotiation =
+										Some(FundingNegotiation::ConstructingTransaction {
+											funding,
+											interactive_tx_constructor,
+										});
+									return Err(AbortReason::InternalError(
+										"Trusted splice contains non-holder inputs",
+									));
+								}
+								funding.trusted_own_funding = Some(());
+								funding.minimum_depth_override = Some(0);
+							}
 							funding.channel_transaction_parameters.funding_outpoint =
 								Some(funding_outpoint);
 							match chan.context.get_initial_commitment_signed_v2(&funding, &&logger)
@@ -2407,6 +2425,9 @@ pub(super) struct FundingScope {
 	/// The minimum number of confirmations before the funding is locked. If set, this will override
 	/// [`ChannelContext::minimum_depth`].
 	minimum_depth_override: Option<u32>,
+	/// Candidate-specific permission to trust the peer with the old shared funding output.
+	/// Written as an even TLV so older implementations cannot silently discard this policy.
+	trusted_own_funding: Option<()>,
 }
 
 impl Writeable for FundingScope {
@@ -2421,6 +2442,7 @@ impl Writeable for FundingScope {
 			(13, self.funding_tx_confirmation_height, required),
 			(15, self.short_channel_id, option),
 			(17, self.minimum_depth_override, option),
+			(18, self.trusted_own_funding, option),
 		});
 		Ok(())
 	}
@@ -2438,6 +2460,7 @@ impl Readable for FundingScope {
 		let mut funding_tx_confirmation_height = RequiredWrapper(None);
 		let mut short_channel_id = None;
 		let mut minimum_depth_override = None;
+		let mut trusted_own_funding = None;
 
 		read_tlv_fields!(reader, {
 			(1, value_to_self_msat, required),
@@ -2449,6 +2472,7 @@ impl Readable for FundingScope {
 			(13, funding_tx_confirmation_height, required),
 			(15, short_channel_id, option),
 			(17, minimum_depth_override, option),
+			(18, trusted_own_funding, option),
 		});
 
 		Ok(Self {
@@ -2465,6 +2489,7 @@ impl Readable for FundingScope {
 			funding_tx_confirmation_height: funding_tx_confirmation_height.0.unwrap(),
 			short_channel_id,
 			minimum_depth_override,
+			trusted_own_funding,
 			#[cfg(any(test, fuzzing))]
 			next_local_fee: Mutex::new(PredictedNextFee::default()),
 			#[cfg(any(test, fuzzing))]
@@ -2679,6 +2704,7 @@ impl FundingScope {
 			funding_tx_confirmation_height: 0,
 			funding_tx_confirmed_in: None,
 			minimum_depth_override: None,
+			trusted_own_funding: None,
 			short_channel_id: None,
 		})
 	}
@@ -2762,6 +2788,7 @@ struct PendingFunding {
 	/// The funding txid used in the `splice_locked` received from the counterparty.
 	received_funding_txid: Option<Txid>,
 	requested_minimum_depth: Option<u16>,
+	trusted_own_funding: Option<()>,
 }
 
 impl_writeable_tlv_based!(PendingFunding, {
@@ -2770,6 +2797,7 @@ impl_writeable_tlv_based!(PendingFunding, {
 	(5, sent_funding_txid, option),
 	(7, received_funding_txid, option),
 	(9, requested_minimum_depth, option),
+	(10, trusted_own_funding, option),
 });
 
 enum FundingNegotiation {
@@ -2859,6 +2887,7 @@ pub(crate) struct SpliceInstructions {
 	funding_feerate_per_kw: u32,
 	locktime: u32,
 	minimum_depth: Option<u16>,
+	trusted_own_funding: Option<()>,
 }
 
 impl SpliceInstructions {
@@ -2878,6 +2907,7 @@ impl_writeable_tlv_based!(SpliceInstructions, {
 	(9, funding_feerate_per_kw, required),
 	(11, locktime, required),
 	(13, minimum_depth, option),
+	(14, trusted_own_funding, option),
 });
 
 pub(crate) enum QuiescentAction {
@@ -3691,6 +3721,7 @@ where
 			funding_tx_confirmation_height: 0,
 			short_channel_id: None,
 			minimum_depth_override: None,
+			trusted_own_funding: None,
 		};
 		let channel_context = ChannelContext {
 			user_id,
@@ -3952,6 +3983,7 @@ where
 			funding_tx_confirmation_height: 0,
 			short_channel_id: None,
 			minimum_depth_override: None,
+			trusted_own_funding: None,
 		};
 		let channel_context = Self {
 			user_id,
@@ -12041,6 +12073,30 @@ where
 		}
 	}
 
+	/// Returns fully signed, unconfirmed trusted splice transactions whose broadcast obligation
+	/// survives reconnect and restart. Unfinished negotiations and retired candidates are excluded.
+	pub fn trusted_splice_funding_for_rebroadcast(&self) -> Vec<&Transaction> {
+		if self.is_awaiting_monitor_update() || self.context.is_manual_broadcast() {
+			return Vec::new();
+		}
+		core::iter::once(&self.funding)
+			.chain(
+				self.pending_splice.iter().flat_map(|pending| pending.negotiated_candidates.iter()),
+			)
+			.filter(|funding| {
+				funding.trusted_own_funding.is_some()
+					&& funding.get_funding_tx_confirmation_height().is_none()
+			})
+			.filter_map(|funding| {
+				funding.funding_transaction.as_ref().filter(|tx| {
+					funding.get_funding_txid() == Some(tx.compute_txid())
+						&& !tx.input.is_empty()
+						&& tx.input.iter().all(|input| !input.witness.is_empty())
+				})
+			})
+			.collect()
+	}
+
 	/// Initiate splicing.
 	/// - `our_funding_inputs`: the inputs we contribute to the new funding transaction.
 	///   Includes the witness weight for this input (e.g. P2WPKH_WITNESS_WEIGHT=109 for typical P2WPKH inputs).
@@ -12058,17 +12114,27 @@ where
 			funding_feerate_per_kw,
 			locktime,
 			None,
+			false,
 			logger,
 		)
 	}
 
 	pub fn splice_channel_with_minimum_depth<L: Deref>(
 		&mut self, contribution: SpliceContribution, funding_feerate_per_kw: u32, locktime: u32,
-		minimum_depth: Option<u16>, logger: &L,
+		minimum_depth: Option<u16>, trusted_own_funding: bool, logger: &L,
 	) -> Result<Option<msgs::Stfu>, APIError>
 	where
 		L::Target: Logger,
 	{
+		if trusted_own_funding
+			&& (minimum_depth.is_some()
+				|| !contribution.value().is_positive()
+				|| contribution.inputs().is_empty())
+		{
+			return Err(APIError::APIMisuseError {
+				err: "Trusted splice requires a positive, entirely locally funded splice-in without a requested depth".to_owned(),
+			});
+		}
 		if self.holder_commitment_point.current_point().is_none() {
 			return Err(APIError::APIMisuseError {
 				err: format!(
@@ -12166,6 +12232,7 @@ where
 			funding_feerate_per_kw,
 			locktime,
 			minimum_depth,
+			trusted_own_funding: trusted_own_funding.then_some(()),
 		});
 		self.propose_quiescence(logger, action)
 			.map_err(|e| APIError::APIMisuseError { err: e.to_owned() })
@@ -12182,6 +12249,7 @@ where
 			funding_feerate_per_kw,
 			locktime,
 			minimum_depth,
+			trusted_own_funding,
 		} = instructions;
 
 		let prev_funding_input = self.funding.to_splice_funding_input();
@@ -12222,6 +12290,7 @@ where
 			sent_funding_txid: None,
 			received_funding_txid: None,
 			requested_minimum_depth: minimum_depth,
+			trusted_own_funding,
 		});
 
 		msgs::SpliceInit {
@@ -12528,6 +12597,7 @@ where
 			negotiated_candidates: Vec::new(),
 			received_funding_txid: None,
 			requested_minimum_depth: None,
+			trusted_own_funding: None,
 			sent_funding_txid: None,
 		});
 
@@ -12633,6 +12703,14 @@ where
 		{
 			return Err(ChannelError::WarnAndDisconnect(
 				"Peer did not acknowledge requested splice lock depth".to_owned(),
+			));
+		}
+		if pending_splice.trusted_own_funding.is_some()
+			&& (msg.funding_contribution_satoshis != 0 || msg.lock_depth.is_some())
+		{
+			return Err(ChannelError::WarnAndDisconnect(
+				"Trusted locally funded splice cannot accept a peer contribution or lock depth"
+					.to_owned(),
 			));
 		}
 
@@ -15431,6 +15509,7 @@ where
 			(67, pending_outbound_held_htlc_flags, optional_vec), // Added in 0.2
 			(69, holding_cell_held_htlc_flags, optional_vec),
 			(72, self.splice_conflict_records, optional_vec),
+			(74, self.funding.trusted_own_funding, option),
 		});
 
 		Ok(())
@@ -15792,6 +15871,7 @@ where
 		let mut interactive_tx_signing_session: Option<InteractiveTxSigningSession> = None;
 
 		let mut minimum_depth_override: Option<u32> = None;
+		let mut trusted_own_funding: Option<()> = None;
 
 		let mut pending_splice: Option<PendingFunding> = None;
 		let mut quiescent_action = None;
@@ -15849,6 +15929,7 @@ where
 			(67, pending_outbound_held_htlc_flags_opt, optional_vec), // Added in 0.2
 			(69, holding_cell_held_htlc_flags_opt, optional_vec), // Added in 0.2
 			(72, splice_conflict_records, optional_vec),
+			(74, trusted_own_funding, option),
 		});
 
 		let holder_signer = signer_provider.derive_channel_signer(channel_keys_id);
@@ -16143,6 +16224,7 @@ where
 				funding_tx_confirmation_height,
 				short_channel_id,
 				minimum_depth_override,
+				trusted_own_funding,
 			},
 			context: ChannelContext {
 				user_id,
@@ -16297,11 +16379,13 @@ mod tests {
 	use crate::chain::chaininterface::LowerBoundedFeeEstimator;
 	use crate::chain::transaction::OutPoint;
 	use crate::chain::BestBlock;
+	use crate::io::Cursor;
 	use crate::ln::chan_utils::{self, commit_tx_fee_sat, ChannelTransactionParameters};
 	use crate::ln::channel::{
 		AwaitingChannelReadyFlags, ChannelState, FundedChannel, HTLCCandidate, HTLCInitiator,
 		HTLCUpdateAwaitingACK, InboundHTLCOutput, InboundHTLCState, InboundV1Channel,
-		OutboundHTLCOutput, OutboundHTLCState, OutboundV1Channel,
+		OutboundHTLCOutput, OutboundHTLCState, OutboundV1Channel, PendingFunding,
+		SpliceInstructions,
 	};
 	use crate::ln::channel::{
 		MAX_FUNDING_SATOSHIS_NO_WUMBO, MIN_THEIR_CHAN_RESERVE_SATOSHIS,
@@ -16311,7 +16395,7 @@ mod tests {
 	use crate::ln::channelmanager::{self, HTLCSource, PaymentId};
 	use crate::ln::funding::FundingTxInput;
 	use crate::ln::msgs;
-	use crate::ln::msgs::{ChannelUpdate, UnsignedChannelUpdate, MAX_VALUE_MSAT};
+	use crate::ln::msgs::{ChannelUpdate, DecodeError, UnsignedChannelUpdate, MAX_VALUE_MSAT};
 	use crate::ln::onion_utils::{AttributionData, LocalHTLCFailureReason};
 	use crate::ln::script::ShutdownScript;
 	use crate::prelude::*;
@@ -16325,7 +16409,7 @@ mod tests {
 	use crate::types::payment::{PaymentHash, PaymentPreimage};
 	use crate::util::config::UserConfig;
 	use crate::util::errors::APIError;
-	use crate::util::ser::{ReadableArgs, Writeable};
+	use crate::util::ser::{Readable, ReadableArgs, Writeable};
 	use crate::util::test_utils::{
 		self, OnGetShutdownScriptpubkey, TestFeeEstimator, TestKeysInterface, TestLogger,
 	};
@@ -16343,6 +16427,53 @@ mod tests {
 	use bitcoin::transaction::{Transaction, TxOut, Version};
 	use bitcoin::{ScriptBuf, WPubkeyHash, WitnessProgram, WitnessVersion};
 	use std::cmp;
+
+	#[test]
+	fn test_trusted_splice_authorization_requires_updated_reader() {
+		// Prior versions can skip these odd-numbered fields, but must not silently
+		// skip the new even-numbered trust authorization at either durable phase.
+		fn prior_reader(bytes: Vec<u8>) -> Result<(), DecodeError> {
+			let mut cursor = Cursor::new(bytes);
+			let reader = &mut cursor;
+			read_tlv_fields!(reader, {});
+			Ok(())
+		}
+		for trusted_own_funding in [None, Some(())] {
+			let pending = PendingFunding {
+				funding_negotiation: None,
+				negotiated_candidates: Vec::new(),
+				sent_funding_txid: None,
+				received_funding_txid: None,
+				requested_minimum_depth: None,
+				trusted_own_funding,
+			};
+			let instructions = SpliceInstructions {
+				adjusted_funding_contribution: bitcoin::SignedAmount::from_sat(10_000),
+				our_funding_inputs: Vec::new(),
+				our_funding_outputs: Vec::new(),
+				change_script: None,
+				funding_feerate_per_kw: 253,
+				locktime: 0,
+				minimum_depth: None,
+				trusted_own_funding,
+			};
+			let restored = PendingFunding::read(&mut Cursor::new(pending.encode())).unwrap();
+			assert_eq!(restored.trusted_own_funding, trusted_own_funding);
+			let restored =
+				SpliceInstructions::read(&mut Cursor::new(instructions.encode())).unwrap();
+			assert_eq!(restored.trusted_own_funding, trusted_own_funding);
+			for bytes in [pending.encode(), instructions.encode()] {
+				assert_eq!(
+					prior_reader(bytes),
+					if trusted_own_funding.is_some() {
+						Err(DecodeError::UnknownRequiredFeature)
+					} else {
+						Ok(())
+					}
+				);
+			}
+		}
+	}
 
 	#[test]
 	fn test_intercept_liquidity_shortfall_constraints() {
@@ -18659,6 +18790,7 @@ mod tests {
 			funding_tx_confirmation_height: 0,
 			short_channel_id: None,
 			minimum_depth_override: None,
+			trusted_own_funding: None,
 		};
 		let post_channel_value =
 			funding.compute_post_splice_value(our_funding_contribution, their_funding_contribution);

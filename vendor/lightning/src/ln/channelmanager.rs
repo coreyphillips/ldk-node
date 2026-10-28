@@ -4898,7 +4898,7 @@ where
 		let mut res = Ok(());
 		PersistenceNotifierGuard::optionally_notify(self, || {
 			let result = self.internal_splice_channel(
-				channel_id, counterparty_node_id, contribution, funding_feerate_per_kw, locktime, None
+				channel_id, counterparty_node_id, contribution, funding_feerate_per_kw, locktime, None, false
 			);
 			res = result;
 			match res {
@@ -4931,13 +4931,43 @@ where
 			funding_feerate_per_kw,
 			locktime,
 			Some(minimum_depth),
+			false,
+		)
+	}
+
+	/// Initiates an entirely locally funded splice with a trusted counterparty, allowing this
+	/// candidate to lock before confirmation even if the original channel required confirmations.
+	///
+	/// The caller must explicitly trust the peer not to spend the previous shared funding output
+	/// in conflict with this splice, and must own every supplied input. A conflicting old commitment
+	/// can cause loss before the splice confirms. Pairing or providing our own new inputs does not
+	/// establish this trust. Use [`Self::splice_channel`] for untrusted peers and
+	/// [`Self::splice_channel_with_minimum_depth`] when any third party supplies funding.
+	///
+	/// Only a positive splice-in is accepted. The peer may not contribute inputs or request a
+	/// confirmation depth. Ownership is checked again against the completed transaction before
+	/// commitment signatures are released. This permission applies only to this candidate and is
+	/// persisted across restart; subsequent splices retain the channel's normal confirmation policy.
+	pub fn splice_channel_with_trusted_own_funding(
+		&self, channel_id: &ChannelId, peer: &PublicKey, contribution: SpliceContribution,
+		funding_feerate_per_kw: u32, locktime: Option<u32>,
+	) -> Result<(), APIError> {
+		let _persistence_guard = PersistenceNotifierGuard::notify_on_drop(self);
+		self.internal_splice_channel(
+			channel_id,
+			peer,
+			contribution,
+			funding_feerate_per_kw,
+			locktime,
+			None,
+			true,
 		)
 	}
 
 	fn internal_splice_channel(
 		&self, channel_id: &ChannelId, counterparty_node_id: &PublicKey,
 		contribution: SpliceContribution, funding_feerate_per_kw: u32, locktime: Option<u32>,
-		minimum_depth: Option<u16>,
+		minimum_depth: Option<u16>, trusted_own_funding: bool,
 	) -> Result<(), APIError> {
 		let per_peer_state = self.per_peer_state.read().unwrap();
 
@@ -4973,6 +5003,7 @@ where
 						funding_feerate_per_kw,
 						locktime,
 						minimum_depth,
+						trusted_own_funding,
 						&&logger,
 					)?;
 					if let Some(msg) = msg_opt {
@@ -9912,6 +9943,7 @@ This indicates a bug inside LDK. Please report this error at https://github.com/
 			send_channel_ready!(self, pending_msg_events, channel, msg);
 		}
 
+		let resumed_funding_txid = funding_broadcastable.as_ref().map(|tx| tx.compute_txid());
 		if let Some(tx) = funding_broadcastable {
 			if channel.context.is_manual_broadcast() {
 				log_info!(logger, "Not broadcasting funding transaction with txid {} as it is manually managed", tx.compute_txid());
@@ -9929,6 +9961,15 @@ This indicates a bug inside LDK. Please report this error at https://github.com/
 				log_info!(logger, "Broadcasting funding transaction with txid {}", tx.compute_txid());
 				self.tx_broadcaster.broadcast_transactions(&[&tx]);
 			}
+		}
+
+		// A signed trusted splice may still be waiting for the peer's lock after a restart.
+		// Re-send the exact durable transaction, including after monitor persistence resumes.
+		// The channel excludes unsigned, retired and confirmed candidates and held monitor updates.
+		let trusted_splices: Vec<_> = channel.trusted_splice_funding_for_rebroadcast().into_iter()
+			.filter(|tx| Some(tx.compute_txid()) != resumed_funding_txid).collect();
+		if !trusted_splices.is_empty() {
+			self.tx_broadcaster.broadcast_transactions(&trusted_splices);
 		}
 
 		if let Some(signing_session) = (!channel.is_awaiting_monitor_update())

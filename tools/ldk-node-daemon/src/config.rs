@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use electrum_client::ElectrumApi;
-use ldk_node::bitcoin::{blockdata::constants::genesis_block, Network};
+use ldk_node::bitcoin::{blockdata::constants::genesis_block, secp256k1::PublicKey, Network};
 use ldk_node::chicory::JitServiceConfig;
 use ldk_node::{Builder, Node};
 use serde::{Deserialize, Serialize};
@@ -39,6 +39,8 @@ pub enum ChainSource {
 #[serde(default, deny_unknown_fields)]
 pub struct ChicoryPolicy {
 	pub enabled: bool,
+	#[serde(deserialize_with = "deserialize_trusted_splice_peers")]
+	pub trusted_splice_peer_pubkeys: Vec<PublicKey>,
 	#[serde(default = "default_flat_fee")]
 	pub flat_fee_sat: u64,
 	#[serde(default = "default_ppm")]
@@ -52,6 +54,7 @@ impl Default for ChicoryPolicy {
 	fn default() -> Self {
 		Self {
 			enabled: false,
+			trusted_splice_peer_pubkeys: Vec::new(),
 			flat_fee_sat: default_flat_fee(),
 			fee_ppm: default_ppm(),
 			max_client_funding_sats: default_client_cap(),
@@ -59,6 +62,32 @@ impl Default for ChicoryPolicy {
 		}
 	}
 }
+
+fn deserialize_trusted_splice_peers<'de, D: serde::Deserializer<'de>>(
+	deserializer: D,
+) -> Result<Vec<PublicKey>, D::Error> {
+	let values = Vec::<String>::deserialize(deserializer)?;
+	if values.len() > 128 {
+		return Err(serde::de::Error::custom("At most 128 trusted splice peers are allowed"));
+	}
+	let mut peers = Vec::with_capacity(values.len());
+	for value in values {
+		if value.len() != 66 || !(value.starts_with("02") || value.starts_with("03")) {
+			return Err(serde::de::Error::custom(
+				"Trusted splice peers must be compressed public keys",
+			));
+		}
+		let peer = value
+			.parse()
+			.map_err(|_| serde::de::Error::custom("Invalid trusted splice peer public key"))?;
+		if peers.contains(&peer) {
+			return Err(serde::de::Error::custom("Duplicate trusted splice peer public key"));
+		}
+		peers.push(peer);
+	}
+	Ok(peers)
+}
+
 fn default_flat_fee() -> u64 {
 	100
 }
@@ -197,6 +226,7 @@ impl Config {
 			relay_enabled: self.chicory.enabled,
 			allow_confirmed_v2: self.chicory.enabled,
 			allow_splice_jit: self.chicory.enabled,
+			trusted_splice_peer_pubkeys: self.chicory.trusted_splice_peer_pubkeys.clone(),
 			reuse_funding_key_on_splice: self.chicory.enabled,
 			inbound_splice_minimum_depth: 6,
 			flat_fee_sat: self.chicory.flat_fee_sat,

@@ -1,0 +1,100 @@
+{
+  "schema": 2,
+  "source_revision": "2cdab260ed36dc053278fb48326130ed7f654b77",
+  "source_base_revision": "67bc9cf0ba3e55fa1e1d7ad73e360bb04321a62c",
+  "source_compatibility_revision": "c9acc05f61899468f4eefd71d599d0de0bea9190",
+  "upstream_beignet_revision": "daed636187e42bfbd156e5f5b74fda9c7a6379cd",
+  "upstream_backports": [
+    "3055cf4d7650fa45b8c9804ed9ef9e664c1a748d",
+    "8c628bc69b569f419480a72313f2b917189f663b",
+    "3f7d22f0d33e89d6368ffe5f05a38c67491288fb",
+    "b92d519a00f5dbea866a375081c692235b244659",
+    "a19302ba2f567c41db56df02886940b6e19f9ecc",
+    "1e398e97ac121dd31d011bfd279509e8bef53472",
+    "345f59e1cfc82775772ea597d5f032b81001d7c1",
+    "56a38c829ad924ea00d26599b992194c355d676d"
+  ],
+  "patches": [
+    {
+      "file": "patches/portable-engine-primary-compatibility.patch",
+      "sha256": "43c589806a4382ac6fe352afb0e83a1e988d41d9c7492e1d8cc1b5b9890daecc"
+    },
+    {
+      "file": "patches/portable-engine-direct-funding-receipts.patch",
+      "sha256": "f3953357884fcc583ac7f74c1665b341503aa61c5eeffb2d4cefb58dad17e730"
+    },
+    {
+      "file": "patches/portable-engine-trusted-primary-splices.patch",
+      "sha256": "8bf0ad180972d50570d0dde9c720a0303d3133e3d34b0078959d4897f646d16c"
+    },
+    {
+      "file": "patches/portable-engine-jit-invoice-binding.patch",
+      "sha256": "39779c1ee4e9a958be6365c6e3d0b0afb633d7a1c4f9dd7a4cded45369dc05fe"
+    }
+  ],
+  "source_files": {
+    "README.md": "c15122443a989e16b0045b90b3a1f07a00fb081800e333760244679aebf00f8f",
+    "package-lock.json": "178924144c2cfa5e399d2867818b600a0176dba2b618ce82f40833e9842a49b4",
+    "package.json": "9822ef714119641517d165f7dd0d2673f849c2d8ec43c38a248ff196db23829f",
+    "portable-tests/direct-funding-received.test.cjs": "64087308c04fb960edf29a86e9f935a5a76805edf0b70a9a1eabb4eed89ebb3c",
+    "portable-tests/helpers/real-signing.ts": "808c7a382c6ac31f6808ad1492c180d9b03973956678ece0c9e6d097d31a11f2",
+    "portable-tests/helpers/splice-wire.ts": "bdb977c1230f27e8b4ca95da926fc80ba90e9107f2c19f2dc8afcfec224dae4e",
+    "portable-tests/jit-invoice-binding.test.cjs": "613ef92f9df6eb1ec655e565fd3732cd5aab81c0c00758fb13d1d377a9677957",
+    "portable-tests/reestablish-watchdog.test.cjs": "9ca6458bbcf89f51dc20a0249ea40ee2b04fe5b7b30db22fbf00442c430f2781",
+    "portable-tests/trusted-peer-splice.test.cjs": "e088b7993943a4aa2888a2058cc9b569ce964044917e6e1596441037d7fbe718",
+    "portable/reestablish-watchdog.cjs": "ffe3241db4c52731c502bb3f653d2ca2fff11b2e2065d35983b13687b3d338c2",
+    "portable/runtime.ts": "5711755f50d955b4dc76da052de32b3166afc3042da7ddfcb657b843fd19356a",
+    "scripts/build-portable.cjs": "52da2c3e25d620a9a3238f124d5f070d1898f320a4fd191ad3559e65880ba6c5",
+    "src/cli/README.md": "60aab47c0002a99c9636d9da6fb6f873370e7d4ea11eab1e048617852969ebb5",
+    "src/cli/beignet-node.ts": "75de29e841875fbb3d817673724f64135eeadd3a3dba7a4c6311bfac72bf1ece",
+    "src/cli/cli.ts": "c7e4ea0396642e5ca787c35274eb6072d3ad9d4912ff3fb4d8706972c0fcdf77",
+    "src/cli/daemon.ts": "0deb77571a3259c7a2a88087d07141f4d8ce91cbf85993dabde5daaf9dfdcab2",
+    "src/cli/openapi.ts": "252eb747aac6a5b274ee838999d6bc84d2e55fb56c966e45c42e94c7609cadb1",
+    "src/cli/routes.ts": "46da320a8a3eea13d1368b590d8e7929d256dc6ec978311e857c217f187cd623",
+    "src/cli/types.ts": "487b61a62732724990c534bba435d9f83459c57ad4dd5cf19636270340cfe842",
+    "src/electrum/index.ts": "ccdd89d5b59eaa5f31ad01732cd2a8a0d0a3cb4913d7eeb1765d19c1349896e1",
+    "src/lightning/README.md": "6aaa2ec10c0567e8bb7f489486a36cd146318af7fa92e1b64b36a5faf296376a",
+    "src/lightning/advisor/fee-advisor.ts": "46e3c3b072d1bd7d2df0012050aa6275aef9915b19747fb7656af54cd273de3d",
+    "src/lightning/channel/channel-manager.ts": "57c37fa0fd1604ac583d815985e94108c47fa27baeb9747dea727cf005ac0611",
+    "src/lightning/channel/channel-state.ts": "1aa5fc795819a5a4b15a4022ec9aa31c2532e1135f32c9b227296fd409794f58",
+    "src/lightning/channel/channel.ts": "58b08f528e3db6a532e90e88892a0155e29e072e242eb0f990ee46822c3e5994",
+    "src/lightning/direct-funding/index.ts": "16e1ffaa274cc8c58c22ee184a8bca86cb73c71284ddb45e37dbd06c3a4dc048",
+    "src/lightning/direct-funding/messages.ts": "811118bdd1579c7551ed7145f90f11b22cad9ce7b2b87b20a29e096740813b4e",
+    "src/lightning/direct-funding/receiver/engine.ts": "4bf84cd8e1357656fcd1c9f70213637027eddb93a6dc0e891c950b1fe69ce4cc",
+    "src/lightning/direct-funding/receiver/types.ts": "1c2acaafddfabd8ed9681d5598a8ed982d5c7a28f7bd2f156b01db94bc43d78b",
+    "src/lightning/direct-funding/receiver/verify.ts": "69e8cf5e16de8459e60151fb28219282b1e882450e06e9d8bc7e8bd0d2ee2d4c",
+    "src/lightning/direct-funding/requests.ts": "d9df21baec4b88c25d45fcd71cc7e69be50bca609d7738ed488a69294896e236",
+    "src/lightning/direct-funding/sender/engine.ts": "c977944344e19d15ce4c52083facaa34c69241990cfab360d1d7ed1f98d22ceb",
+    "src/lightning/direct-funding/sender/types.ts": "52945126f37c184fd9ba6698c14845a50df230ddd37758bd28284ba9d2a9b016",
+    "src/lightning/direct-funding/sender/verify.ts": "76b3d3516c997abc2ae62e13ffce368c4698fdf637975a229110f47c1de80efa",
+    "src/lightning/direct-funding/types.ts": "d7681bca8c0a43114cd12787683ad4a1f4f24670d3a183f0db7ad0b987d75150",
+    "src/lightning/liquidity/jit-receive.ts": "a81f166d9847c3fee67929712f0ab09e46a8e6f24a21b3937d0163d7319b1e3e",
+    "src/lightning/message/channel-update.ts": "efcc7d9aa291ff56918d052a798b8e99902a4becf921e6ffcebbe3611e4af7f5",
+    "src/lightning/node/events.ts": "246eec12241bf3e4b8fb9fef5103b600d594de5d3549ecb6c88c151efd2cd3ac",
+    "src/lightning/node/lightning-node.ts": "e4a9a1073323f7d54c778b4a070bf38e0f291b9a002083c9ce065021028f623a",
+    "src/lightning/node/payment-types.ts": "140dd46d3379c992c33a572438bd2fdb15fd78d7aeaa6e3fd5c6e5c935100c0b",
+    "src/lightning/node/types.ts": "0413ea7300397631ff5a2007d51a7956a01bb276643500fc3ccee34023c1cae2",
+    "src/lightning/storage/serialization.ts": "b129f1d4704563f7689b5f9d4429e7f40d7b2926b8e6784fe0d26dd8061fd798",
+    "src/wallet/index.ts": "653285f174e61576836338e33b0d85577c56e2fdb6ad4bb1427fca07f563e3c8"
+  },
+  "bundles": {
+    "dist/portable.cjs": {
+      "original": "05cdb752e1007532edc1366ea14cbf98a96825885a62d47d6001f74c1bed229d",
+      "previous_patched": "d1a173ff6eec2dabfaf315f81da4fec0e174950e881e2e37dce5b380000822c9",
+      "patched": "50f3c1dd032b4268cbf0ab89908a278942743aaad6f9fac9d416cf6e9b59a8c1",
+      "previous_backport": "cd6a026220c15c01125074b0c6831423b8ed918e29aecc41ec7048ea7b1eea0e",
+      "previous_receipts": "92004e670d844eba296eceedf4c723c62f62e3567c2bbe2b20e45b5d663c3e8c",
+      "previous_trusted": "2b23253210168f546d2258d081847bf0e843cdd5ae1bfae3ccc0fb419efeedb6"
+    },
+    "dist/portable.mjs": {
+      "original": "d3c4ecedab13893d936742542affde9c0b1e8628dd370dfd8beefca3eeb481e6",
+      "previous_patched": "7b98cf137c21dd1b84f9c27175c13ce844be180ed7da7b883001579b39e94fae",
+      "patched": "78fdb087d031fb2f2dc7efcfe44d60b7805a3e0405f1e9fcad9664e9dafb5221",
+      "previous_backport": "4b4c020f15a50b630fcbf85c118cd12fc771314a4a37883d65031ac60cd92bad",
+      "previous_receipts": "4407a215d6df3baaf9ca91b7ce93aa4461a5432f3b94c1ac859ca216225fef98",
+      "previous_trusted": "ab6d64a88db7515592a68de537dabcd1e85d15f24c1c92c853b4402401b1fcd8"
+    }
+  },
+  "source_trusted_splice_base_revision": "8bfb99c970c62d40fb4574d9cc5370fc457c256b",
+  "source_invoice_binding_base_revision": "1b3eae63407ae267b6f3a06aa3c006062856632f"
+}
